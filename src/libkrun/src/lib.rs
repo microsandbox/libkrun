@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::net::Ipv4Addr;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::unbounded;
@@ -60,6 +61,7 @@ const INIT_PATH: &str = "/init.krun";
 #[derive(Default)]
 struct TsiConfig {
     port_map: Option<HashMap<u16, u16>>,
+    redirect_ip: Option<Ipv4Addr>,
 }
 
 enum NetworkConfig {
@@ -205,6 +207,16 @@ impl ContextConfig {
             }
             NetworkConfig::VirtioNetPasst(_) => Err(()),
             NetworkConfig::VirtioNetGvproxy(_) => Err(()),
+        }
+    }
+
+    fn set_redirect_ip(&mut self, redirect_ip: Ipv4Addr) -> Result<(), ()> {
+        match &mut self.net_cfg {
+            NetworkConfig::Tsi(tsi_config) => {
+                tsi_config.redirect_ip = Some(redirect_ip);
+                Ok(())
+            }
+            _ => Err(()),
         }
     }
 
@@ -700,6 +712,38 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
     KRUN_SUCCESS
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_redirect_ip(ctx_id: u32, c_redirect_ip: *const c_char) -> i32 {
+    // Validate the input pointer.
+    if c_redirect_ip.is_null() {
+        return -libc::EINVAL;
+    }
+
+    // Convert the C string to a Rust &str.
+    let redirect_ip_str = match CStr::from_ptr(c_redirect_ip).to_str() {
+        Ok(s) => s,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    // Parse the string into an Ipv4Addr.
+    let redirect_ip = match redirect_ip_str.parse::<Ipv4Addr>() {
+        Ok(ip) => ip,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            if ctx_cfg.get_mut().set_redirect_ip(redirect_ip).is_err() {
+                return -libc::ENOTSUP;
+            }
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_rlimits(ctx_id: u32, c_rlimits: *const *const c_char) -> i32 {
@@ -1104,6 +1148,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vsock_id: "vsock0".to_string(),
         guest_cid: 3,
         host_port_map: None,
+        redirect_ip: None,
         unix_ipc_port_map: None,
     };
 
@@ -1115,6 +1160,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     match ctx_cfg.net_cfg {
         NetworkConfig::Tsi(tsi_cfg) => {
             vsock_config.host_port_map = tsi_cfg.port_map;
+            vsock_config.redirect_ip = tsi_cfg.redirect_ip;
             vsock_set = true;
         }
         NetworkConfig::VirtioNetPasst(_fd) => {

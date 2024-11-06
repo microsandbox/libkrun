@@ -236,6 +236,27 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
 
+
+/**
+ * Configures the IPv4 loopback address to always redirect to.
+ *
+ * When this is set, the TSI implementation will redirect all connections (e.g. listen and connect)
+ * to the default loopback address (127.0.0.1) to the address specified here.
+ *
+ * Arguments:
+ *  "ctx_id"      - The configuration context ID.
+ *  "redirect_ip" - A null-terminated string representing the IPv4 loopback address to redirect to.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *
+ * Notes:
+ *  "redirect_ip" must be a valid IPv4 loopback address in the range [127.0.0.2, 127.255.255.254].
+ *  On macOS, non-default loopback addresses are not enabled by default, so you may need to
+ *  set it up with `sudo ifconfig lo0 alias <redirect_ip>`.
+ */
+int32_t krun_set_redirect_ip(uint32_t ctx_id, const char *redirect_ip);
+
 /* Flags for virglrenderer.  Copied from virglrenderer bindings. */
 #define VIRGLRENDERER_USE_EGL 1 << 0
 #define VIRGLRENDERER_THREAD_SYNC 1 << 1

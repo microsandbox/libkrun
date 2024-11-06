@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ pub struct MuxerThread {
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
+    redirect_ip: Option<Ipv4Addr>,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt_evt: EventFd,
@@ -38,6 +40,7 @@ impl MuxerThread {
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
+        redirect_ip: Option<Ipv4Addr>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt_evt: EventFd,
@@ -58,6 +61,7 @@ impl MuxerThread {
             intc,
             irq_line,
             reaper_sender,
+            redirect_ip,
         }
     }
 
@@ -120,6 +124,7 @@ impl MuxerThread {
                 id,
                 local_port,
                 peer_port,
+                self.redirect_ip,
                 accept_fd,
                 self.mem.clone(),
                 self.queue.clone(),

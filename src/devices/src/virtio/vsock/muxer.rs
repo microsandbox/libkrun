@@ -101,6 +101,7 @@ pub fn push_packet(
 pub struct VsockMuxer {
     cid: u64,
     host_port_map: Option<HashMap<u16, u16>>,
+    redirect_ip: Option<Ipv4Addr>,
     queue: Option<Arc<Mutex<VirtQueue>>>,
     mem: Option<GuestMemoryMmap>,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -118,6 +119,7 @@ impl VsockMuxer {
     pub(crate) fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
+        redirect_ip: Option<Ipv4Addr>,
         interrupt_evt: EventFd,
         interrupt_status: Arc<AtomicUsize>,
         unix_ipc_port_map: Option<HashMap<u32, PathBuf>>,
@@ -125,6 +127,7 @@ impl VsockMuxer {
         VsockMuxer {
             cid,
             host_port_map,
+            redirect_ip,
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
@@ -172,6 +175,7 @@ impl VsockMuxer {
             self.epoll.clone(),
             self.rxq.clone(),
             self.proxy_map.clone(),
+            self.redirect_ip,
             mem,
             queue,
             self.interrupt_evt.try_clone().unwrap(),
@@ -279,6 +283,7 @@ impl VsockMuxer {
                         defs::TSI_PROXY_PORT,
                         req.peer_port,
                         pkt.src_port(),
+                        self.redirect_ip,
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
@@ -299,6 +304,7 @@ impl VsockMuxer {
                         id,
                         self.cid,
                         req.peer_port,
+                        self.redirect_ip,
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),

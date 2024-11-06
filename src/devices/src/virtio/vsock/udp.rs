@@ -31,6 +31,7 @@ pub struct UdpProxy {
     cid: u64,
     local_port: u32,
     peer_port: u32,
+    redirect_ip: Option<Ipv4Addr>,
     fd: RawFd,
     pub status: ProxyStatus,
     sendto_addr: Option<SockaddrIn>,
@@ -49,6 +50,7 @@ impl UdpProxy {
         id: u64,
         cid: u64,
         peer_port: u32,
+        redirect_ip: Option<Ipv4Addr>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -94,6 +96,7 @@ impl UdpProxy {
             cid,
             local_port: 0,
             peer_port,
+            redirect_ip,
             fd,
             status: ProxyStatus::Idle,
             sendto_addr: None,
@@ -237,9 +240,32 @@ impl Proxy for UdpProxy {
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("vsock: udp: connect: addr={}, port={}", req.addr, req.port);
+
+        // Check if connection IP is localhost
+        if req.addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!("vsock: UdpProxy: Connection attempt to non-localhost IP: {} denied", req.addr);
+
+            // This response goes to the connection.
+            let rx = MuxerRx::ConnResponse {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: -libc::EPERM,
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+
+            return ProxyUpdate::default();
+        }
+
+        // Use redirect_ip if set, otherwise use the original address
+        let connect_addr = self.redirect_ip.unwrap_or(req.addr);
+        debug!(
+            "vsock: UdpProxy: Connecting to {} (original: {})",
+            connect_addr, req.addr
+        );
+
         let res = match connect(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)),
+            &SockaddrIn::from(SocketAddrV4::new(connect_addr, req.port)),
         ) {
             Ok(()) => {
                 debug!("vsock: connect: Connected");
@@ -325,9 +351,22 @@ impl Proxy for UdpProxy {
             req.addr, req.port
         );
 
+        // Check if target IP is localhost
+        if req.addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!("vsock: UdpProxy: SendTo attempt to non-localhost IP: {} denied", req.addr);
+            return ProxyUpdate::default();
+        }
+
+        // Use redirect_ip if set, otherwise use the original address
+        let target_addr = self.redirect_ip.unwrap_or(req.addr);
+        debug!(
+            "vsock: UdpProxy: SendTo {} (original: {})",
+            target_addr, req.addr
+        );
+
         let mut update = ProxyUpdate::default();
 
-        self.sendto_addr = Some(SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)));
+        self.sendto_addr = Some(SockaddrIn::from(SocketAddrV4::new(target_addr, req.port)));
         if !self.listening {
             match bind(self.fd, &SockaddrIn::new(0, 0, 0, 0, 0)) {
                 Ok(_) => {

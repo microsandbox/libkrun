@@ -33,6 +33,7 @@ pub struct TcpProxy {
     local_port: u32,
     peer_port: u32,
     control_port: u32,
+    redirect_ip: Option<Ipv4Addr>,
     fd: RawFd,
     pub status: ProxyStatus,
     mem: GuestMemoryMmap,
@@ -55,6 +56,7 @@ impl TcpProxy {
         local_port: u32,
         peer_port: u32,
         control_port: u32,
+        redirect_ip: Option<Ipv4Addr>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -103,6 +105,7 @@ impl TcpProxy {
             local_port,
             peer_port,
             control_port,
+            redirect_ip,
             fd,
             status: ProxyStatus::Idle,
             mem,
@@ -125,6 +128,7 @@ impl TcpProxy {
         parent_id: u64,
         local_port: u32,
         peer_port: u32,
+        redirect_ip: Option<Ipv4Addr>,
         fd: RawFd,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
@@ -141,6 +145,7 @@ impl TcpProxy {
             local_port,
             peer_port,
             control_port: 0,
+            redirect_ip,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -176,6 +181,12 @@ impl TcpProxy {
             return 0;
         }
 
+        if req.addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!("vsock: TcpProxy: Listen attempt on non-localhost IP: {} denied", req.addr);
+            return -libc::EPERM;
+        }
+
+        let bind_addr = self.redirect_ip.unwrap_or(req.addr);
         let port = if let Some(port_map) = host_port_map {
             if let Some(port) = port_map.get(&req.port) {
                 *port
@@ -188,7 +199,7 @@ impl TcpProxy {
 
         match bind(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, port)),
+            &SockaddrIn::from(SocketAddrV4::new(bind_addr, port)),
         ) {
             Ok(_) => {
                 debug!("tcp bind: id={}", self.id);
@@ -366,9 +377,21 @@ impl Proxy for TcpProxy {
     fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
+        if req.addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!("vsock: TcpProxy: Connection attempt to non-localhost IP: {} denied", req.addr);
+            self.push_connect_rsp(-libc::EPERM);
+            return update;
+        }
+
+        let connect_addr = self.redirect_ip.unwrap_or(req.addr);
+        debug!(
+            "vsock: TcpProxy: Connecting to {} (original: {})",
+            connect_addr, req.addr
+        );
+
         let result = match connect(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)),
+            &SockaddrIn::from(SocketAddrV4::new(connect_addr, req.port)),
         ) {
             Ok(()) => {
                 debug!("vsock: connect: Connected");
