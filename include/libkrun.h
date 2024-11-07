@@ -236,26 +236,45 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
 
-
 /**
- * Configures the IPv4 loopback address to always redirect to.
+ * Configures the IPv4 address that is rewritten to when the TSI implementation encounters 127.0.0.1.
  *
- * When this is set, the TSI implementation will redirect all connections (e.g. listen and connect)
- * to the default loopback address (127.0.0.1) to the address specified here.
+ * When set, any connections (listen, connect, sendto_addr, etc.) to 127.0.0.1 in the guest will
+ * be automatically rewritten to use this address instead.
  *
  * Arguments:
- *  "ctx_id"      - The configuration context ID.
- *  "redirect_ip" - A null-terminated string representing the IPv4 loopback address to redirect to.
+ *  "ctx_id"     - the configuration context ID.
+ *  "rewrite_ip" - a null-terminated string representing the IPv4 address.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  *
  * Notes:
- *  "redirect_ip" must be a valid IPv4 loopback address in the range [127.0.0.2, 127.255.255.254].
+ *  "rewrite_ip" must be a valid IPv4 address.
  *  On macOS, non-default loopback addresses are not enabled by default, so you may need to
- *  set it up with `sudo ifconfig lo0 alias <redirect_ip>`.
+ *  set it up with `sudo ifconfig lo0 alias <rewrite_ip>`.
+ *
+ *  Ignored if passt or gvproxy networking is used.
  */
-int32_t krun_set_redirect_ip(uint32_t ctx_id, const char *redirect_ip);
+int32_t krun_set_tsi_rewrite_ip(uint32_t ctx_id, const char *rewrite_ip);
+
+/**
+ * Determines if the VM is only allowed to connect to 127.0.0.1.
+ *
+ * When enabled, the VM is only allowed to connect to 127.0.0.1, otherwise it can connect
+ * to any non-loopback address like 93.184.216.34.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "enable" - boolean indicating whether the VM is allowed to connect to 127.0.0.1 only.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *
+ * Notes:
+ *  This setting is ignored if krun_set_tsi_rewrite_ip is not called.
+ */
+int32_t krun_enable_tsi_local_only(uint32_t ctx_id, bool enable);
 
 /* Flags for virglrenderer.  Copied from virglrenderer bindings. */
 #define VIRGLRENDERER_USE_EGL 1 << 0

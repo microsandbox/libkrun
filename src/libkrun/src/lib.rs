@@ -61,7 +61,8 @@ const INIT_PATH: &str = "/init.krun";
 #[derive(Default)]
 struct TsiConfig {
     port_map: Option<HashMap<u16, u16>>,
-    redirect_ip: Option<Ipv4Addr>,
+    rewrite_ip: Option<Ipv4Addr>,
+    local_only: bool,
 }
 
 enum NetworkConfig {
@@ -210,10 +211,10 @@ impl ContextConfig {
         }
     }
 
-    fn set_redirect_ip(&mut self, redirect_ip: Ipv4Addr) -> Result<(), ()> {
+    fn set_rewrite_ip(&mut self, rewrite_ip: Ipv4Addr) -> Result<(), ()> {
         match &mut self.net_cfg {
             NetworkConfig::Tsi(tsi_config) => {
-                tsi_config.redirect_ip = Some(redirect_ip);
+                tsi_config.rewrite_ip = Some(rewrite_ip);
                 Ok(())
             }
             _ => Err(()),
@@ -713,27 +714,27 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krun_set_redirect_ip(ctx_id: u32, c_redirect_ip: *const c_char) -> i32 {
+pub unsafe extern "C" fn krun_set_tsi_rewrite_ip(ctx_id: u32, c_rewrite_ip: *const c_char) -> i32 {
     // Validate the input pointer.
-    if c_redirect_ip.is_null() {
+    if c_rewrite_ip.is_null() {
         return -libc::EINVAL;
     }
 
     // Convert the C string to a Rust &str.
-    let redirect_ip_str = match CStr::from_ptr(c_redirect_ip).to_str() {
+    let rewrite_ip_str = match CStr::from_ptr(c_rewrite_ip).to_str() {
         Ok(s) => s,
         Err(_) => return -libc::EINVAL,
     };
 
     // Parse the string into an Ipv4Addr.
-    let redirect_ip = match redirect_ip_str.parse::<Ipv4Addr>() {
+    let rewrite_ip = match rewrite_ip_str.parse::<Ipv4Addr>() {
         Ok(ip) => ip,
         Err(_) => return -libc::EINVAL,
     };
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
-            if ctx_cfg.get_mut().set_redirect_ip(redirect_ip).is_err() {
+            if ctx_cfg.get_mut().set_rewrite_ip(rewrite_ip).is_err() {
                 return -libc::ENOTSUP;
             }
         }
@@ -1148,7 +1149,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vsock_id: "vsock0".to_string(),
         guest_cid: 3,
         host_port_map: None,
-        redirect_ip: None,
+        rewrite_ip: None,
+        local_only: true,
         unix_ipc_port_map: None,
     };
 
@@ -1160,7 +1162,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     match ctx_cfg.net_cfg {
         NetworkConfig::Tsi(tsi_cfg) => {
             vsock_config.host_port_map = tsi_cfg.port_map;
-            vsock_config.redirect_ip = tsi_cfg.redirect_ip;
+            vsock_config.rewrite_ip = tsi_cfg.rewrite_ip;
+            vsock_config.local_only = tsi_cfg.local_only;
             vsock_set = true;
         }
         NetworkConfig::VirtioNetPasst(_fd) => {
