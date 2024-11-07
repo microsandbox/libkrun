@@ -270,9 +270,6 @@ int32_t krun_set_tsi_rewrite_ip(uint32_t ctx_id, const char *rewrite_ip);
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
- *
- * Notes:
- *  This setting is ignored if krun_set_tsi_rewrite_ip is not called.
  */
 int32_t krun_enable_tsi_local_only(uint32_t ctx_id, bool enable);
 

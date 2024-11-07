@@ -186,21 +186,7 @@ impl TcpProxy {
             return 0;
         }
 
-        // Check if target IP is localhost when local_only is true
-        if self.local_only && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
-                "vsock: TcpProxy: Listen attempt on non-localhost IP: {} denied",
-                req.addr
-            );
-            return -libc::EPERM;
-        }
-
-        // If not local_only, check if it's a non-127.0.0.1 loopback address
-        if !self.local_only && req.addr.is_loopback() && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
-                "vsock: TcpProxy: Listen attempt on non-127.0.0.1 loopback IP: {} denied",
-                req.addr
-            );
+        if !self.validate_ip(req.addr, "Listen") {
             return -libc::EPERM;
         }
 
@@ -381,6 +367,27 @@ impl TcpProxy {
             Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
         };
     }
+
+    fn validate_ip(&self, addr: Ipv4Addr, operation: &str) -> bool {
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        true
+    }
 }
 
 impl Proxy for TcpProxy {
@@ -395,22 +402,7 @@ impl Proxy for TcpProxy {
     fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        // Check if target IP is localhost when local_only is true
-        if self.local_only && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
-                "vsock: TcpProxy: Connection attempt to non-localhost IP: {} denied",
-                req.addr
-            );
-            self.push_connect_rsp(-libc::EPERM);
-            return update;
-        }
-
-        // If not local_only, check if it's a non-127.0.0.1 loopback address
-        if !self.local_only && req.addr.is_loopback() && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
-                "vsock: TcpProxy: Connection attempt to non-127.0.0.1 loopback IP: {} denied",
-                req.addr
-            );
+        if !self.validate_ip(req.addr, "Connection") {
             self.push_connect_rsp(-libc::EPERM);
             return update;
         }

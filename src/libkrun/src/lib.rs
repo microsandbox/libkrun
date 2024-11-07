@@ -744,6 +744,22 @@ pub unsafe extern "C" fn krun_set_tsi_rewrite_ip(ctx_id: u32, c_rewrite_ip: *con
     KRUN_SUCCESS
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn krun_enable_tsi_local_only(ctx_id: u32, enable: bool) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            match &mut cfg.net_cfg {
+                NetworkConfig::Tsi(tsi_config) => {
+                    tsi_config.local_only = enable;
+                    KRUN_SUCCESS
+                }
+                _ => -libc::ENOTSUP,
+            }
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]

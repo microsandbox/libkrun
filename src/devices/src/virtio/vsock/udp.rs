@@ -230,6 +230,27 @@ impl UdpProxy {
         debug!("vsock: udp: recv_pkt: have_used={}", have_used);
         (have_used, wait_credit)
     }
+
+    fn validate_ip(&self, addr: Ipv4Addr, operation: &str) -> bool {
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: UdpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: UdpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        true
+    }
 }
 
 impl Proxy for UdpProxy {
@@ -244,32 +265,13 @@ impl Proxy for UdpProxy {
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("vsock: udp: connect: addr={}, port={}", req.addr, req.port);
 
-        // Check if connection IP is localhost
-        if self.local_only && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!("vsock: UdpProxy: Connection attempt to non-localhost IP: {} denied", req.addr);
-
-            // This response goes to the connection.
+        if !self.validate_ip(req.addr, "Connection") {
             let rx = MuxerRx::ConnResponse {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
                 result: -libc::EPERM,
             };
             push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-
-            return ProxyUpdate::default();
-        }
-
-        // If not local_only, check if it's a non-127.0.0.1 loopback address
-        if !self.local_only && req.addr.is_loopback() && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!("vsock: UdpProxy: Connection attempt to non-127.0.0.1 loopback IP: {} denied", req.addr);
-
-            let rx = MuxerRx::ConnResponse {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                result: -libc::EPERM,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-
             return ProxyUpdate::default();
         }
 
@@ -368,15 +370,7 @@ impl Proxy for UdpProxy {
             req.addr, req.port
         );
 
-        // Check if target IP is localhost when local_only is true
-        if self.local_only && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!("vsock: UdpProxy: SendTo attempt to non-localhost IP: {} denied", req.addr);
-            return ProxyUpdate::default();
-        }
-
-        // If not local_only, check if it's a non-127.0.0.1 loopback address
-        if !self.local_only && req.addr.is_loopback() && req.addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!("vsock: UdpProxy: SendTo attempt to non-127.0.0.1 loopback IP: {} denied", req.addr);
+        if !self.validate_ip(req.addr, "SendTo") {
             return ProxyUpdate::default();
         }
 
