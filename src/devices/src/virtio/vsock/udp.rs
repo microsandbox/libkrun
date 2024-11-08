@@ -231,13 +231,22 @@ impl UdpProxy {
         (have_used, wait_credit)
     }
 
-    fn validate_ip(&self, addr: Ipv4Addr, operation: &str) -> bool {
+    fn validate_and_rewrite_ip(&self, addr: Ipv4Addr, operation: &str) -> Result<Ipv4Addr, i32> {
+        // Always allow 0.0.0.0 for binding, it will be rewritten
+        if addr == Ipv4Addr::new(0, 0, 0, 0) {
+            return Ok(if let Some(rewrite) = self.rewrite_ip {
+                rewrite
+            } else {
+                Ipv4Addr::new(127, 0, 0, 1)
+            });
+        }
+
         if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
             debug!(
                 "vsock: UdpProxy: {} attempt to non-localhost IP: {} denied",
                 operation, addr
             );
-            return false;
+            return Err(libc::EPERM);
         }
 
         // If not local_only, check if it's a non-127.0.0.1 loopback address
@@ -246,10 +255,11 @@ impl UdpProxy {
                 "vsock: UdpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
                 operation, addr
             );
-            return false;
+            return Err(libc::EPERM);
         }
 
-        true
+        // Use rewrite_ip if set, otherwise use the original address
+        Ok(self.rewrite_ip.unwrap_or(addr))
     }
 }
 
@@ -265,18 +275,19 @@ impl Proxy for UdpProxy {
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("vsock: udp: connect: addr={}, port={}", req.addr, req.port);
 
-        if !self.validate_ip(req.addr, "Connection") {
-            let rx = MuxerRx::ConnResponse {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                result: -libc::EPERM,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            return ProxyUpdate::default();
-        }
+        let connect_addr = match self.validate_and_rewrite_ip(req.addr, "Connection") {
+            Ok(addr) => addr,
+            Err(e) => {
+                let rx = MuxerRx::ConnResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -e,
+                };
+                push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+                return ProxyUpdate::default();
+            }
+        };
 
-        // Use rewrite_ip if set, otherwise use the original address
-        let connect_addr = self.rewrite_ip.unwrap_or(req.addr);
         debug!(
             "vsock: UdpProxy: Connecting to {} (original: {})",
             connect_addr, req.addr
@@ -370,12 +381,13 @@ impl Proxy for UdpProxy {
             req.addr, req.port
         );
 
-        if !self.validate_ip(req.addr, "SendTo") {
-            return ProxyUpdate::default();
-        }
+        let target_addr = match self.validate_and_rewrite_ip(req.addr, "SendTo") {
+            Ok(addr) => addr,
+            Err(_) => {
+                return ProxyUpdate::default();
+            }
+        };
 
-        // Use rewrite_ip if set, otherwise use the original address
-        let target_addr = self.rewrite_ip.unwrap_or(req.addr);
         debug!(
             "vsock: UdpProxy: SendTo {} (original: {})",
             target_addr, req.addr

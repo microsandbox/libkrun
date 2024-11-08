@@ -181,16 +181,48 @@ impl TcpProxy {
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
+    fn validate_and_rewrite_ip(&self, addr: Ipv4Addr, operation: &str) -> Result<Ipv4Addr, i32> {
+        // Always allow 0.0.0.0 for binding, it will be rewritten
+        if addr == Ipv4Addr::new(0, 0, 0, 0) {
+            return Ok(if let Some(rewrite) = self.rewrite_ip {
+                rewrite
+            } else {
+                Ipv4Addr::new(127, 0, 0, 1)
+            });
+        }
+
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // Use rewrite_ip if set, otherwise use the original address
+        Ok(self.rewrite_ip.unwrap_or(addr))
+    }
+
     fn try_listen(&mut self, req: &TsiListenReq, host_port_map: &Option<HashMap<u16, u16>>) -> i32 {
         if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
             return 0;
         }
 
-        if !self.validate_ip(req.addr, "Listen") {
-            return -libc::EPERM;
-        }
+        let bind_addr = match self.validate_and_rewrite_ip(req.addr, "Listen") {
+            Ok(addr) => addr,
+            Err(e) => return -e,
+        };
 
-        let bind_addr = self.rewrite_ip.unwrap_or(req.addr);
+        info!("tcp: try_listen: bind_addr={}", bind_addr);
         let port = if let Some(port_map) = host_port_map {
             if let Some(port) = port_map.get(&req.port) {
                 *port
@@ -399,16 +431,18 @@ impl Proxy for TcpProxy {
         self.status
     }
 
-    fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        if !self.validate_ip(req.addr, "Connection") {
-            self.push_connect_rsp(-libc::EPERM);
-            return update;
-        }
+        let connect_addr = match self.validate_and_rewrite_ip(req.addr, "Connection") {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.push_connect_rsp(-e);
+                return update;
+            }
+        };
 
-        let connect_addr = self.rewrite_ip.unwrap_or(req.addr);
-        debug!(
+        info!(
             "vsock: TcpProxy: Connecting to {} (original: {})",
             connect_addr, req.addr
         );
@@ -819,3 +853,4 @@ impl Drop for TcpProxy {
         }
     }
 }
+
