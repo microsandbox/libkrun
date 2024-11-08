@@ -116,7 +116,14 @@ impl Vsock {
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
             .collect();
-        Self::with_queues(cid, host_port_map, rewrite_ip, local_only, queues, unix_ipc_port_map)
+        Self::with_queues(
+            cid,
+            host_port_map,
+            rewrite_ip,
+            local_only,
+            queues,
+            unix_ipc_port_map,
+        )
     }
 
     pub fn id(&self) -> &str {

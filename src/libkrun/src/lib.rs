@@ -8,6 +8,7 @@ use std::env;
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
+use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
@@ -15,7 +16,6 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
-use std::net::Ipv4Addr;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::unbounded;

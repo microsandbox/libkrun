@@ -192,7 +192,7 @@ impl TcpProxy {
         }
 
         if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
+            warn!(
                 "vsock: TcpProxy: {} attempt to non-localhost IP: {} denied",
                 operation, addr
             );
@@ -201,7 +201,7 @@ impl TcpProxy {
 
         // If not local_only, check if it's a non-127.0.0.1 loopback address
         if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
+            warn!(
                 "vsock: TcpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
                 operation, addr
             );
@@ -431,7 +431,7 @@ impl Proxy for TcpProxy {
         self.status
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
         let connect_addr = match self.validate_and_rewrite_ip(req.addr, "Connection") {
@@ -853,4 +853,3 @@ impl Drop for TcpProxy {
         }
     }
 }
-

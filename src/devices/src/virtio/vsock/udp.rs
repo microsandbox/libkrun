@@ -242,7 +242,7 @@ impl UdpProxy {
         }
 
         if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
+            warn!(
                 "vsock: UdpProxy: {} attempt to non-localhost IP: {} denied",
                 operation, addr
             );
@@ -251,7 +251,7 @@ impl UdpProxy {
 
         // If not local_only, check if it's a non-127.0.0.1 loopback address
         if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
-            debug!(
+            warn!(
                 "vsock: UdpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
                 operation, addr
             );
@@ -288,7 +288,7 @@ impl Proxy for UdpProxy {
             }
         };
 
-        debug!(
+        info!(
             "vsock: UdpProxy: Connecting to {} (original: {})",
             connect_addr, req.addr
         );
@@ -387,11 +387,6 @@ impl Proxy for UdpProxy {
                 return ProxyUpdate::default();
             }
         };
-
-        debug!(
-            "vsock: UdpProxy: SendTo {} (original: {})",
-            target_addr, req.addr
-        );
 
         let mut update = ProxyUpdate::default();
 
