@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,6 +59,8 @@ impl Vsock {
     pub(crate) fn with_queues(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         queues: Vec<VirtQueue>,
         unix_ipc_port_map: Option<HashMap<u32, PathBuf>>,
     ) -> super::Result<Vsock> {
@@ -79,6 +82,8 @@ impl Vsock {
             muxer: VsockMuxer::new(
                 cid,
                 host_port_map,
+                rewrite_ip,
+                local_only,
                 interrupt_evt.try_clone().unwrap(),
                 interrupt_status.clone(),
                 unix_ipc_port_map,
@@ -103,13 +108,22 @@ impl Vsock {
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         unix_ipc_port_map: Option<HashMap<u32, PathBuf>>,
     ) -> super::Result<Vsock> {
         let queues: Vec<VirtQueue> = defs::QUEUE_SIZES
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
             .collect();
-        Self::with_queues(cid, host_port_map, queues, unix_ipc_port_map)
+        Self::with_queues(
+            cid,
+            host_port_map,
+            rewrite_ip,
+            local_only,
+            queues,
+            unix_ipc_port_map,
+        )
     }
 
     pub fn id(&self) -> &str {

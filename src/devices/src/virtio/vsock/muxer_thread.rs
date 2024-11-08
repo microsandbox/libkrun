@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,8 @@ pub struct MuxerThread {
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
+    rewrite_ip: Option<Ipv4Addr>,
+    local_only: bool,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt_evt: EventFd,
@@ -38,6 +41,8 @@ impl MuxerThread {
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt_evt: EventFd,
@@ -51,6 +56,8 @@ impl MuxerThread {
             epoll,
             rxq,
             proxy_map,
+            rewrite_ip,
+            local_only,
             mem,
             queue,
             interrupt_evt,
@@ -120,6 +127,8 @@ impl MuxerThread {
                 id,
                 local_port,
                 peer_port,
+                self.rewrite_ip,
+                self.local_only,
                 accept_fd,
                 self.mem.clone(),
                 self.queue.clone(),

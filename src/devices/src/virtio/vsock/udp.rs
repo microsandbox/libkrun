@@ -31,6 +31,8 @@ pub struct UdpProxy {
     cid: u64,
     local_port: u32,
     peer_port: u32,
+    rewrite_ip: Option<Ipv4Addr>,
+    local_only: bool,
     fd: RawFd,
     pub status: ProxyStatus,
     sendto_addr: Option<SockaddrIn>,
@@ -49,6 +51,8 @@ impl UdpProxy {
         id: u64,
         cid: u64,
         peer_port: u32,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -94,6 +98,8 @@ impl UdpProxy {
             cid,
             local_port: 0,
             peer_port,
+            rewrite_ip,
+            local_only,
             fd,
             status: ProxyStatus::Idle,
             sendto_addr: None,
@@ -224,6 +230,37 @@ impl UdpProxy {
         debug!("vsock: udp: recv_pkt: have_used={}", have_used);
         (have_used, wait_credit)
     }
+
+    fn validate_and_rewrite_ip(&self, addr: Ipv4Addr, operation: &str) -> Result<Ipv4Addr, i32> {
+        // Always allow 0.0.0.0 for binding, it will be rewritten
+        if addr == Ipv4Addr::new(0, 0, 0, 0) {
+            return Ok(if let Some(rewrite) = self.rewrite_ip {
+                rewrite
+            } else {
+                Ipv4Addr::new(127, 0, 0, 1)
+            });
+        }
+
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            warn!(
+                "vsock: UdpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            warn!(
+                "vsock: UdpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // Use rewrite_ip if set, otherwise use the original address
+        Ok(self.rewrite_ip.unwrap_or(addr))
+    }
 }
 
 impl Proxy for UdpProxy {
@@ -237,9 +274,28 @@ impl Proxy for UdpProxy {
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         debug!("vsock: udp: connect: addr={}, port={}", req.addr, req.port);
+
+        let connect_addr = match self.validate_and_rewrite_ip(req.addr, "Connection") {
+            Ok(addr) => addr,
+            Err(e) => {
+                let rx = MuxerRx::ConnResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -e,
+                };
+                push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+                return ProxyUpdate::default();
+            }
+        };
+
+        info!(
+            "vsock: UdpProxy: Connecting to {} (original: {})",
+            connect_addr, req.addr
+        );
+
         let res = match connect(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)),
+            &SockaddrIn::from(SocketAddrV4::new(connect_addr, req.port)),
         ) {
             Ok(()) => {
                 debug!("vsock: connect: Connected");
@@ -325,9 +381,16 @@ impl Proxy for UdpProxy {
             req.addr, req.port
         );
 
+        let target_addr = match self.validate_and_rewrite_ip(req.addr, "SendTo") {
+            Ok(addr) => addr,
+            Err(_) => {
+                return ProxyUpdate::default();
+            }
+        };
+
         let mut update = ProxyUpdate::default();
 
-        self.sendto_addr = Some(SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)));
+        self.sendto_addr = Some(SockaddrIn::from(SocketAddrV4::new(target_addr, req.port)));
         if !self.listening {
             match bind(self.fd, &SockaddrIn::new(0, 0, 0, 0, 0)) {
                 Ok(_) => {

@@ -33,6 +33,8 @@ pub struct TcpProxy {
     local_port: u32,
     peer_port: u32,
     control_port: u32,
+    rewrite_ip: Option<Ipv4Addr>,
+    local_only: bool,
     fd: RawFd,
     pub status: ProxyStatus,
     mem: GuestMemoryMmap,
@@ -55,6 +57,8 @@ impl TcpProxy {
         local_port: u32,
         peer_port: u32,
         control_port: u32,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -103,6 +107,8 @@ impl TcpProxy {
             local_port,
             peer_port,
             control_port,
+            rewrite_ip,
+            local_only,
             fd,
             status: ProxyStatus::Idle,
             mem,
@@ -125,6 +131,8 @@ impl TcpProxy {
         parent_id: u64,
         local_port: u32,
         peer_port: u32,
+        rewrite_ip: Option<Ipv4Addr>,
+        local_only: bool,
         fd: RawFd,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
@@ -141,6 +149,8 @@ impl TcpProxy {
             local_port,
             peer_port,
             control_port: 0,
+            rewrite_ip,
+            local_only,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -171,11 +181,48 @@ impl TcpProxy {
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
+    fn validate_and_rewrite_ip(&self, addr: Ipv4Addr, operation: &str) -> Result<Ipv4Addr, i32> {
+        // Always allow 0.0.0.0 for binding, it will be rewritten
+        if addr == Ipv4Addr::new(0, 0, 0, 0) {
+            return Ok(if let Some(rewrite) = self.rewrite_ip {
+                rewrite
+            } else {
+                Ipv4Addr::new(127, 0, 0, 1)
+            });
+        }
+
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            warn!(
+                "vsock: TcpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            warn!(
+                "vsock: TcpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return Err(libc::EPERM);
+        }
+
+        // Use rewrite_ip if set, otherwise use the original address
+        Ok(self.rewrite_ip.unwrap_or(addr))
+    }
+
     fn try_listen(&mut self, req: &TsiListenReq, host_port_map: &Option<HashMap<u16, u16>>) -> i32 {
         if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
             return 0;
         }
 
+        let bind_addr = match self.validate_and_rewrite_ip(req.addr, "Listen") {
+            Ok(addr) => addr,
+            Err(e) => return -e,
+        };
+
+        info!("tcp: try_listen: bind_addr={}", bind_addr);
         let port = if let Some(port_map) = host_port_map {
             if let Some(port) = port_map.get(&req.port) {
                 *port
@@ -188,7 +235,7 @@ impl TcpProxy {
 
         match bind(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, port)),
+            &SockaddrIn::from(SocketAddrV4::new(bind_addr, port)),
         ) {
             Ok(_) => {
                 debug!("tcp bind: id={}", self.id);
@@ -352,6 +399,27 @@ impl TcpProxy {
             Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
         };
     }
+
+    fn validate_ip(&self, addr: Ipv4Addr, operation: &str) -> bool {
+        if self.local_only && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-localhost IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        // If not local_only, check if it's a non-127.0.0.1 loopback address
+        if !self.local_only && addr.is_loopback() && addr != Ipv4Addr::new(127, 0, 0, 1) {
+            debug!(
+                "vsock: TcpProxy: {} attempt to non-127.0.0.1 loopback IP: {} denied",
+                operation, addr
+            );
+            return false;
+        }
+
+        true
+    }
 }
 
 impl Proxy for TcpProxy {
@@ -366,9 +434,22 @@ impl Proxy for TcpProxy {
     fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
+        let connect_addr = match self.validate_and_rewrite_ip(req.addr, "Connection") {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.push_connect_rsp(-e);
+                return update;
+            }
+        };
+
+        info!(
+            "vsock: TcpProxy: Connecting to {} (original: {})",
+            connect_addr, req.addr
+        );
+
         let result = match connect(
             self.fd,
-            &SockaddrIn::from(SocketAddrV4::new(req.addr, req.port)),
+            &SockaddrIn::from(SocketAddrV4::new(connect_addr, req.port)),
         ) {
             Ok(()) => {
                 debug!("vsock: connect: Connected");

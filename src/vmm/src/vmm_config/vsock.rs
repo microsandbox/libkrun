@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +39,10 @@ pub struct VsockDeviceConfig {
     pub guest_cid: u32,
     /// An optional map of host to guest port mappings.
     pub host_port_map: Option<HashMap<u16, u16>>,
+    /// An optional IPv4 address to rewrite to.
+    pub rewrite_ip: Option<Ipv4Addr>,
+    /// Whether to only rewrite connections to 127.0.0.1.
+    pub local_only: bool,
     /// An optional map of guest port to host UNIX domain sockets for IPC.
     pub unix_ipc_port_map: Option<HashMap<u32, PathBuf>>,
 }
@@ -77,6 +82,8 @@ impl VsockBuilder {
         Vsock::new(
             u64::from(cfg.guest_cid),
             cfg.host_port_map,
+            cfg.rewrite_ip,
+            cfg.local_only,
             cfg.unix_ipc_port_map,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
@@ -114,6 +121,8 @@ pub(crate) mod tests {
             vsock_id: vsock_dev_id.to_string(),
             guest_cid: 3,
             host_port_map: None,
+            rewrite_ip: None,
+            local_only: true,
             unix_ipc_port_map: None,
         }
     }
