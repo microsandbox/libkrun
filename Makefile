@@ -95,7 +95,7 @@ $(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY)
 ifeq ($(OS),Darwin)
 	cargo build --release $(FEATURE_FLAGS)
 else
-	cd monocore && RUSTFLAGS="-C link-args=-Wl,-rpath,$(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/" \
+	RUSTFLAGS="-C link-args=-Wl,-rpath,$(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/" \
 		cargo build --release $(FEATURE_FLAGS)
 endif
 ifeq ($(SEV),1)
