@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 /// `std::collections::BTreeMap` also apply to this struct. Additionally, there is a 1:1
 /// relationship between the 2 key types. In other words, for each `K1` in the map, there is exactly
 /// one `K2` in the map and vice versa.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MultikeyBTreeMap<K1, K2, V>
 where
     K1: Ord,

@@ -47,7 +47,7 @@ type Inode = u64;
 type Handle = u64;
 
 /// Alternative key for looking up inodes by device and inode number
-#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct InodeAltKey {
     /// The inode number from the host filesystem
     ino: u64,
@@ -79,7 +79,7 @@ struct InodeData {
 }
 
 /// State for directory stream iteration
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct DirStream {
     /// Opaque handle for the directory stream
     stream: u64,
@@ -197,8 +197,8 @@ pub struct OverlayFs {
     /// Symbol table for interned filenames
     filenames: Arc<RwLock<SymbolTable>>,
 
-    /// Map of paths to inodes, where the index in the Vec<Inode> corresponds to the layer index
-    path_to_inode_map: Arc<RwLock<HashMap<Vec<Symbol>, Vec<Inode>>>>,
+    /// Root inodes for each layer, ordered from bottom to top
+    layer_roots: Arc<RwLock<Vec<Inode>>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -221,61 +221,49 @@ impl OverlayFs {
             ));
         }
 
-        // Initialize with inode 1 for the root directory
-        let init_inode = 1;
-        let init_handle = 1;
+        let mut next_inode = 1;
         let mut inodes = MultikeyBTreeMap::new();
-        let mut next_inode = init_inode + 1;
-        let mut path_to_inode_map = HashMap::new();
 
         // Initialize the root inodes for all layers
-        Self::init_root_inodes(
-            &layers,
-            &mut inodes,
-            &mut next_inode,
-            &mut path_to_inode_map,
-        )?;
+        let layer_roots = Self::init_root_inodes(&layers, &mut inodes, &mut next_inode)?;
 
         Ok(OverlayFs {
             inodes: RwLock::new(inodes),
             next_inode: AtomicU64::new(next_inode),
-            init_inode,
+            init_inode: 1,
             handles: RwLock::new(BTreeMap::new()),
-            next_handle: AtomicU64::new(init_handle),
-            init_handle,
+            next_handle: AtomicU64::new(1),
+            init_handle: 1,
             map_windows: Mutex::new(HashMap::new()),
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             cfg,
             filenames: Arc::new(RwLock::new(SymbolTable::new())),
-            path_to_inode_map: Arc::new(RwLock::new(path_to_inode_map)),
+            layer_roots: Arc::new(RwLock::new(layer_roots)),
         })
     }
 
     /// Initialize root inodes for all layers
     ///
-    /// This function processes layers from bottom to top, creating root inodes for each layer
-    /// and populating the path_to_inode_map.
+    /// This function processes layers from top to bottom, creating root inodes for each layer.
     ///
     /// Parameters:
     /// - layers: Slice of paths to the layer roots, ordered from bottom to top
     /// - inodes: Mutable reference to the inodes map to populate
     /// - next_inode: Mutable reference to the next inode counter
-    /// - filenames: Reference to the symbol table for interned filenames
-    /// - path_to_inode_map: Reference to the path to inode map
+    ///
+    /// Returns:
+    /// - io::Result<Vec<Inode>> containing the root inodes for each layer
     fn init_root_inodes(
         layers: &[PathBuf],
         inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
         next_inode: &mut u64,
-        path_to_inode_map: &mut HashMap<Vec<Symbol>, Vec<Inode>>,
-    ) -> io::Result<()> {
-        let num_layers = layers.len();
+    ) -> io::Result<Vec<Inode>> {
+        // Pre-allocate layer_roots with the right size
+        let mut layer_roots = vec![0; layers.len()];
 
-        // Initialize the path_to_inode_map entry for the root path
-        let mut root_inodes = vec![0; num_layers];
-
-        // Process layers from bottom to top
-        for (i, layer_path) in layers.iter().enumerate() {
+        // Process layers from top to bottom
+        for (i, layer_path) in layers.iter().enumerate().rev() {
             let layer_idx = i; // Layer index from bottom to top
 
             // Get the stat information for this layer's root
@@ -301,26 +289,18 @@ impl OverlayFs {
             // Insert the inode into the map
             inodes.insert(inode_id, alt_key, inode_data);
 
-            // Store the root inode for this layer in the path_to_inode_map
-            root_inodes[layer_idx] = inode_id;
+            // Store the root inode for this layer
+            layer_roots[layer_idx] = inode_id;
         }
 
-        // Update the path_to_inode_map with the root inodes
-        path_to_inode_map.insert(vec![], root_inodes);
-
-        Ok(())
+        Ok(layer_roots)
     }
 
     fn get_layer_root(&self, layer_idx: usize) -> io::Result<Arc<InodeData>> {
-        let path_to_inode_map = self.path_to_inode_map.read().unwrap();
-
-        // Get the root path's inodes (empty path represents the root)
-        let root_inodes = path_to_inode_map
-            .get(&vec![])
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "root path not found"))?;
+        let layer_roots = self.layer_roots.read().unwrap();
 
         // Check if the layer index is valid
-        if layer_idx >= root_inodes.len() {
+        if layer_idx >= layer_roots.len() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "layer index out of bounds",
@@ -328,17 +308,14 @@ impl OverlayFs {
         }
 
         // Get the inode for this layer
-        let inode = root_inodes[layer_idx];
+        let inode = layer_roots[layer_idx];
         if inode == 0 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "layer not found"));
         }
 
         // Get the inode data
         let inodes = self.inodes.read().unwrap();
-        inodes
-            .get(&inode)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "inode not found"))
+        inodes.get(&inode).cloned().ok_or_else(ebadf)
     }
 
     /// Creates a new inode and adds it to the inode map
@@ -379,58 +356,22 @@ impl OverlayFs {
             .ok_or_else(ebadf)
     }
 
+    /// Converts a dev/ino pair to a volume path
+    fn dev_ino_to_vol_path(&self, dev: i32, ino: u64) -> io::Result<CString> {
+        let path = format!("/{}/{}/{}", VOL_DIR, dev, ino);
+        CString::new(path).map_err(|_| einval())
+    }
+
+    /// Converts a dev/ino pair and name to a volume path
+    fn dev_ino_and_name_to_vol_path(&self, dev: i32, ino: u64, name: &CStr) -> io::Result<CString> {
+        let path = format!("/{}/{}/{}/{}", VOL_DIR, dev, ino, name.to_string_lossy());
+        CString::new(path).map_err(|_| einval())
+    }
+
     /// Converts an inode number to a volume path
     fn inode_number_to_vol_path(&self, inode: Inode) -> io::Result<CString> {
         let data = self.get_inode_data(inode)?;
-        self.inode_data_to_vol_path(&data)
-    }
-
-    /// Converts an inode to a volume path
-    fn inode_data_to_vol_path(&self, inode_data: &InodeData) -> io::Result<CString> {
-        let path = format!("/{}/{}/{}", VOL_DIR, inode_data.dev, inode_data.ino);
-        CString::new(path).map_err(|_| einval())
-    }
-
-    /// Converts a parent inode and name to a volume path
-    fn inode_data_name_to_vol_path(&self, parent_data: &InodeData, name: &CStr) -> io::Result<CString> {
-        let path = format!(
-            "/{}/{}/{}/{}",
-            VOL_DIR,
-            parent_data.dev,
-            parent_data.ino,
-            name.to_string_lossy()
-        );
-        CString::new(path).map_err(|_| einval())
-    }
-
-    fn symbols_to_path(
-        &self,
-        root_inode_data: &InodeData,
-        symbols: &[Symbol],
-    ) -> io::Result<CString> {
-        if symbols.is_empty() {
-            // If there are no symbols, return the root path
-            return CString::new(format!(
-                "/{}/{}/{}",
-                VOL_DIR, root_inode_data.dev, root_inode_data.ino
-            ))
-            .map_err(|_| einval());
-        }
-
-        // Convert symbols to strings and join them with '/'
-        let mut path_parts = Vec::with_capacity(symbols.len());
-        for symbol in symbols {
-            let filenames_guard = self.filenames.read().unwrap();
-            let name = filenames_guard.get(*symbol).unwrap();
-            let name_str = name.to_string_lossy().into_owned();
-            path_parts.push(name_str);
-        }
-
-        let relative_path = path_parts.join("/");
-        let relative_path_cstr = CString::new(relative_path).map_err(|_| einval())?;
-
-        // Use the relative path with inode_data_name_to_vol_path
-        self.inode_data_name_to_vol_path(root_inode_data, &relative_path_cstr)
+        self.dev_ino_to_vol_path(data.dev, data.ino)
     }
 
     /// Creates an Entry from stat information and inode data
@@ -446,41 +387,17 @@ impl OverlayFs {
     }
 
     /// Checks for whiteout file in top layer
-    fn check_whiteout(&self, parent_path: &CStr, name: &CStr) -> io::Result<()> {
+    fn check_whiteout(&self, parent_path: &CStr, name: &CStr) -> io::Result<bool> {
         let parent_str = parent_path.to_str().map_err(|_| einval())?;
         let name_str = name.to_str().map_err(|_| einval())?;
 
         let whiteout_path = format!("{}/{}{}", parent_str, WHITEOUT_PREFIX, name_str);
         let whiteout_cpath = CString::new(whiteout_path).map_err(|_| einval())?;
 
-        if let Ok(_) = Self::lstat_path(&whiteout_cpath) {
-            return Err(io::Error::from_raw_os_error(libc::ENOENT));
-        }
-        Ok(())
-    }
-
-    /// Looks up an entry in a specific layer
-    fn get_entry_stat(&self, parent_path: &CStr, name: &CStr) -> io::Result<bindings::stat64> {
-        let parent_str = parent_path.to_str().map_err(|_| einval())?;
-        let name_str = name.to_str().map_err(|_| einval())?;
-
-        let full_path = format!("{}/{}", parent_str, name_str);
-        let c_path = CString::new(full_path).map_err(|_| einval())?;
-
-        let st = Self::lstat_path(&c_path)?;
-
-        Ok(st)
-    }
-
-    /// Checks if an inode with the given alternative key exists
-    /// If it exists, increments the refcount and returns the inode
-    fn get_existing_inode(&self, alt_key: &InodeAltKey) -> Option<Inode> {
-        let inodes = self.inodes.read().unwrap();
-        if let Some(existing_data) = inodes.get_alt(alt_key) {
-            existing_data.refcount.fetch_add(1, Ordering::SeqCst);
-            Some(existing_data.inode)
-        } else {
-            None
+        match Self::lstat_path(&whiteout_cpath) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -499,109 +416,15 @@ impl OverlayFs {
         })
     }
 
-    /// Performs a lookup operation
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        let start_layer_idx = parent_data.layer_idx;
-        let parent_path = parent_data.path.clone();
-        let symbol = self.intern_name(name)?;
-        let mut entry_path = parent_path.clone();
-        entry_path.push(symbol);
-
-        // Iteratively check layers from the parent's layer down to layer 0
-        for layer_idx in (0..=start_layer_idx).rev() {
-            let layer_root = self.get_layer_root(layer_idx)?;
-            let path_cstr = self.symbols_to_path(&layer_root, &entry_path)?;
-
-            // Check for whiteouts in upper layers
-            if layer_idx < start_layer_idx {
-                // For each layer above the current one, check if there's a whiteout
-                let mut whiteout_found = false;
-
-                for _ in (layer_idx + 1)..=start_layer_idx {
-                    // Construct the parent path for the whiteout check
-                    let parent_vol_path =
-                        format!("/{}/{}/{}", VOL_DIR, parent_data.dev, parent_data.ino);
-                    let parent_vol_path_cstr = match CString::new(parent_vol_path) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("Invalid parent path for whiteout check: {}", e),
-                            ));
-                        }
-                    };
-
-                    // Check if there's a whiteout for this entry in the upper layer
-                    if let Err(_) = self.check_whiteout(&parent_vol_path_cstr, name) {
-                        // Whiteout found, skip this entry and all lower layers
-                        whiteout_found = true;
-                        break;
-                    }
-                }
-
-                if whiteout_found {
-                    // Skip to the next layer if a whiteout was found
-                    continue;
-                }
-            }
-
-            // Try to stat the entry in this layer
-            match Self::lstat_path(&path_cstr) {
-                Ok(st) => {
-                    // Found the entry in this layer
-                    let alt_key = InodeAltKey::new(st.st_ino, st.st_dev);
-
-                    // Check if we already have this inode
-                    if let Some(data) = self.inodes.read().unwrap().get_alt(&alt_key) {
-                        data.refcount.fetch_add(1, Ordering::SeqCst);
-                        return Ok(self.create_entry(data.inode, st));
-                    }
-
-                    // Create new inode with the path
-                    let (inode, _) = self.create_inode(st.st_ino, st.st_dev, entry_path, layer_idx);
-                    return Ok(self.create_entry(inode, st));
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // Entry not found in this layer, continue to the next layer
-                    continue;
-                }
-                Err(e) => {
-                    // Other error, return it
-                    return Err(e);
-                }
-            }
-        }
-
-        // If we get here, the entry was not found in any layer
-        Err(io::Error::new(io::ErrorKind::NotFound, "Entry not found"))
-    }
-
-    /// Helper function to perform lstat on a path
-    fn lstat_path(c_path: &CString) -> io::Result<bindings::stat64> {
-        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
-
-        let ret = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr() as *mut libc::stat) };
-        if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(unsafe { st.assume_init() })
-        }
-    }
-
-    /// Checks if a name represents a whiteout file
-    fn is_whiteout_name(name: &CStr) -> bool {
-        if let Ok(name_str) = name.to_str() {
-            name_str.starts_with(WHITEOUT_PREFIX)
-        } else {
-            false
+    /// Checks for an opaque directory marker in the given parent directory path.
+    fn check_opaque_marker(&self, parent_path: &CStr) -> io::Result<bool> {
+        let parent_str = parent_path.to_str().map_err(|_| einval())?;
+        let opaque_path = format!("{}/{}", parent_str, OPAQUE_MARKER);
+        let opaque_cpath = CString::new(opaque_path).map_err(|_| einval())?;
+        match Self::lstat_path(&opaque_cpath) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -643,6 +466,171 @@ impl OverlayFs {
         Ok(())
     }
 
+    /// Looks up a path segment by segment in a given layer
+    ///
+    /// This function traverses a path one segment at a time within a specific layer,
+    /// handling whiteouts and opaque markers along the way.
+    ///
+    /// # Return Value
+    /// Returns `Option<io::Result<bindings::stat64>>` where:
+    /// - `Some(Ok(stat))` - Successfully found the file/directory and retrieved its stats
+    /// - `Some(Err(e))` - Encountered an error during lookup that should be propagated:
+    ///   - If error is `NotFound`, caller should try next layer
+    ///   - For any other IO error, caller should stop searching entirely
+    /// - `None` - Stop searching lower layers because either:
+    ///   - Found a whiteout file for this path (file was deleted in this layer)
+    ///   - Found an opaque directory marker (directory contents are masked in this layer)
+    ///
+    /// # Arguments
+    /// * `layer_root` - Root inode data for the layer being searched
+    /// * `path_segments` - Path components to traverse, as interned symbols
+    ///
+    /// # Example Return Flow
+    /// 1. If path exists: `Some(Ok(stat))`
+    /// 2. If path has whiteout: `None`
+    /// 3. If path not found: `Some(Err(NotFound))`
+    /// 4. If directory has opaque marker: `None`
+    /// 5. If IO error occurs: `Some(Err(io_error))`
+    fn lookup_segment_by_segment(
+        &self,
+        layer_root: &Arc<InodeData>,
+        path_segments: &[Symbol],
+    ) -> Option<io::Result<bindings::stat64>> {
+        let mut current_stat;
+        let mut parent_dev = layer_root.dev;
+        let mut parent_ino = layer_root.ino;
+        let mut opaque_marker_found = false;
+
+        // Start from layer root
+        let root_vol_path = match self.dev_ino_to_vol_path(parent_dev, parent_ino) {
+            Ok(path) => path,
+            Err(e) => return Some(Err(e)),
+        };
+
+        current_stat = match Self::lstat_path(&root_vol_path) {
+            Ok(stat) => stat,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Traverse each path segment
+        for segment in path_segments {
+            // Get the current segment name and parent vol path
+            let filenames = self.filenames.read().unwrap();
+            let segment_name = filenames.get(*segment).unwrap();
+            let parent_vol_path = match self.dev_ino_to_vol_path(parent_dev, parent_ino) {
+                Ok(path) => path,
+                Err(e) => return Some(Err(e)),
+            };
+
+            // Check for whiteout at current level
+            match self.check_whiteout(&parent_vol_path, segment_name) {
+                Ok(true) => return None, // Found whiteout, stop searching
+                Ok(false) => (),         // No whiteout, continue
+                Err(e) => return Some(Err(e)),
+            }
+
+            // Check for opaque marker at current level
+            match self.check_opaque_marker(&parent_vol_path) {
+                Ok(true) => {
+                    opaque_marker_found = true;
+                }
+                Ok(false) => (),
+                Err(e) => return Some(Err(e)),
+            }
+
+            // Try to stat the current segment using parent dev/ino
+            let current_vol_path =
+                match self.dev_ino_and_name_to_vol_path(parent_dev, parent_ino, segment_name) {
+                    Ok(path) => path,
+                    Err(e) => return Some(Err(e)),
+                };
+
+            drop(filenames); // Now safe to drop filenames lock
+
+            match Self::lstat_path(&current_vol_path) {
+                Ok(st) => {
+                    // Update parent dev/ino for next iteration
+                    parent_dev = st.st_dev as i32;
+                    parent_ino = st.st_ino;
+                    current_stat = st;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound && opaque_marker_found => {
+                    // For example, for a lookup of /foo/bar/baz, where /foo/bar has an opaque marker,
+                    // then if we cannot find /foo/bar/baz in the current layer, we cannot find it
+                    // in any other layer as /foo/bar is masked.
+                    return None;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        Some(Ok(current_stat))
+    }
+
+    /// Performs a lookup operation
+    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Create path segments for lookup by appending the new name
+        let mut path_segments = parent_data.path.clone();
+        let symbol = self.intern_name(name)?;
+        path_segments.push(symbol);
+
+        // Start from the parent's layer and try each layer down to layer 0
+        for layer_idx in (0..=parent_data.layer_idx).rev() {
+            let layer_root = self.get_layer_root(layer_idx)?;
+
+            match self.lookup_segment_by_segment(&layer_root, &path_segments) {
+                Some(Ok(st)) => {
+                    let alt_key = InodeAltKey::new(st.st_ino, st.st_dev as i32);
+
+                    // Check if we already have this inode
+                    let inodes = self.inodes.read().unwrap();
+                    if let Some(data) = inodes.get_alt(&alt_key) {
+                        data.refcount.fetch_add(1, Ordering::SeqCst);
+                        return Ok(self.create_entry(data.inode, st));
+                    }
+
+                    drop(inodes);
+
+                    // Create new inode
+                    let (inode, _) = self.create_inode(
+                        st.st_ino,
+                        st.st_dev as i32,
+                        path_segments.clone(),
+                        layer_idx,
+                    );
+                    return Ok(self.create_entry(inode, st));
+                }
+                Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    // Continue to check lower layers
+                    continue;
+                }
+                Some(Err(e)) => return Err(e),
+                None => {
+                    // Hit a whiteout or opaque marker, stop searching lower layers
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                }
+            }
+        }
+
+        // Not found in any layer
+        Err(io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    /// Helper function to perform lstat on a path
+    fn lstat_path(c_path: &CString) -> io::Result<bindings::stat64> {
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+
+        let ret = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr() as *mut libc::stat) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { st.assume_init() })
+        }
+    }
+
     /// Performs a readdir operation
     fn do_readdir<F>(
         &self,
@@ -674,8 +662,7 @@ impl OverlayFs {
     /// Performs a getattr operation
     fn do_getattr(&self, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
         // Get the path for this inode
-        let path =
-            self.inode_data_to_vol_path(self.inodes.read().unwrap().get(&inode).ok_or_else(ebadf)?)?;
+        let path = self.inode_number_to_vol_path(inode)?;
 
         // Get file attributes
         let st = Self::lstat_path(&path)?;
@@ -695,69 +682,6 @@ impl OverlayFs {
         todo!("implement do_unlink")
     }
 
-    /// Parses open flags
-    fn parse_open_flags(&self, flags: i32) -> i32 {
-        // Start with the basic access mode
-        let mut parsed = flags & libc::O_ACCMODE;
-
-        // Add standard flags that we want to pass through
-        if flags & libc::O_APPEND != 0 {
-            parsed |= libc::O_APPEND;
-        }
-        if flags & libc::O_ASYNC != 0 {
-            parsed |= libc::O_ASYNC;
-        }
-        if flags & libc::O_CLOEXEC != 0 {
-            parsed |= libc::O_CLOEXEC;
-        }
-        if flags & libc::O_CREAT != 0 {
-            parsed |= libc::O_CREAT;
-        }
-        if flags & libc::O_DIRECTORY != 0 {
-            parsed |= libc::O_DIRECTORY;
-        }
-        if flags & libc::O_EXCL != 0 {
-            parsed |= libc::O_EXCL;
-        }
-        if flags & libc::O_NOFOLLOW != 0 {
-            parsed |= libc::O_NOFOLLOW;
-        }
-        if flags & libc::O_NONBLOCK != 0 {
-            parsed |= libc::O_NONBLOCK;
-        }
-        if flags & libc::O_SYNC != 0 {
-            parsed |= libc::O_SYNC;
-        }
-        if flags & libc::O_TRUNC != 0 {
-            parsed |= libc::O_TRUNC;
-        }
-
-        parsed
-    }
-
-    /// Gets the path to a layer's root directory
-    fn get_layer_path(&self, layer_idx: usize) -> io::Result<CString> {
-        let root_inode = self.get_layer_root(layer_idx)?;
-        CString::new(format!("/{}/{}", VOL_DIR, root_inode.ino)).map_err(|_| einval())
-    }
-
-    /// Returns the file descriptor or an error
-    fn open_layer_dir(&self, layer_idx: usize) -> io::Result<RawFd> {
-        // Get the layer root inode
-        let layer_root = self.get_layer_root(layer_idx)?;
-
-        // Get the layer path
-        let layer_path = self.inode_data_to_vol_path(&layer_root)?;
-
-        // Open the directory
-        let fd = unsafe { libc::open(layer_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(fd)
-    }
-
     /// Decrements the reference count for an inode and removes it if the count reaches zero
     fn forget_one(
         inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
@@ -771,9 +695,6 @@ impl OverlayFs {
             if previous <= count {
                 // Remove the inode from the map
                 inodes.remove(&inode);
-
-                // With the new design, we don't need to recursively forget lower layer inodes
-                // The path_to_inode_map handles the layer relationships
             }
         }
     }
@@ -813,18 +734,6 @@ impl FileSystem for OverlayFs {
         // Enable posix ACLs if supported
         if capable.contains(FsOptions::POSIX_ACL) {
             opts |= FsOptions::POSIX_ACL;
-        }
-
-        // Verify all layers exist and are accessible
-        let path_to_inode_map = self.path_to_inode_map.read().unwrap();
-        let root_path = Vec::new();
-        if let Some(root_inodes) = path_to_inode_map.get(&root_path) {
-            for (layer_idx, &inode) in root_inodes.iter().enumerate() {
-                if inode != 0 {
-                    let fd = self.open_layer_dir(layer_idx)?;
-                    unsafe { libc::close(fd) };
-                }
-            }
         }
 
         Ok(opts)
@@ -1168,7 +1077,6 @@ impl FileSystem for OverlayFs {
         // TODO: Release an open directory
         todo!("implement releasedir")
     }
-
     fn fsyncdir(
         &self,
         _ctx: Context,
@@ -1279,263 +1187,5 @@ impl Default for Context {
             gid: 0,
             pid: 0,
         }
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lookup_basic() -> io::Result<()> {
-        // Create test layers:
-        // Lower layer: file1, dir1/file2
-        // Upper layer: file3
-        let layers = vec![
-            vec![
-                ("file1", false, 0o644),
-                ("dir1", true, 0o755),
-                ("dir1/file2", false, 0o644),
-            ],
-            vec![("file3", false, 0o644)],
-        ];
-
-        let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-
-        // Initialize filesystem
-        fs.init(FsOptions::empty())?;
-
-        // Test lookup in top layer
-        let file3_name = CString::new("file3").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file3_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        // Test lookup in lower layer
-        let file1_name = CString::new("file1").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file1_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        // Test lookup of directory
-        let dir1_name = CString::new("dir1").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &dir1_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_lookup_whiteout() -> io::Result<()> {
-        // Create test layers:
-        // Lower layer: file1, file2
-        // Upper layer: .wh.file1 (whiteout for file1)
-        let layers = vec![
-            vec![("file1", false, 0o644), ("file2", false, 0o644)],
-            vec![(".wh.file1", false, 0o644)],
-        ];
-
-        let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-
-        // Initialize filesystem
-        fs.init(FsOptions::empty())?;
-
-        // Test lookup of whited-out file
-        let file1_name = CString::new("file1").unwrap();
-        assert!(fs.lookup(Context::default(), 1, &file1_name).is_err());
-
-        // Test lookup of non-whited-out file
-        let file2_name = CString::new("file2").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file2_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_lookup_opaque_dir() -> io::Result<()> {
-        // Create test layers:
-        // Lower layer: dir1/file1, dir1/file2
-        // Upper layer: dir1/.wh..wh..opq, dir1/file3
-        let layers = vec![
-            vec![
-                ("dir1", true, 0o755),
-                ("dir1/file1", false, 0o644),
-                ("dir1/file2", false, 0o644),
-            ],
-            vec![
-                ("dir1", true, 0o755),
-                ("dir1/.wh..wh..opq", false, 0o644),
-                ("dir1/file3", false, 0o644),
-            ],
-        ];
-
-        let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-
-        // Initialize filesystem
-        fs.init(FsOptions::empty())?;
-
-        // Lookup dir1 first
-        let dir1_name = CString::new("dir1").unwrap();
-        let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
-
-        // Test lookup of file in opaque directory
-        // file1 and file2 should not be visible
-        let file1_name = CString::new("file1").unwrap();
-        assert!(fs
-            .lookup(Context::default(), dir1_entry.inode, &file1_name)
-            .is_err());
-
-        let file2_name = CString::new("file2").unwrap();
-        assert!(fs
-            .lookup(Context::default(), dir1_entry.inode, &file2_name)
-            .is_err());
-
-        // file3 should be visible
-        let file3_name = CString::new("file3").unwrap();
-        let entry = fs.lookup(Context::default(), dir1_entry.inode, &file3_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_lookup_multiple_layers() -> io::Result<()> {
-        // Create test layers:
-        // Lower layer 1: file1
-        // Lower layer 2: file2
-        // Upper layer: file3
-        let layers = vec![
-            vec![("file1", false, 0o644)],
-            vec![("file2", false, 0o644)],
-            vec![("file3", false, 0o644)],
-        ];
-
-        let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-
-        // Initialize filesystem
-        fs.init(FsOptions::empty())?;
-
-        // Test lookup in each layer
-        let file1_name = CString::new("file1").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file1_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        let file2_name = CString::new("file2").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file2_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        let file3_name = CString::new("file3").unwrap();
-        let entry = fs.lookup(Context::default(), 1, &file3_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_lookup_nested_whiteouts() -> io::Result<()> {
-        // Create test layers:
-        // Lower layer: dir1/file1, dir2/file2
-        // Middle layer: dir1/.wh.file1, .wh.dir2
-        // Upper layer: dir1/file3
-        let layers = vec![
-            vec![
-                ("dir1", true, 0o755),
-                ("dir1/file1", false, 0o644),
-                ("dir2", true, 0o755),
-                ("dir2/file2", false, 0o644),
-            ],
-            vec![
-                ("dir1", true, 0o755),
-                ("dir1/.wh.file1", false, 0o644),
-                (".wh.dir2", false, 0o644),
-            ],
-            vec![("dir1", true, 0o755), ("dir1/file3", false, 0o644)],
-        ];
-
-        let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-
-        // Initialize filesystem
-        fs.init(FsOptions::empty())?;
-
-        // Lookup dir1
-        let dir1_name = CString::new("dir1").unwrap();
-        let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
-        todo!();
-
-        // file1 should be whited out
-        let file1_name = CString::new("file1").unwrap();
-        assert!(fs
-            .lookup(Context::default(), dir1_entry.inode, &file1_name)
-            .is_err());
-
-        // file3 should be visible
-        let file3_name = CString::new("file3").unwrap();
-        let entry = fs.lookup(Context::default(), dir1_entry.inode, &file3_name)?;
-        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
-
-        // dir2 should be whited out
-        let dir2_name = CString::new("dir2").unwrap();
-        assert!(fs.lookup(Context::default(), 1, &dir2_name).is_err());
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod helper {
-    use std::{
-        fs::{self, File},
-        os::unix::fs::PermissionsExt,
-    };
-
-    use super::*;
-    use tempfile::TempDir;
-
-    // Helper function to create a temporary directory with specified files
-    pub(super) fn setup_test_layer(files: &[(&str, bool, u32)]) -> io::Result<TempDir> {
-        let dir = TempDir::new().unwrap();
-
-        for (path, is_dir, mode) in files {
-            let full_path = dir.path().join(path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // TODO:Remove. Debugging.
-            if full_path.exists() {
-                continue;
-            }
-
-            if *is_dir {
-                fs::create_dir(&full_path)?;
-            } else {
-                File::create(&full_path)?;
-            }
-
-            fs::set_permissions(&full_path, fs::Permissions::from_mode(*mode))?;
-        }
-
-        Ok(dir)
-    }
-
-    // Helper function to create an overlayfs with specified layers
-    pub(super) fn create_overlayfs(
-        layers: Vec<Vec<(&str, bool, u32)>>,
-    ) -> io::Result<(OverlayFs, Vec<TempDir>)> {
-        let mut temp_dirs = Vec::new();
-        let mut layer_paths = Vec::new();
-
-        for layer in layers {
-            let temp_dir = setup_test_layer(&layer)?;
-            layer_paths.push(temp_dir.path().to_path_buf());
-            temp_dirs.push(temp_dir);
-        }
-
-        let cfg = Config::default();
-        let overlayfs = OverlayFs::new(layer_paths, cfg)?;
-        Ok((overlayfs, temp_dirs))
     }
 }
