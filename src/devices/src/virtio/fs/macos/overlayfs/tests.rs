@@ -1,7 +1,8 @@
-use std::{ffi::CString, io};
+use std::os::unix::fs::PermissionsExt;
+use std::{ffi::CString, fs, io};
 
 use crate::virtio::{
-    fs::filesystem::{Context, FileSystem},
+    fs::filesystem::{Context, Extensions, FileSystem, SetattrValid},
     fuse::FsOptions,
 };
 
@@ -26,7 +27,7 @@ fn test_lookup_basic() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -60,7 +61,7 @@ fn test_lookup_whiteout() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -96,7 +97,7 @@ fn test_lookup_opaque_dir() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -138,7 +139,7 @@ fn test_lookup_multiple_layers() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -181,7 +182,7 @@ fn test_lookup_nested_whiteouts() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -240,7 +241,7 @@ fn test_lookup_complex_layers() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -339,7 +340,7 @@ fn test_lookup_complex_opaque_dirs() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -430,7 +431,7 @@ fn test_lookup_opaque_with_empty_subdir() -> io::Result<()> {
     ];
 
     let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-    helper::debug_print_layers(&temp_dirs)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
     fs.init(FsOptions::empty())?;
@@ -457,6 +458,1433 @@ fn test_lookup_opaque_with_empty_subdir() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_getattr_basic() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: file1 (mode 0644), dir1 (mode 0755), shadowed (mode 0644)
+    // Upper layer: file2 (mode 0600), shadowed (mode 0600) - shadows lower layer's shadowed
+    let layers = vec![
+        vec![
+            ("file1", false, 0o644),
+            ("dir1", true, 0o755),
+            ("shadowed", false, 0o644),
+        ],
+        vec![
+            ("file2", false, 0o600),
+            ("shadowed", false, 0o600), // This shadows the lower layer's shadowed file
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test getattr on file in lower layer
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), 1, &file1_name)?;
+    let (file1_attr, _) = fs.getattr(Context::default(), file1_entry.inode, None)?;
+    assert_eq!(file1_attr.st_mode & 0o777, 0o644);
+    assert_eq!(file1_attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    // Test getattr on directory
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
+    let (dir1_attr, _) = fs.getattr(Context::default(), dir1_entry.inode, None)?;
+    assert_eq!(dir1_attr.st_mode & 0o777, 0o755);
+    assert_eq!(dir1_attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // Test getattr on file in upper layer
+    let file2_name = CString::new("file2").unwrap();
+    let file2_entry = fs.lookup(Context::default(), 1, &file2_name)?;
+    let (file2_attr, _) = fs.getattr(Context::default(), file2_entry.inode, None)?;
+    assert_eq!(file2_attr.st_mode & 0o777, 0o600);
+    assert_eq!(file2_attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    // Test getattr on shadowed file - should get attributes from upper layer
+    let shadowed_name = CString::new("shadowed").unwrap();
+    let shadowed_entry = fs.lookup(Context::default(), 1, &shadowed_name)?;
+    let (shadowed_attr, _) = fs.getattr(Context::default(), shadowed_entry.inode, None)?;
+    assert_eq!(
+        shadowed_attr.st_mode & 0o777,
+        0o600,
+        "Should get mode from upper layer's shadowed file"
+    );
+    assert_eq!(shadowed_attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_getattr_invalid_inode() -> io::Result<()> {
+    // Create a simple test layer
+    let layers = vec![vec![("file1", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test getattr with invalid inode
+    let invalid_inode = 999999;
+    let result = fs.getattr(Context::default(), invalid_inode, None);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+
+    Ok(())
+}
+
+#[test]
+fn test_getattr_whiteout() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: file1
+    // Upper layer: .wh.file1 (whiteout for file1)
+    let layers = vec![
+        vec![("file1", false, 0o644)],
+        vec![(".wh.file1", false, 0o644)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Try to lookup and getattr whited-out file
+    let file1_name = CString::new("file1").unwrap();
+    assert!(fs.lookup(Context::default(), 1, &file1_name).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_getattr_timestamps() -> io::Result<()> {
+    // Create test layers with a single file
+    let layers = vec![vec![("file1", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Get the file's attributes
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), 1, &file1_name)?;
+    let (file1_attr, timeout) = fs.getattr(Context::default(), file1_entry.inode, None)?;
+
+    // Verify that timestamps are present
+    assert!(file1_attr.st_atime > 0);
+    assert!(file1_attr.st_mtime > 0);
+    assert!(file1_attr.st_ctime > 0);
+
+    // Verify that the timeout matches the configuration
+    assert_eq!(timeout, fs.get_config().attr_timeout);
+
+    Ok(())
+}
+
+#[test]
+fn test_getattr_complex() -> io::Result<()> {
+    // Create test layers with complex directory structure and various shadowing/opaque scenarios:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1 (mode 0644)
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file (mode 0644)
+    //   - dir2/
+    //   - dir2/file2 (mode 0644)
+    // Layer 1 (middle):
+    //   - dir1/ (with opaque marker)
+    //   - dir1/file1 (mode 0600) - shadows bottom but visible due to opaque
+    //   - dir1/middle_file (mode 0600)
+    //   - dir2/file2 (mode 0600) - shadows bottom
+    // Layer 2 (top):
+    //   - dir1/
+    //   - dir1/top_file (mode 0666)
+    //   - dir2/ (with opaque marker)
+    //   - dir2/new_file (mode 0666)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+            ("dir2", true, 0o755),
+            ("dir2/file2", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/.wh..wh..opq", false, 0o644), // Makes dir1 opaque
+            ("dir1/file1", false, 0o600),        // Shadows but visible due to opaque
+            ("dir1/middle_file", false, 0o600),
+            ("dir2", true, 0o755),
+            ("dir2/file2", false, 0o600), // Shadows bottom layer
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/top_file", false, 0o666),
+            ("dir2", true, 0o755),
+            ("dir2/.wh..wh..opq", false, 0o644), // Makes dir2 opaque
+            ("dir2/new_file", false, 0o666),
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test 1: Files in dir1 (with opaque marker in middle layer)
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
+
+    // 1a. file1 should have mode 0600 from middle layer (due to opaque marker), not 0644 from bottom
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), dir1_entry.inode, &file1_name)?;
+    let (file1_attr, _) = fs.getattr(Context::default(), file1_entry.inode, None)?;
+    assert_eq!(
+        file1_attr.st_mode & 0o777,
+        0o600,
+        "file1 should have mode from middle layer due to opaque marker"
+    );
+
+    // 1b. bottom_file should not be visible due to opaque marker in middle layer
+    let bottom_file_name = CString::new("bottom_file").unwrap();
+    assert!(
+        fs.lookup(Context::default(), dir1_entry.inode, &bottom_file_name)
+            .is_err(),
+        "bottom_file should be hidden by opaque marker"
+    );
+
+    // 1c. middle_file should be visible with mode 0600
+    let middle_file_name = CString::new("middle_file").unwrap();
+    let middle_file_entry = fs.lookup(Context::default(), dir1_entry.inode, &middle_file_name)?;
+    let (middle_file_attr, _) = fs.getattr(Context::default(), middle_file_entry.inode, None)?;
+    assert_eq!(middle_file_attr.st_mode & 0o777, 0o600);
+
+    // 1d. top_file should be visible with mode 0666
+    let top_file_name = CString::new("top_file").unwrap();
+    let top_file_entry = fs.lookup(Context::default(), dir1_entry.inode, &top_file_name)?;
+    let (top_file_attr, _) = fs.getattr(Context::default(), top_file_entry.inode, None)?;
+    assert_eq!(top_file_attr.st_mode & 0o777, 0o666);
+
+    // Test 2: Files in dir2 (with opaque marker in top layer)
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(Context::default(), 1, &dir2_name)?;
+
+    // 2a. file2 from bottom and middle layers should not be visible due to opaque marker in top
+    let file2_name = CString::new("file2").unwrap();
+    assert!(
+        fs.lookup(Context::default(), dir2_entry.inode, &file2_name)
+            .is_err(),
+        "file2 should be hidden by opaque marker in top layer"
+    );
+
+    // 2b. new_file should be visible with mode 0666
+    let new_file_name = CString::new("new_file").unwrap();
+    let new_file_entry = fs.lookup(Context::default(), dir2_entry.inode, &new_file_name)?;
+    let (new_file_attr, _) = fs.getattr(Context::default(), new_file_entry.inode, None)?;
+    assert_eq!(new_file_attr.st_mode & 0o777, 0o666);
+
+    // Test 3: Directory attributes
+    // 3a. dir1 should exist and be a directory
+    let (dir1_attr, _) = fs.getattr(Context::default(), dir1_entry.inode, None)?;
+    assert_eq!(dir1_attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    assert_eq!(dir1_attr.st_mode & 0o777, 0o755);
+
+    // 3b. dir2 should exist and be a directory
+    let (dir2_attr, _) = fs.getattr(Context::default(), dir2_entry.inode, None)?;
+    assert_eq!(dir2_attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    assert_eq!(dir2_attr.st_mode & 0o777, 0o755);
+
+    Ok(())
+}
+
+#[test]
+fn test_copyup_complex() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1 (mode 0644)
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file (mode 0644)
+    //   - dir1/symlink -> file1
+    //   - dir2/
+    //   - dir2/file2 (mode 0600)
+    // Layer 1 (middle):
+    //   - dir3/
+    //   - dir3/middle_file (mode 0666)
+    //   - dir3/nested/
+    //   - dir3/nested/data (mode 0644)
+    // Layer 2 (top - initially empty):
+    //   (empty - will be populated by copyup operations)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+            ("dir2", true, 0o755),
+            ("dir2/file2", false, 0o600),
+        ],
+        vec![
+            ("dir3", true, 0o755),
+            ("dir3/middle_file", false, 0o666),
+            ("dir3/nested", true, 0o755),
+            ("dir3/nested/data", false, 0o644),
+        ],
+        vec![], // Empty top layer
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Create symlink in bottom layer
+    let symlink_path = temp_dirs[0].path().join("dir1").join("symlink");
+    std::os::unix::fs::symlink("file1", &symlink_path)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test 1: Copy up a regular file from bottom layer
+    // First lookup dir1/file1 to get its path_inodes
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
+    let file1_name = CString::new("file1").unwrap();
+    let (_, path_inodes) = fs.do_lookup(dir1_entry.inode, &file1_name)?;
+
+    // Perform copyup
+    fs.do_copyup(&path_inodes)?;
+
+    // Verify the file was copied up correctly
+    let top_file1_path = temp_dirs[2].path().join("dir1").join("file1");
+    let metadata = fs::metadata(&top_file1_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+    assert!(top_file1_path.exists());
+
+    // Test 2: Copy up a directory with nested content
+    let dir3_name = CString::new("dir3").unwrap();
+    let dir3_entry = fs.lookup(Context::default(), 1, &dir3_name)?;
+    let nested_name = CString::new("nested").unwrap();
+    let (nested_entry, nested_path_inodes) = fs.do_lookup(dir3_entry.inode, &nested_name)?;
+
+    // Copy up the nested directory
+    fs.do_copyup(&nested_path_inodes)?;
+
+    // Verify the directory structure was copied
+    let top_nested_path = temp_dirs[2].path().join("dir3").join("nested");
+    assert!(top_nested_path.exists());
+    assert!(top_nested_path.is_dir());
+    let metadata = fs::metadata(&top_nested_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+
+    // Test 3: Copy up a file from the middle layer
+    let middle_file_name = CString::new("middle_file").unwrap();
+    let (_, middle_file_path_inodes) = fs.do_lookup(dir3_entry.inode, &middle_file_name)?;
+
+    // Perform copyup
+    fs.do_copyup(&middle_file_path_inodes)?;
+
+    // Verify the file was copied up correctly
+    let top_middle_file_path = temp_dirs[2].path().join("dir3").join("middle_file");
+    let metadata = fs::metadata(&top_middle_file_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o666);
+    assert!(top_middle_file_path.exists());
+
+    // Test 4: Copy up a nested file
+    let data_name = CString::new("data").unwrap();
+    let (_, data_path_inodes) = fs.do_lookup(nested_entry.inode, &data_name)?;
+
+    // Perform copyup
+    fs.do_copyup(&data_path_inodes)?;
+
+    // Verify the nested file was copied up correctly
+    let top_data_path = temp_dirs[2].path().join("dir3").join("nested").join("data");
+    let metadata = fs::metadata(&top_data_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+    assert!(top_data_path.exists());
+
+    // Test 5: Verify parent directories are created as needed
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(Context::default(), 1, &dir2_name)?;
+    let file2_name = CString::new("file2").unwrap();
+    let (_, file2_path_inodes) = fs.do_lookup(dir2_entry.inode, &file2_name)?;
+
+    // Perform copyup
+    fs.do_copyup(&file2_path_inodes)?;
+
+    // Verify the directory structure
+    let top_dir2_path = temp_dirs[2].path().join("dir2");
+    assert!(top_dir2_path.exists());
+    assert!(top_dir2_path.is_dir());
+    let top_file2_path = top_dir2_path.join("file2");
+    let metadata = fs::metadata(&top_file2_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert!(top_file2_path.exists());
+
+    // Test 6: Copy up a symbolic link
+    let symlink_name = CString::new("symlink").unwrap();
+    let (_, symlink_path_inodes) = fs.do_lookup(dir1_entry.inode, &symlink_name)?;
+
+    // Perform copyup
+    fs.do_copyup(&symlink_path_inodes)?;
+
+    // Verify the symlink was copied up correctly
+    let top_symlink_path = temp_dirs[2].path().join("dir1").join("symlink");
+    assert!(top_symlink_path.exists());
+    assert!(fs::symlink_metadata(&top_symlink_path)?
+        .file_type()
+        .is_symlink());
+
+    // Read the symlink target
+    let target = fs::read_link(&top_symlink_path)?;
+    assert_eq!(target.to_str().unwrap(), "file1");
+
+    Ok(())
+}
+
+#[test]
+fn test_setattr_basic() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: file1 (mode 0644)
+    // Upper layer: file2 (mode 0600)
+    let layers = vec![vec![("file1", false, 0o644)], vec![("file2", false, 0o600)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, true)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test setattr on file in upper layer
+    let file2_name = CString::new("file2").unwrap();
+    let file2_entry = fs.lookup(Context::default(), 1, &file2_name)?;
+
+    // Change mode to 0640
+    let mut attr = file2_entry.attr;
+    attr.st_mode = (attr.st_mode & !0o777) | 0o640;
+    let valid = SetattrValid::MODE;
+    let (new_attr, _) = fs.setattr(Context::default(), file2_entry.inode, attr, None, valid)?;
+    assert_eq!(new_attr.st_mode & 0o777, 0o640);
+
+    // Verify the change was applied to the filesystem
+    let (verify_attr, _) = fs.getattr(Context::default(), file2_entry.inode, None)?;
+    assert_eq!(verify_attr.st_mode & 0o777, 0o640);
+
+    Ok(())
+}
+
+#[test]
+fn test_setattr_copyup() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: file1 (mode 0644)
+    // Upper layer: empty (file1 will be copied up)
+    let layers = vec![vec![("file1", false, 0o644)], vec![]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, true)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test setattr on file in lower layer (should trigger copyup)
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), 1, &file1_name)?;
+
+    // Change mode to 0640
+    let mut attr = file1_entry.attr;
+    attr.st_mode = (attr.st_mode & !0o777) | 0o640;
+    let valid = SetattrValid::MODE;
+    let (new_attr, _) = fs.setattr(Context::default(), file1_entry.inode, attr, None, valid)?;
+    assert_eq!(new_attr.st_mode & 0o777, 0o640);
+
+    Ok(())
+}
+
+#[test]
+fn test_setattr_timestamps() -> io::Result<()> {
+    // Create test layers with a single file
+    let layers = vec![vec![("file1", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Get the file's entry
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), 1, &file1_name)?;
+
+    // Set specific timestamps
+    let mut attr = file1_entry.attr;
+    attr.st_atime = 12345;
+    attr.st_atime_nsec = 67890;
+    attr.st_mtime = 98765;
+    attr.st_mtime_nsec = 43210;
+
+    let valid = SetattrValid::ATIME | SetattrValid::MTIME;
+    let (new_attr, _) = fs.setattr(Context::default(), file1_entry.inode, attr, None, valid)?;
+
+    // Verify timestamps were set
+    assert_eq!(new_attr.st_atime, 12345);
+    assert_eq!(new_attr.st_atime_nsec, 67890);
+    assert_eq!(new_attr.st_mtime, 98765);
+    assert_eq!(new_attr.st_mtime_nsec, 43210);
+
+    Ok(())
+}
+
+#[test]
+fn test_setattr_size() -> io::Result<()> {
+    // Create test layers with a single file
+    let layers = vec![vec![("file1", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Get the file's entry
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), 1, &file1_name)?;
+
+    // Set file size to 1000 bytes
+    let mut attr = file1_entry.attr;
+    attr.st_size = 1000;
+    let valid = SetattrValid::SIZE;
+    let (new_attr, _) = fs.setattr(Context::default(), file1_entry.inode, attr, None, valid)?;
+
+    // Verify size was set
+    assert_eq!(new_attr.st_size, 1000);
+
+    // Verify the actual file size on disk
+    let file_path = temp_dirs[0].path().join("file1");
+    let metadata = fs::metadata(file_path)?;
+    assert_eq!(metadata.len(), 1000);
+
+    Ok(())
+}
+
+#[test]
+fn test_setattr_complex() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1 (mode 0644)
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file (mode 0644)
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2 (mode 0600)
+    // Layer 2 (top):
+    //   - dir3/
+    //   - dir3/file3 (mode 0666)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/file2", false, 0o600)],
+        vec![("dir3", true, 0o755), ("dir3/file3", false, 0o666)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test 1: Modify file in bottom layer (should trigger copyup)
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(Context::default(), dir1_entry.inode, &file1_name)?;
+
+    // Change mode and size
+    let mut attr = file1_entry.attr;
+    attr.st_mode = (attr.st_mode & !0o777) | 0o640;
+    attr.st_size = 2000;
+    let valid = SetattrValid::MODE | SetattrValid::SIZE;
+    let (new_attr, _) = fs.setattr(Context::default(), file1_entry.inode, attr, None, valid)?;
+
+    // Verify changes
+    assert_eq!(new_attr.st_mode & 0o777, 0o640);
+    assert_eq!(new_attr.st_size, 2000);
+
+    // Test 2: Modify file in middle layer (should trigger copyup)
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(Context::default(), 1, &dir2_name)?;
+    let file2_name = CString::new("file2").unwrap();
+    let file2_entry = fs.lookup(Context::default(), dir2_entry.inode, &file2_name)?;
+
+    // Change timestamps
+    let mut attr = file2_entry.attr;
+    attr.st_atime = 12345;
+    attr.st_mtime = 67890;
+    let valid = SetattrValid::ATIME | SetattrValid::MTIME;
+    let (new_attr, _) = fs.setattr(Context::default(), file2_entry.inode, attr, None, valid)?;
+
+    // Verify changes
+    assert_eq!(new_attr.st_atime, 12345);
+    assert_eq!(new_attr.st_mtime, 67890);
+
+    // Verify file was copied up
+    let top_file2_path = temp_dirs[2].path().join("dir2").join("file2");
+    assert!(top_file2_path.exists());
+
+    // Test 3: Modify file in top layer (no copyup needed)
+    let dir3_name = CString::new("dir3").unwrap();
+    let dir3_entry = fs.lookup(Context::default(), 1, &dir3_name)?;
+    let file3_name = CString::new("file3").unwrap();
+    let file3_entry = fs.lookup(Context::default(), dir3_entry.inode, &file3_name)?;
+
+    // Change mode
+    let mut attr = file3_entry.attr;
+    attr.st_mode = (attr.st_mode & !0o777) | 0o644;
+    let valid = SetattrValid::MODE;
+    let (new_attr, _) = fs.setattr(Context::default(), file3_entry.inode, attr, None, valid)?;
+
+    // Verify changes
+    assert_eq!(new_attr.st_mode & 0o777, 0o644);
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_basic() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: target_file, link -> target_file
+    let layers = vec![vec![
+        ("target_file", false, 0o644),
+        // Note: symlinks will be created separately below
+    ]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Create symlink in bottom layer
+    let symlink_path = temp_dirs[0].path().join("link");
+    std::os::unix::fs::symlink("target_file", &symlink_path)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test readlink
+    let link_name = CString::new("link").unwrap();
+    let link_entry = fs.lookup(Context::default(), 1, &link_name)?;
+    let target = fs.readlink(Context::default(), link_entry.inode)?;
+
+    assert_eq!(target, b"target_file");
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_multiple_layers() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: target1, link1 -> target1
+    // Middle layer: target2, link2 -> target2
+    // Upper layer: target3, link3 -> target3
+    let layers = vec![
+        vec![("target1", false, 0o644)],
+        vec![("target2", false, 0o644)],
+        vec![("target3", false, 0o644)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+    // Create symlinks in each layer
+    std::os::unix::fs::symlink("target1", temp_dirs[0].path().join("link1"))?;
+    std::os::unix::fs::symlink("target2", temp_dirs[1].path().join("link2"))?;
+    std::os::unix::fs::symlink("target3", temp_dirs[2].path().join("link3"))?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test readlink for symlink in bottom layer
+    let link1_name = CString::new("link1").unwrap();
+    let link1_entry = fs.lookup(Context::default(), 1, &link1_name)?;
+    let target1 = fs.readlink(Context::default(), link1_entry.inode)?;
+    assert_eq!(target1, b"target1");
+
+    // Test readlink for symlink in middle layer
+    let link2_name = CString::new("link2").unwrap();
+    let link2_entry = fs.lookup(Context::default(), 1, &link2_name)?;
+    let target2 = fs.readlink(Context::default(), link2_entry.inode)?;
+    assert_eq!(target2, b"target2");
+
+    // Test readlink for symlink in top layer
+    let link3_name = CString::new("link3").unwrap();
+    let link3_entry = fs.lookup(Context::default(), 1, &link3_name)?;
+    let target3 = fs.readlink(Context::default(), link3_entry.inode)?;
+    assert_eq!(target3, b"target3");
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_shadowed() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: target1, link -> target1
+    // Upper layer: link -> target2 (shadows lower layer's link)
+    let layers = vec![
+        vec![("target1", false, 0o644)],
+        vec![("target2", false, 0o644)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Create symlinks
+    std::os::unix::fs::symlink("target1", temp_dirs[0].path().join("link"))?;
+    std::os::unix::fs::symlink("target2", temp_dirs[1].path().join("link"))?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test readlink - should get the symlink from upper layer
+    let link_name = CString::new("link").unwrap();
+    let link_entry = fs.lookup(Context::default(), 1, &link_name)?;
+    let target = fs.readlink(Context::default(), link_entry.inode)?;
+
+    assert_eq!(target, b"target2", "Should read symlink from upper layer");
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_nested() -> io::Result<()> {
+    // Create test layers with nested directory structure:
+    // Lower layer:
+    //   - dir1/target1
+    //   - dir1/link1 -> target1
+    //   - dir2/target2
+    //   - dir2/subdir/link2 -> ../target2
+    let layers = vec![vec![
+        ("dir1", true, 0o755),
+        ("dir1/target1", false, 0o644),
+        ("dir2", true, 0o755),
+        ("dir2/target2", false, 0o644),
+        ("dir2/subdir", true, 0o755),
+    ]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+    // Create symlinks
+    std::os::unix::fs::symlink("target1", temp_dirs[0].path().join("dir1/link1"))?;
+    std::os::unix::fs::symlink("../target2", temp_dirs[0].path().join("dir2/subdir/link2"))?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test readlink for simple symlink in directory
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(Context::default(), 1, &dir1_name)?;
+    let link1_name = CString::new("link1").unwrap();
+    let link1_entry = fs.lookup(Context::default(), dir1_entry.inode, &link1_name)?;
+    let target1 = fs.readlink(Context::default(), link1_entry.inode)?;
+    assert_eq!(target1, b"target1");
+
+    // Test readlink for symlink with relative path
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(Context::default(), 1, &dir2_name)?;
+    let subdir_name = CString::new("subdir").unwrap();
+    let subdir_entry = fs.lookup(Context::default(), dir2_entry.inode, &subdir_name)?;
+    let link2_name = CString::new("link2").unwrap();
+    let link2_entry = fs.lookup(Context::default(), subdir_entry.inode, &link2_name)?;
+    let target2 = fs.readlink(Context::default(), link2_entry.inode)?;
+    assert_eq!(target2, b"../target2");
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_errors() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: regular_file, directory
+    let layers = vec![vec![
+        ("regular_file", false, 0o644),
+        ("directory", true, 0o755),
+    ]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Test readlink on regular file (should fail)
+    let file_name = CString::new("regular_file").unwrap();
+    let file_entry = fs.lookup(Context::default(), 1, &file_name)?;
+    let result = fs.readlink(Context::default(), file_entry.inode);
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().raw_os_error(),
+        Some(libc::EINVAL),
+        "Reading link of regular file should return EINVAL"
+    );
+
+    // Test readlink on directory (should fail)
+    let dir_name = CString::new("directory").unwrap();
+    let dir_entry = fs.lookup(Context::default(), 1, &dir_name)?;
+    let result = fs.readlink(Context::default(), dir_entry.inode);
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().raw_os_error(),
+        Some(libc::EINVAL),
+        "Reading link of directory should return EINVAL"
+    );
+
+    // Test readlink with invalid inode
+    let result = fs.readlink(Context::default(), 999999);
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().raw_os_error(),
+        Some(libc::EBADF),
+        "Reading link with invalid inode should return EBADF"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_readlink_whiteout() -> io::Result<()> {
+    // Create test layers:
+    // Lower layer: target1, link1 -> target1
+    // Upper layer: .wh.link1 (whiteout for link1)
+    let layers = vec![
+        vec![("target1", false, 0o644)],
+        vec![(".wh.link1", false, 0o644)], // Whiteout file
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Create symlink in bottom layer
+    std::os::unix::fs::symlink("target1", temp_dirs[0].path().join("link1"))?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Try to lookup whited-out symlink (should fail)
+    let link_name = CString::new("link1").unwrap();
+    match fs.lookup(Context::default(), 1, &link_name) {
+        Ok(_) => panic!("Expected lookup of whited-out symlink to fail"),
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::ENOENT),
+                "Looking up whited-out symlink should return ENOENT"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_basic() -> io::Result<()> {
+    // Create test layers:
+    // Single layer with a file
+    let layers = vec![vec![("file1", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Create a new directory
+    let dir_name = CString::new("new_dir").unwrap();
+    let ctx = Context::default();
+    let entry = fs.mkdir(ctx, 1, &dir_name, 0o755, 0, Extensions::default())?;
+
+    // Verify the directory was created with correct mode
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    assert_eq!(entry.attr.st_mode & 0o777, 0o755);
+
+    // Verify we can look it up
+    let lookup_entry = fs.lookup(ctx, 1, &dir_name)?;
+    assert_eq!(lookup_entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // Verify the directory exists on disk in the top layer
+    let dir_path = temp_dirs.last().unwrap().path().join("new_dir");
+    assert!(dir_path.exists());
+    assert!(dir_path.is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_nested() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2
+    // Layer 2 (top):
+    //   - dir3/
+    //   - dir3/top_file
+    //   - dir1/.wh.subdir (whiteout)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/file2", false, 0o644)],
+        vec![
+            ("dir3", true, 0o755),
+            ("dir3/top_file", false, 0o644),
+            ("dir1/.wh.subdir", false, 0o644),
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Create nested directory in dir1 (should trigger copy-up)
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+    let nested_name = CString::new("new_nested").unwrap();
+    let nested_entry = fs.mkdir(
+        ctx,
+        dir1_entry.inode,
+        &nested_name,
+        0o700,
+        0,
+        Extensions::default(),
+    )?;
+    assert_eq!(nested_entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // Test 2: Create directory inside the newly created nested directory
+    let deep_name = CString::new("deep_dir").unwrap();
+    let deep_entry = fs.mkdir(
+        ctx,
+        nested_entry.inode,
+        &deep_name,
+        0o755,
+        0,
+        Extensions::default(),
+    )?;
+    assert_eq!(deep_entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    // Test 3: Create directory in dir2 (middle layer, should trigger copy-up)
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+    let middle_nested_name = CString::new("middle_nested").unwrap();
+    let middle_nested_entry = fs.mkdir(
+        ctx,
+        dir2_entry.inode,
+        &middle_nested_name,
+        0o755,
+        0,
+        Extensions::default(),
+    )?;
+    assert_eq!(
+        middle_nested_entry.attr.st_mode & libc::S_IFMT,
+        libc::S_IFDIR
+    );
+
+    // Test 4: Create directory in dir3 (top layer, no copy-up needed)
+    let dir3_name = CString::new("dir3").unwrap();
+    let dir3_entry = fs.lookup(ctx, 1, &dir3_name)?;
+    let top_nested_name = CString::new("top_nested").unwrap();
+    let top_nested_entry = fs.mkdir(
+        ctx,
+        dir3_entry.inode,
+        &top_nested_name,
+        0o755,
+        0,
+        Extensions::default(),
+    )?;
+    assert_eq!(top_nested_entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Verify all directories exist in appropriate layers
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(top_layer.join("dir1/new_nested").exists());
+    assert!(top_layer.join("dir1/new_nested/deep_dir").exists());
+    assert!(top_layer.join("dir2/middle_nested").exists());
+    assert!(top_layer.join("dir3/top_nested").exists());
+
+    // Verify the original files are still accessible
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, dir1_entry.inode, &file1_name)?;
+    assert_eq!(file1_entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_with_umask() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/subdir/ (0o755)
+    //   - dir1/subdir/file1
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2
+    // Layer 2 (top):
+    //   - dir3/ (0o777)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/file1", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/file2", false, 0o644)],
+        vec![("dir3", true, 0o777)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Create directory with different umasks in root
+    let dir_names = vec![
+        ("dir_umask_022", 0o777, 0o022, 0o755), // Common umask
+        ("dir_umask_077", 0o777, 0o077, 0o700), // Strict umask
+        ("dir_umask_002", 0o777, 0o002, 0o775), // Group writable
+        ("dir_umask_000", 0o777, 0o000, 0o777), // No umask
+    ];
+
+    let test_cases = dir_names.clone();
+    for (name, mode, umask, expected) in test_cases {
+        let dir_name = CString::new(name).unwrap();
+        let entry = fs.mkdir(ctx, 1, &dir_name, mode, umask, Extensions::default())?;
+        assert_eq!(
+            entry.attr.st_mode & 0o777,
+            expected,
+            "Directory {} has wrong permissions",
+            name
+        );
+    }
+
+    // Test 2: Create nested directories with umask in different layers
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+    let nested_name = CString::new("nested_umask").unwrap();
+    let nested_entry = fs.mkdir(
+        ctx,
+        dir1_entry.inode,
+        &nested_name,
+        0o777,
+        0o027,
+        Extensions::default(),
+    )?;
+    assert_eq!(nested_entry.attr.st_mode & 0o777, 0o750);
+
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+    let middle_name = CString::new("middle_umask").unwrap();
+    let middle_entry = fs.mkdir(
+        ctx,
+        dir2_entry.inode,
+        &middle_name,
+        0o777,
+        0o077,
+        Extensions::default(),
+    )?;
+    assert_eq!(middle_entry.attr.st_mode & 0o777, 0o700);
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_existing_name() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    //   - dir1/subdir/file2
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file3
+    //   - dir1/another_file
+    // Layer 2 (top):
+    //   - dir3/
+    //   - dir3/file4
+    //   - .wh.dir1/subdir (whiteout)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/file2", false, 0o644),
+        ],
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/file3", false, 0o644),
+            ("dir1/another_file", false, 0o644),
+        ],
+        vec![
+            ("dir3", true, 0o755),
+            ("dir3/file4", false, 0o644),
+            ("dir1/.wh.subdir", false, 0o644),
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Try to create directory with name of existing file in bottom layer
+    let file1_name = CString::new("file1").unwrap();
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+    match fs.mkdir(
+        ctx,
+        dir1_entry.inode,
+        &file1_name,
+        0o755,
+        0,
+        Extensions::default(),
+    ) {
+        Ok(_) => {
+            helper::debug_print_layers(&temp_dirs, false)?;
+            panic!("Expected mkdir with existing file name to fail");
+        }
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+    }
+
+    // Test 2: Try to create directory with name of existing file in middle layer
+    let file3_name = CString::new("file3").unwrap();
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+    match fs.mkdir(
+        ctx,
+        dir2_entry.inode,
+        &file3_name,
+        0o755,
+        0,
+        Extensions::default(),
+    ) {
+        Ok(_) => panic!("Expected mkdir with existing file name to fail"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+    }
+
+    // Test 3: Try to create directory with name of existing directory
+    let dir3_name = CString::new("dir3").unwrap();
+    match fs.mkdir(ctx, 1, &dir3_name, 0o755, 0, Extensions::default()) {
+        Ok(_) => panic!("Expected mkdir with existing directory name to fail"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+    }
+
+    // Test 4: Try to create directory with name that exists in lower layer but is whited out
+    let subdir_name = CString::new("subdir").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    // This should succeed because the original subdir is whited out
+    let new_subdir = fs.mkdir(
+        ctx,
+        dir1_entry.inode,
+        &subdir_name,
+        0o755,
+        0,
+        Extensions::default(),
+    )?;
+    assert_eq!(new_subdir.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_invalid_parent() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2
+    //   - .wh.dir1 (whiteout entire dir1)
+    // Layer 2 (top):
+    //   - dir3/
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+        ],
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/file2", false, 0o644),
+            (".wh.dir1", false, 0o644), // Whiteout entire dir1
+        ],
+        vec![("dir3", true, 0o755)],
+    ];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&_temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Try to create directory with non-existent parent inode
+    let dir_name = CString::new("new_dir").unwrap();
+    let invalid_inode = 999999;
+    match fs.mkdir(
+        ctx,
+        invalid_inode,
+        &dir_name,
+        0o755,
+        0,
+        Extensions::default(),
+    ) {
+        Ok(_) => panic!("Expected mkdir with invalid parent to fail"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBADF)),
+    }
+
+    // Test 2: Try to create directory in whited-out directory
+    let dir1_name = CString::new("dir1").unwrap();
+    match fs.lookup(ctx, 1, &dir1_name) {
+        Ok(_) => panic!("Expected lookup of whited-out directory to fail"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOENT)),
+    }
+
+    // Test 3: Try to create directory with file as parent
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+    let file2_name = CString::new("file2").unwrap();
+    let file2_entry = fs.lookup(ctx, dir2_entry.inode, &file2_name)?;
+
+    let nested_name = CString::new("nested").unwrap();
+    match fs.mkdir(
+        ctx,
+        file2_entry.inode,
+        &nested_name,
+        0o755,
+        0,
+        Extensions::default(),
+    ) {
+        Ok(_) => panic!("Expected mkdir with file as parent to fail"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR)),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_invalid_name() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/.hidden_file
+    //   - dir1/subdir/
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/.wh..wh..opq (opaque directory)
+    // Layer 2 (top):
+    //   - dir3/
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/.hidden_file", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+        ],
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/.wh..wh..opq", false, 0o644), // Opaque directory marker
+        ],
+        vec![("dir3", true, 0o755)],
+    ];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test various invalid names
+    let test_cases = vec![
+        ("", io::ErrorKind::InvalidInput, "empty name"),
+        (
+            "..",
+            io::ErrorKind::PermissionDenied,
+            "parent dir traversal",
+        ),
+        ("foo/bar", io::ErrorKind::PermissionDenied, "contains slash"),
+        (
+            "foo\\bar",
+            io::ErrorKind::PermissionDenied,
+            "contains backslash",
+        ),
+        (
+            "foo\0bar",
+            io::ErrorKind::InvalidInput,
+            "contains null byte",
+        ),
+        (".wh.foo", io::ErrorKind::InvalidInput, "whiteout prefix"),
+        (".wh..wh..opq", io::ErrorKind::InvalidInput, "opaque marker"),
+    ];
+
+    for (name, expected_kind, desc) in test_cases {
+        let name = CString::new(name.as_bytes().to_vec()).unwrap_or_default();
+        match fs.mkdir(ctx, 1, &name, 0o755, 0, Extensions::default()) {
+            Ok(_) => panic!("Expected mkdir with {} to fail", desc),
+            Err(e) => assert_eq!(
+                e.kind(),
+                expected_kind,
+                "Wrong error kind for {}: expected {:?}, got {:?}",
+                desc,
+                expected_kind,
+                e.kind()
+            ),
+        }
+    }
+
+    // Test invalid UTF-8 separately since it can't be represented as a string literal
+    let invalid_utf8 = vec![0x66, 0x6f, 0x6f, 0x80, 0x62, 0x61, 0x72]; // "foo<invalid>bar"
+    let name = CString::new(invalid_utf8).unwrap();
+    match fs.mkdir(ctx, 1, &name, 0o755, 0, Extensions::default()) {
+        Ok(_) => panic!("Expected mkdir with invalid UTF-8 to fail"),
+        Err(e) => assert_eq!(
+            e.kind(),
+            io::ErrorKind::InvalidInput,
+            "Wrong error kind for invalid UTF-8: expected {:?}, got {:?}",
+            io::ErrorKind::InvalidInput,
+            e.kind()
+        ),
+    }
+
+    // Test with valid but unusual names
+    let valid_cases = vec![
+        "very_long_name_that_is_valid_but_unusual_and_tests_length_limits",
+        " leading_space",
+        "trailing_space ",
+        "!@#$%^&*()_+-=",
+    ];
+
+    for name in valid_cases {
+        let name = CString::new(name).unwrap();
+        // These should succeed
+        let entry = fs.mkdir(ctx, 1, &name, 0o755, 0, Extensions::default())?;
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_mkdir_multiple_layers() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2
+    // Layer 2 (top):
+    //   - dir3/
+    //   - dir3/top_file
+    //   - .wh.dir1 (whiteout)
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/file2", false, 0o644)],
+        vec![
+            ("dir3", true, 0o755),
+            ("dir3/top_file", false, 0o644),
+            (".wh.dir1", false, 0o644),
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Create directory in each layer and verify copy-up behavior
+    let dir_names = vec![("dir2", "new_dir2"), ("dir3", "new_dir3")];
+
+    for (parent, new_dir) in dir_names {
+        let parent_name = CString::new(parent).unwrap();
+        let parent_entry = fs.lookup(ctx, 1, &parent_name)?;
+
+        let new_name = CString::new(new_dir).unwrap();
+        let entry = fs.mkdir(
+            ctx,
+            parent_entry.inode,
+            &new_name,
+            0o755,
+            0,
+            Extensions::default(),
+        )?;
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+
+        // Create a nested directory inside
+        let nested_name = CString::new(format!("nested_in_{}", new_dir)).unwrap();
+        let nested_entry = fs.mkdir(
+            ctx,
+            entry.inode,
+            &nested_name,
+            0o700,
+            0,
+            Extensions::default(),
+        )?;
+        assert_eq!(nested_entry.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    }
+
+    // Test 2: Verify all directories exist in the top layer
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(top_layer.join("dir2/new_dir2").exists());
+    assert!(top_layer.join("dir2/new_dir2/nested_in_new_dir2").exists());
+    assert!(top_layer.join("dir3/new_dir3").exists());
+    assert!(top_layer.join("dir3/new_dir3/nested_in_new_dir3").exists());
+
+    // Test 3: Try to create directory in whited-out dir1 (should fail)
+    let dir1_name = CString::new("dir1").unwrap();
+    match fs.lookup(ctx, 1, &dir1_name) {
+        Ok(_) => panic!("Expected lookup of whited-out directory to fail"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOENT)),
+    }
+
+    Ok(())
+}
+
 mod helper {
     use std::{
         fs::{self, File},
@@ -475,11 +1903,6 @@ mod helper {
             let full_path = dir.path().join(path);
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent)?;
-            }
-
-            // TODO:Remove. Debugging.
-            if full_path.exists() {
-                continue;
             }
 
             if *is_dir {
@@ -513,17 +1936,19 @@ mod helper {
     }
 
     // Debug utility to print the directory structure of each layer using tree command
-    pub(super) fn debug_print_layers(temp_dirs: &[TempDir]) -> io::Result<()> {
+    pub(super) fn debug_print_layers(temp_dirs: &[TempDir], show_perms: bool) -> io::Result<()> {
         println!("\n=== Layer Directory Structures ===");
 
         for (i, dir) in temp_dirs.iter().enumerate() {
             println!("\nLayer {}: {}", i, dir.path().display());
 
-            // Run tree command on the layer directory
-            let output = Command::new("tree")
-                .arg("-a") // Show hidden files
-                .arg(dir.path())
-                .output()?;
+            let path = dir.path();
+            let mut tree_cmd = Command::new("tree");
+            tree_cmd.arg("-a"); // show hidden files
+            if show_perms {
+                tree_cmd.arg("-p");
+            }
+            let output = tree_cmd.arg(path).output()?;
 
             if output.status.success() {
                 println!("{}", String::from_utf8_lossy(&output.stdout));
@@ -534,7 +1959,9 @@ mod helper {
                 );
             }
         }
+
         println!("================================\n");
+
         Ok(())
     }
 }

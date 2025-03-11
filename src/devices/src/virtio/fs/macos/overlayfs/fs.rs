@@ -17,7 +17,7 @@ use intaglio::Symbol;
 use crate::virtio::bindings;
 use crate::virtio::fs::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
-    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    ListxattrReply, OpenOptions, SecContext, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::virtio::fs::fuse;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
@@ -35,6 +35,9 @@ const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
 /// The volume directory
 const VOL_DIR: &str = ".vol";
+
+/// The owner and permissions attribute
+const OWNER_PERMS_XATTR_KEY: &[u8] = b"user.vm.owner_perms\0";
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -58,24 +61,24 @@ struct InodeAltKey {
 
 /// Data associated with an inode
 #[derive(Debug)]
-struct InodeData {
+pub(crate) struct InodeData {
     /// The inode number in the overlay filesystem
-    inode: Inode,
+    pub(crate) inode: Inode,
 
     /// The inode number from the host filesystem
-    ino: u64,
+    pub(crate) ino: u64,
 
     /// The device ID from the host filesystem
-    dev: i32,
+    pub(crate) dev: i32,
 
-    /// Reference count for this inode
-    refcount: AtomicU64,
+    /// Reference count for this inode from the perspective of [`FileSystem::lookup`]
+    pub(crate) refcount: AtomicU64,
 
     /// Path to inode
-    path: Vec<Symbol>,
+    pub(crate) path: Vec<Symbol>,
 
     /// The layer index this inode belongs to
-    layer_idx: usize,
+    pub(crate) layer_idx: usize,
 }
 
 /// State for directory stream iteration
@@ -99,6 +102,16 @@ struct HandleData {
 
     /// Directory stream state (used for directory handles)
     dirstream: Mutex<DirStream>,
+}
+
+/// Represents either a file descriptor or a path
+#[derive(Clone)]
+enum FileId {
+    /// A file descriptor
+    Fd(RawFd),
+
+    /// A path
+    Path(CString),
 }
 
 /// Configuration for the overlay filesystem
@@ -192,7 +205,7 @@ pub struct OverlayFs {
     announce_submounts: AtomicBool,
 
     /// Configuration options
-    cfg: Config,
+    config: Config,
 
     /// Symbol table for interned filenames
     filenames: Arc<RwLock<SymbolTable>>,
@@ -213,7 +226,7 @@ impl InodeAltKey {
 
 impl OverlayFs {
     /// Creates a new OverlayFs with the given layers
-    pub fn new(layers: Vec<PathBuf>, cfg: Config) -> io::Result<Self> {
+    pub fn new(layers: Vec<PathBuf>, config: Config) -> io::Result<Self> {
         if layers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -237,7 +250,7 @@ impl OverlayFs {
             map_windows: Mutex::new(HashMap::new()),
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
-            cfg,
+            config,
             filenames: Arc::new(RwLock::new(SymbolTable::new())),
             layer_roots: Arc::new(RwLock::new(layer_roots)),
         })
@@ -268,7 +281,7 @@ impl OverlayFs {
 
             // Get the stat information for this layer's root
             let c_path = CString::new(layer_path.to_string_lossy().as_bytes())?;
-            let st = Self::lstat_path(&c_path)?;
+            let st = Self::unpatched_stat(&FileId::Path(c_path))?;
 
             // Create the alt key for this inode
             let alt_key = InodeAltKey::new(st.st_ino, st.st_dev as i32);
@@ -296,6 +309,14 @@ impl OverlayFs {
         Ok(layer_roots)
     }
 
+    pub fn get_config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn get_filenames(&self) -> &Arc<RwLock<SymbolTable>> {
+        &self.filenames
+    }
+
     fn get_layer_root(&self, layer_idx: usize) -> io::Result<Arc<InodeData>> {
         let layer_roots = self.layer_roots.read().unwrap();
 
@@ -314,8 +335,7 @@ impl OverlayFs {
         }
 
         // Get the inode data
-        let inodes = self.inodes.read().unwrap();
-        inodes.get(&inode).cloned().ok_or_else(ebadf)
+        self.get_inode_data(inode)
     }
 
     /// Creates a new inode and adds it to the inode map
@@ -356,6 +376,12 @@ impl OverlayFs {
             .ok_or_else(ebadf)
     }
 
+    fn bump_refcount(&self, inode: Inode) {
+        let inodes = self.inodes.write().unwrap();
+        let inode_data = inodes.get(&inode).unwrap();
+        inode_data.refcount.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Converts a dev/ino pair to a volume path
     fn dev_ino_to_vol_path(&self, dev: i32, ino: u64) -> io::Result<CString> {
         let path = format!("/{}/{}/{}", VOL_DIR, dev, ino);
@@ -381,8 +407,8 @@ impl OverlayFs {
             generation: 0,
             attr: st,
             attr_flags: 0,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
+            attr_timeout: self.config.attr_timeout,
+            entry_timeout: self.config.entry_timeout,
         }
     }
 
@@ -394,7 +420,7 @@ impl OverlayFs {
         let whiteout_path = format!("{}/{}{}", parent_str, WHITEOUT_PREFIX, name_str);
         let whiteout_cpath = CString::new(whiteout_path).map_err(|_| einval())?;
 
-        match Self::lstat_path(&whiteout_cpath) {
+        match Self::unpatched_stat(&FileId::Path(whiteout_cpath)) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
@@ -421,21 +447,24 @@ impl OverlayFs {
         let parent_str = parent_path.to_str().map_err(|_| einval())?;
         let opaque_path = format!("{}/{}", parent_str, OPAQUE_MARKER);
         let opaque_cpath = CString::new(opaque_path).map_err(|_| einval())?;
-        match Self::lstat_path(&opaque_cpath) {
+        match Self::unpatched_stat(&FileId::Path(opaque_cpath)) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
     }
 
-    /// Validates a name to prevent path traversal attacks
+    /// Validates a name to prevent path traversal attacks and special overlay markers
     ///
-    /// This function checks if a name contains path traversal sequences like ".." or
-    /// other potentially dangerous patterns.
+    /// This function checks if a name contains:
+    /// - Path traversal sequences like ".."
+    /// - Other potentially dangerous patterns like slashes
+    /// - Whiteout markers (.wh. prefix)
+    /// - Opaque directory markers (.wh..wh..opq)
     ///
     /// Returns:
     /// - Ok(()) if the name is safe
-    /// - Err(io::Error) if the name contains path traversal sequences
+    /// - Err(io::Error) if the name contains invalid patterns
     fn validate_name(name: &CStr) -> io::Result<()> {
         let name_bytes = name.to_bytes();
 
@@ -463,6 +492,33 @@ impl OverlayFs {
             ));
         }
 
+        // Convert to str for string pattern matching
+        let name_str = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "name contains invalid UTF-8",
+                ))
+            }
+        };
+
+        // Check for whiteout prefix
+        if name_str.starts_with(".wh.") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name cannot start with whiteout prefix",
+            ));
+        }
+
+        // Check for opaque marker
+        if name_str == ".wh..wh..opq" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name cannot be an opaque directory marker",
+            ));
+        }
+
         Ok(())
     }
 
@@ -470,6 +526,11 @@ impl OverlayFs {
     ///
     /// This function traverses a path one segment at a time within a specific layer,
     /// handling whiteouts and opaque markers along the way.
+    ///
+    /// ### Arguments
+    /// * `layer_root` - Root inode data for the layer being searched
+    /// * `path_segments` - Path components to traverse, as interned symbols
+    /// * `path_inodes` - Vector to store inode data for each path segment traversed
     ///
     /// # Return Value
     /// Returns `Option<io::Result<bindings::stat64>>` where:
@@ -481,20 +542,30 @@ impl OverlayFs {
     ///   - Found a whiteout file for this path (file was deleted in this layer)
     ///   - Found an opaque directory marker (directory contents are masked in this layer)
     ///
-    /// # Arguments
-    /// * `layer_root` - Root inode data for the layer being searched
-    /// * `path_segments` - Path components to traverse, as interned symbols
-    ///
     /// # Example Return Flow
     /// 1. If path exists: `Some(Ok(stat))`
     /// 2. If path has whiteout: `None`
     /// 3. If path not found: `Some(Err(NotFound))`
     /// 4. If directory has opaque marker: `None`
     /// 5. If IO error occurs: `Some(Err(io_error))`
+    ///
+    /// # Side Effects
+    /// - Creates inodes for each path segment if they don't already exist
+    /// - Updates path_inodes with inode data for each segment traversed
+    /// - Increments reference counts for existing inodes that are reused
+    ///
+    /// # Path Resolution
+    /// For a path like "foo/bar/baz", the function:
+    /// 1. Starts at layer_root
+    /// 2. Looks up "foo", checking for whiteouts/opaque markers
+    /// 3. If "foo" exists, creates/reuses its inode and adds to path_inodes
+    /// 4. Repeats for "bar" and "baz"
+    /// 5. Returns stats for "baz" if found
     fn lookup_segment_by_segment(
         &self,
         layer_root: &Arc<InodeData>,
         path_segments: &[Symbol],
+        path_inodes: &mut Vec<Arc<InodeData>>,
     ) -> Option<io::Result<bindings::stat64>> {
         let mut current_stat;
         let mut parent_dev = layer_root.dev;
@@ -507,13 +578,13 @@ impl OverlayFs {
             Err(e) => return Some(Err(e)),
         };
 
-        current_stat = match Self::lstat_path(&root_vol_path) {
+        current_stat = match Self::patched_stat(&FileId::Path(root_vol_path)) {
             Ok(stat) => stat,
             Err(e) => return Some(Err(e)),
         };
 
         // Traverse each path segment
-        for segment in path_segments {
+        for (depth, segment) in path_segments.iter().enumerate() {
             // Get the current segment name and parent vol path
             let filenames = self.filenames.read().unwrap();
             let segment_name = filenames.get(*segment).unwrap();
@@ -547,12 +618,42 @@ impl OverlayFs {
 
             drop(filenames); // Now safe to drop filenames lock
 
-            match Self::lstat_path(&current_vol_path) {
+            match Self::patched_stat(&FileId::Path(current_vol_path)) {
                 Ok(st) => {
                     // Update parent dev/ino for next iteration
                     parent_dev = st.st_dev as i32;
                     parent_ino = st.st_ino;
                     current_stat = st;
+
+                    // Create or get inode for this path segment
+                    let alt_key = InodeAltKey::new(st.st_ino, st.st_dev as i32);
+                    let inode_data = {
+                        let inodes = self.inodes.read().unwrap();
+                        if let Some(data) = inodes.get_alt(&alt_key) {
+                            data.clone()
+                        } else {
+                            drop(inodes); // Drop read lock before write lock
+                            let mut path = if depth > 0 {
+                                path_inodes[depth - 1].path.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            path.push(*segment);
+                            let (_, data) = self.create_inode(
+                                st.st_ino,
+                                st.st_dev as i32,
+                                path,
+                                layer_root.layer_idx,
+                            );
+                            data
+                        }
+                    };
+
+                    // Update path_inodes with the current segment's inode data
+                    if depth >= path_inodes.len() {
+                        // Haven't seen this depth before, append
+                        path_inodes.push(inode_data);
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound && opaque_marker_found => {
                     // For example, for a lookup of /foo/bar/baz, where /foo/bar has an opaque marker,
@@ -567,41 +668,62 @@ impl OverlayFs {
         Some(Ok(current_stat))
     }
 
-    /// Performs a lookup operation
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        // Get the parent inode data
-        let parent_data = self.get_inode_data(parent)?;
+    /// Looks up a file or directory entry across multiple filesystem layers.
+    ///
+    /// This function starts from the specified upper layer (given by start_layer_idx) and searches downwards
+    /// through the layers to locate the file represented by the provided path segments (an interned path).
+    /// At each layer, it calls lookup_segment_by_segment to traverse the path step by step while handling
+    /// whiteout files and opaque directory markers. If an entry is found in a layer, the function returns
+    /// an Entry structure containing the file metadata along with a vector of InodeData for each path segment traversed.
+    ///
+    /// ## Arguments
+    ///
+    /// * `start_layer_idx` - The index of the starting layer (from the topmost, which may be the writable layer).
+    /// * `path_segments` - A slice of interned symbols representing the path components to traverse.
+    ///
+    /// ## Returns
+    ///
+    /// On success, returns a tuple containing:
+    /// - An Entry representing the located file or directory along with its attributes.
+    /// - A vector of Arc<InodeData> corresponding to the inodes for each traversed path segment.
+    ///
+    /// ## Errors
+    ///
+    /// Returns an io::Error if:
+    /// - The file is not found in any layer (ENOENT), or
+    /// - An error occurs during the lookup process in one of the layers.
+    fn lookup_layer_by_layer<'a>(
+        &'a self,
+        start_layer_idx: usize,
+        path_segments: &[Symbol],
+    ) -> io::Result<(Entry, Vec<Arc<InodeData>>)> {
+        let mut path_inodes = vec![];
 
-        // Create path segments for lookup by appending the new name
-        let mut path_segments = parent_data.path.clone();
-        let symbol = self.intern_name(name)?;
-        path_segments.push(symbol);
-
-        // Start from the parent's layer and try each layer down to layer 0
-        for layer_idx in (0..=parent_data.layer_idx).rev() {
+        // Start from the start_layer_idx and try each layer down to layer 0
+        for layer_idx in (0..=start_layer_idx).rev() {
             let layer_root = self.get_layer_root(layer_idx)?;
 
-            match self.lookup_segment_by_segment(&layer_root, &path_segments) {
+            match self.lookup_segment_by_segment(&layer_root, &path_segments, &mut path_inodes) {
                 Some(Ok(st)) => {
                     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev as i32);
 
                     // Check if we already have this inode
                     let inodes = self.inodes.read().unwrap();
                     if let Some(data) = inodes.get_alt(&alt_key) {
-                        data.refcount.fetch_add(1, Ordering::SeqCst);
-                        return Ok(self.create_entry(data.inode, st));
+                        return Ok((self.create_entry(data.inode, st), path_inodes));
                     }
 
                     drop(inodes);
 
                     // Create new inode
-                    let (inode, _) = self.create_inode(
+                    let (inode, data) = self.create_inode(
                         st.st_ino,
                         st.st_dev as i32,
-                        path_segments.clone(),
+                        path_segments.to_vec(),
                         layer_idx,
                     );
-                    return Ok(self.create_entry(inode, st));
+                    path_inodes.push(data.clone());
+                    return Ok((self.create_entry(inode, st), path_inodes));
                 }
                 Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                     // Continue to check lower layers
@@ -619,16 +741,377 @@ impl OverlayFs {
         Err(io::Error::from_raw_os_error(libc::ENOENT))
     }
 
-    /// Helper function to perform lstat on a path
-    fn lstat_path(c_path: &CString) -> io::Result<bindings::stat64> {
+    /// Performs a lookup operation
+    pub(crate) fn do_lookup(
+        &self,
+        parent: Inode,
+        name: &CStr,
+    ) -> io::Result<(Entry, Vec<Arc<InodeData>>)> {
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Create path segments for lookup by appending the new name
+        let mut path_segments = parent_data.path.clone();
+        let symbol = self.intern_name(name)?;
+        path_segments.push(symbol);
+
+        self.lookup_layer_by_layer(parent_data.layer_idx, &path_segments)
+    }
+
+    /// Performs a raw stat syscall without any modifications to the returned stat structure.
+    ///
+    /// This function directly calls the OS's stat syscall and returns the raw stat information
+    /// exactly as provided by the filesystem. It does not apply any overlayfs-specific
+    /// modifications like owner/permission overrides from extended attributes.
+    ///
+    /// ## Arguments
+    /// * `file` - A FileId containing either a path or file descriptor to stat
+    ///
+    /// ## Returns
+    /// * `io::Result<bindings::stat64>` - The raw stat information from the filesystem
+    ///
+    /// ## Safety
+    /// This function performs raw syscalls but handles all unsafe operations internally.
+    fn unpatched_stat(file: &FileId) -> io::Result<bindings::stat64> {
         let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
-        let ret = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr() as *mut libc::stat) };
+        let ret = unsafe {
+            match file {
+                FileId::Path(path) => {
+                    libc::lstat(path.as_ptr(), st.as_mut_ptr() as *mut libc::stat)
+                }
+                FileId::Fd(fd) => libc::fstat(*fd, st.as_mut_ptr() as *mut libc::stat),
+            }
+        };
         if ret < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(unsafe { st.assume_init() })
+            return Err(io::Error::last_os_error());
         }
+
+        Ok(unsafe { st.assume_init() })
+    }
+
+    /// Performs a stat syscall and patches the returned stat structure with overlayfs metadata.
+    ///
+    /// This function extends unpatched_stat by applying overlayfs-specific modifications:
+    /// 1. Gets the raw stat information using unpatched_stat
+    /// 2. Reads extended attributes storing overlayfs owner/permission overrides
+    /// 3. Updates the stat structure with any owner (uid/gid) overrides found
+    /// 4. Updates the permission bits with any mode overrides found
+    ///
+    /// This provides the overlayfs view of file metadata, where file ownership and permissions
+    /// can be modified independently of the underlying filesystem.
+    ///
+    /// ## Arguments
+    /// * `file` - A FileId containing either a path or file descriptor to stat
+    ///
+    /// ## Returns
+    /// * `io::Result<bindings::stat64>` - The stat information with overlayfs patches applied
+    ///
+    /// ## Safety
+    /// This function performs raw syscalls but handles all unsafe operations internally.
+    fn patched_stat(file: &FileId) -> io::Result<bindings::stat64> {
+        let mut stat = Self::unpatched_stat(file)?;
+
+        // Get owner and permissions from xattr
+        if let Ok(Some((uid, gid, mode))) = Self::get_owner_perms_attr(file, &stat) {
+            // Update the stat with the xattr values if available
+            stat.st_uid = uid;
+            stat.st_gid = gid;
+            // Make sure we only modify the permission bits (lower 12 bits)
+            stat.st_mode = (stat.st_mode & !0o7777u16) | mode;
+        }
+
+        Ok(stat)
+    }
+
+    fn get_owner_perms_attr(
+        file: &FileId,
+        st: &bindings::stat64,
+    ) -> io::Result<Option<(u32, u32, u16)>> {
+        // Try to get the owner and permissions from xattr
+        let mut buf: Vec<u8> = vec![0; 32];
+
+        // Get options based on file type
+        let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            libc::XATTR_NOFOLLOW
+        } else {
+            0
+        };
+
+        // Helper function to convert byte slice to u32 value
+        fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
+            match std::str::from_utf8(item) {
+                Ok(val) => match u32::from_str_radix(val, radix) {
+                    Ok(i) => Some(i),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        }
+
+        // Get the xattr
+        let res = match file {
+            FileId::Path(path) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    OWNER_PERMS_XATTR_KEY.as_ptr() as *const i8,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                    options,
+                )
+            },
+            FileId::Fd(fd) => unsafe {
+                libc::fgetxattr(
+                    *fd,
+                    OWNER_PERMS_XATTR_KEY.as_ptr() as *const i8,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOATTR) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+
+        let len = res as usize;
+        buf.truncate(len);
+
+        // Parse the xattr value
+        let parts: Vec<&[u8]> = buf.split(|&b| b == b':').collect();
+        if parts.len() != 3 {
+            return Ok(None);
+        }
+
+        let uid = item_to_value(parts[0], 10).unwrap_or(st.st_uid);
+        let gid = item_to_value(parts[1], 10).unwrap_or(st.st_gid);
+        let mode = item_to_value(parts[2], 8).unwrap_or(st.st_mode as u32) as u16;
+
+        Ok(Some((uid, gid, mode)))
+    }
+
+    fn set_owner_perms_attr(
+        file: &FileId,
+        st: &bindings::stat64,
+        owner: Option<(u32, u32)>,
+        mode: Option<u16>,
+    ) -> io::Result<()> {
+        // Get the current values to use as defaults
+        let (uid, gid) = if let Some((uid, gid)) = owner {
+            (uid, gid)
+        } else {
+            (st.st_uid, st.st_gid)
+        };
+
+        let mode = mode.unwrap_or(st.st_mode);
+
+        // Format the xattr value
+        let value = format!("{}:{}:{:o}", uid, gid, mode & 0o7777);
+        let value_bytes = value.as_bytes();
+
+        // Get options based on file type
+        let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            libc::XATTR_NOFOLLOW
+        } else {
+            0
+        };
+
+        // Set the xattr
+        let res = match file {
+            FileId::Path(path) => unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    OWNER_PERMS_XATTR_KEY.as_ptr() as *const i8,
+                    value_bytes.as_ptr() as *const libc::c_void,
+                    value_bytes.len(),
+                    0,
+                    options,
+                )
+            },
+            FileId::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    *fd,
+                    OWNER_PERMS_XATTR_KEY.as_ptr() as *const i8,
+                    value_bytes.as_ptr() as *const libc::c_void,
+                    value_bytes.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Copies up a file or directory from a lower layer to the top layer
+    pub(crate) fn do_copyup(&self, path_inodes: &[Arc<InodeData>]) -> io::Result<()> {
+        // Get the top layer root
+        let layer_roots = self.layer_roots.read().unwrap();
+        let top_layer_idx = layer_roots.len() - 1;
+        let top_layer_root = self.get_layer_root(top_layer_idx)?;
+
+        // Start from root and copy up each segment that's not in the top layer
+        let mut parent_dev = top_layer_root.dev;
+        let mut parent_ino = top_layer_root.ino;
+
+        for inode_data in path_inodes.iter() {
+            // Skip if this segment is already in the top layer
+            if inode_data.layer_idx == top_layer_idx {
+                parent_dev = inode_data.dev;
+                parent_ino = inode_data.ino;
+                continue;
+            }
+
+            // Get the current segment name
+            let segment_name = {
+                let name = inode_data.path.last().unwrap();
+                let filenames = self.filenames.read().unwrap();
+                filenames.get(*name).unwrap().to_owned()
+            };
+
+            // Get source and destination paths
+            let src_path = self.dev_ino_to_vol_path(inode_data.dev, inode_data.ino)?;
+            let dst_path =
+                self.dev_ino_and_name_to_vol_path(parent_dev, parent_ino, &segment_name)?;
+
+            // Get source file/directory stats
+            let src_stat = Self::patched_stat(&FileId::Path(src_path.clone()))?;
+            let file_type = src_stat.st_mode & libc::S_IFMT;
+
+            // Copy up the file/directory
+            match file_type {
+                libc::S_IFREG => {
+                    // Regular file: copy contents and permissions
+                    unsafe {
+                        let src_file = libc::open(src_path.as_ptr(), libc::O_RDONLY);
+                        if src_file < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+
+                        let mode = (src_stat.st_mode & 0o777) as u32;
+                        let dst_file = libc::open(
+                            dst_path.as_ptr(),
+                            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                            mode,
+                        );
+                        if dst_file < 0 {
+                            libc::close(src_file);
+                            return Err(io::Error::last_os_error());
+                        }
+
+                        // Copy file contents
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n_read =
+                                libc::read(src_file, buf.as_mut_ptr() as *mut _, buf.len());
+                            if n_read <= 0 {
+                                break;
+                            }
+                            let mut pos = 0;
+                            while pos < n_read {
+                                let n_written = libc::write(
+                                    dst_file,
+                                    buf.as_ptr().add(pos as usize) as *const _,
+                                    (n_read - pos) as usize,
+                                );
+                                if n_written <= 0 {
+                                    libc::close(src_file);
+                                    libc::close(dst_file);
+                                    return Err(io::Error::last_os_error());
+                                }
+                                pos += n_written;
+                            }
+                        }
+
+                        // Explicitly set permissions to match source file
+                        // This will override any effects from the umask
+                        if libc::fchmod(dst_file, src_stat.st_mode & 0o777) < 0 {
+                            libc::close(src_file);
+                            libc::close(dst_file);
+                            return Err(io::Error::last_os_error());
+                        }
+
+                        libc::close(src_file);
+                        libc::close(dst_file);
+                    }
+                }
+                libc::S_IFDIR => {
+                    // Directory: just create it with the same permissions
+                    unsafe {
+                        if libc::mkdir(dst_path.as_ptr(), src_stat.st_mode & 0o777) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+
+                        // Explicitly set directory permissions to match source
+                        if libc::chmod(dst_path.as_ptr(), src_stat.st_mode & 0o777) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+                libc::S_IFLNK => {
+                    // Symbolic link: read target and recreate link
+                    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+                    let len = unsafe {
+                        libc::readlink(src_path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if len < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    buf.truncate(len as usize);
+
+                    unsafe {
+                        if libc::symlink(buf.as_ptr() as *const _, dst_path.as_ptr()) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+
+                        // Note: macOS doesn't allow setting permissions on symlinks directly
+                        // The permissions of symlinks are typically ignored by the system
+                    }
+                }
+                _ => {
+                    // Other types (devices, sockets, etc.) are not supported
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "unsupported file type for copy up",
+                    ));
+                }
+            }
+
+            // Update parent dev/ino for next iteration
+            let new_stat = Self::unpatched_stat(&FileId::Path(dst_path))?;
+            parent_dev = new_stat.st_dev as i32;
+            parent_ino = new_stat.st_ino;
+
+            // Update the inode entry to point to the new copy in the top layer
+            let alt_key = InodeAltKey::new(new_stat.st_ino, new_stat.st_dev as i32);
+            let mut inodes = self.inodes.write().unwrap();
+
+            // Create new inode data with updated dev/ino/layer_idx but same path and refcount
+            let new_data = Arc::new(InodeData {
+                inode: inode_data.inode,
+                ino: new_stat.st_ino,
+                dev: new_stat.st_dev as i32,
+                refcount: AtomicU64::new(inode_data.refcount.load(Ordering::SeqCst)),
+                path: inode_data.path.clone(),
+                layer_idx: top_layer_idx,
+            });
+
+            // Replace the old entry with the new one
+            inodes.insert(inode_data.inode, alt_key, new_data);
+        }
+
+        Ok(())
     }
 
     /// Performs a readdir operation
@@ -661,13 +1144,167 @@ impl OverlayFs {
 
     /// Performs a getattr operation
     fn do_getattr(&self, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
-        // Get the path for this inode
-        let path = self.inode_number_to_vol_path(inode)?;
+        let c_path = self.inode_number_to_vol_path(inode)?;
+        let st = Self::patched_stat(&FileId::Path(c_path))?;
 
-        // Get file attributes
-        let st = Self::lstat_path(&path)?;
+        Ok((st, self.config.attr_timeout))
+    }
 
-        Ok((st, self.cfg.attr_timeout))
+    /// Ensures the file is in the top layer by copying it up if necessary.
+    ///
+    /// This function:
+    /// 1. Checks if the file is already in the top layer
+    /// 2. If not, looks up the complete path to the file
+    /// 3. Copies the file and all its parent directories to the top layer
+    /// 4. Returns the inode data for the copied file
+    ///
+    /// ### Arguments
+    /// * `inode_data` - The inode data for the file to copy up
+    ///
+    /// ### Returns
+    /// * `Ok(InodeData)` - The inode data for the file in the top layer
+    /// * `Err(io::Error)` - If the copy-up operation fails
+    fn ensure_top_layer(&self, inode_data: Arc<InodeData>) -> io::Result<Arc<InodeData>> {
+        let layer_roots = self.layer_roots.read().unwrap();
+        let top_layer_idx = layer_roots.len() - 1;
+        drop(layer_roots);
+
+        // If already in top layer, return early
+        if inode_data.layer_idx == top_layer_idx {
+            return Ok(inode_data);
+        }
+
+        // Build the path segments
+        let path_segments = inode_data.path.clone();
+
+        // Lookup the file to get all path inodes
+        let (_, path_inodes) = self.lookup_layer_by_layer(inode_data.layer_idx, &path_segments)?;
+
+        // Copy up the file
+        self.do_copyup(&path_inodes)?;
+
+        // Get the inode data for the copied file
+        self.get_inode_data(inode_data.inode)
+    }
+
+    /// Performs a setattr operation, copying up the file if needed
+    fn do_setattr(
+        &self,
+        inode: Inode,
+        attr: bindings::stat64,
+        handle: Option<Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        // Get the inode data
+        let inode_data = self.get_inode_data(inode)?;
+
+        // Ensure the file is in the top layer before modifying attributes
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Get the file identifier - either from handle or path
+        let file_id = if let Some(handle) = handle {
+            // Get the handle data
+            let handles = self.handles.read().unwrap();
+            let handle_data = handles.get(&handle).ok_or_else(ebadf)?;
+            let file = handle_data.file.read().unwrap();
+            FileId::Fd(file.as_raw_fd())
+        } else {
+            // Use path if no handle available
+            let c_path = self.dev_ino_to_vol_path(inode_data.dev, inode_data.ino)?;
+            FileId::Path(c_path)
+        };
+
+        // Consolidate attribute changes using a single setattrlist call
+        let current_stat = Self::patched_stat(&file_id)?;
+
+        // Handle ownership changes
+        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+            let uid = if valid.contains(SetattrValid::UID) {
+                Some(attr.st_uid)
+            } else {
+                None
+            };
+
+            let gid = if valid.contains(SetattrValid::GID) {
+                Some(attr.st_gid)
+            } else {
+                None
+            };
+
+            if let Some((uid, gid)) = uid
+                .zip(gid)
+                .or_else(|| uid.map(|u| (u, current_stat.st_gid)))
+                .or_else(|| gid.map(|g| (current_stat.st_uid, g)))
+            {
+                Self::set_owner_perms_attr(&file_id, &current_stat, Some((uid, gid)), None)?;
+            }
+        }
+
+        // Handle mode changes
+        if valid.contains(SetattrValid::MODE) {
+            let mode = attr.st_mode & 0o7777;
+            Self::set_owner_perms_attr(&file_id, &current_stat, None, Some(mode))?;
+        }
+
+        // Handle size changes
+        if valid.contains(SetattrValid::SIZE) {
+            let res = match file_id {
+                FileId::Fd(fd) => unsafe { libc::ftruncate(fd, attr.st_size) },
+                FileId::Path(ref c_path) => unsafe {
+                    libc::truncate(c_path.as_ptr(), attr.st_size)
+                },
+            };
+
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // Handle timestamp changes
+        if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
+            let mut tvs = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+            ];
+
+            if valid.contains(SetattrValid::ATIME_NOW) {
+                tvs[0].tv_nsec = libc::UTIME_NOW;
+            } else if valid.contains(SetattrValid::ATIME) {
+                tvs[0].tv_sec = attr.st_atime;
+                tvs[0].tv_nsec = attr.st_atime_nsec;
+            }
+
+            if valid.contains(SetattrValid::MTIME_NOW) {
+                tvs[1].tv_nsec = libc::UTIME_NOW;
+            } else if valid.contains(SetattrValid::MTIME) {
+                tvs[1].tv_sec = attr.st_mtime;
+                tvs[1].tv_nsec = attr.st_mtime_nsec;
+            }
+
+            // Safe because this doesn't modify any memory and we check the return value
+            let res = match file_id {
+                FileId::Fd(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
+                FileId::Path(ref c_path) => unsafe {
+                    let fd = libc::open(c_path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC);
+                    let res = libc::futimens(fd, tvs.as_ptr());
+                    libc::close(fd);
+                    res
+                },
+            };
+
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // Return the updated attributes and timeout
+        self.do_getattr(inode)
     }
 
     /// Performs an unlink operation
@@ -683,11 +1320,8 @@ impl OverlayFs {
     }
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
-    fn forget_one(
-        inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
-        inode: Inode,
-        count: u64,
-    ) {
+    fn forget_one(&self, inode: Inode, count: u64) {
+        let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.get(&inode) {
             let previous = data.refcount.fetch_sub(count, Ordering::SeqCst);
 
@@ -696,6 +1330,63 @@ impl OverlayFs {
                 // Remove the inode from the map
                 inodes.remove(&inode);
             }
+        }
+    }
+
+    fn do_readlink(&self, inode: Inode) -> io::Result<Vec<u8>> {
+        // Get the path for this inode
+        let c_path = self.inode_number_to_vol_path(inode)?;
+
+        // Allocate a buffer for the link target
+        let mut buf = vec![0; libc::PATH_MAX as usize];
+
+        // Call readlink to get the symlink target
+        let res = unsafe {
+            libc::readlink(
+                c_path.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Resize the buffer to the actual length of the link target
+        buf.resize(res as usize, 0);
+        Ok(buf)
+    }
+
+    fn set_secctx(file: &FileId, secctx: SecContext, symlink: bool) -> io::Result<()> {
+        let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
+        let ret = match file {
+            FileId::Path(path) => unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    secctx.name.as_ptr(),
+                    secctx.secctx.as_ptr() as *const libc::c_void,
+                    secctx.secctx.len(),
+                    0,
+                    options,
+                )
+            },
+            FileId::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    *fd,
+                    secctx.name.as_ptr(),
+                    secctx.secctx.as_ptr() as *const libc::c_void,
+                    secctx.secctx.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+
+        if ret != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }
@@ -723,10 +1414,13 @@ impl FileSystem for OverlayFs {
     type Handle = u64;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Set the umask to 0 to ensure that all file permissions are set correctly
+        unsafe { libc::umask(0o000) };
+
         let mut opts = FsOptions::empty();
 
         // Enable writeback caching if requested and supported
-        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+        if self.config.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
             opts |= FsOptions::WRITEBACK_CACHE;
             self.writeback.store(true, Ordering::SeqCst);
         }
@@ -768,7 +1462,13 @@ impl FileSystem for OverlayFs {
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         Self::validate_name(name)?;
-        self.do_lookup(parent, name)
+
+        let (entry, _) = self.do_lookup(parent, name)?;
+
+        // Increment the reference count for the inode
+        self.bump_refcount(entry.inode);
+
+        Ok(entry)
     }
 
     fn forget(&self, _ctx: Context, inode: Self::Inode, count: u64) {
@@ -777,8 +1477,7 @@ impl FileSystem for OverlayFs {
             return;
         }
 
-        let mut inodes = self.inodes.write().unwrap();
-        Self::forget_one(&mut inodes, inode, count);
+        self.forget_one(inode, count);
     }
 
     fn getattr(
@@ -798,45 +1497,94 @@ impl FileSystem for OverlayFs {
         handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
-        // TODO: Set file attributes
-        todo!("implement setattr")
+        self.do_setattr(inode, attr, handle, valid)
     }
 
     fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-        // TODO: Read the target of a symbolic link
-        todo!("implement readlink")
+        self.do_readlink(inode)
     }
 
     fn mkdir(
         &self,
-        _ctx: Context,
-        parent: Self::Inode,
+        ctx: Context,
+        parent: Inode,
         name: &CStr,
         mode: u32,
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Validate the name to prevent path traversal
+        // Validate the name
         Self::validate_name(name)?;
 
+        // Check if an entry with the same name already exists in the parent directory
+        match self.lookup(ctx, parent, name) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Entry already exists",
+                ))
+            }
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(e);
+                }
+                // Expected ENOENT means it does not exist, so continue.
+            }
+        }
+
         // Get the parent inode data
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .ok_or_else(ebadf)?
-            .clone();
+        let parent_data = self.get_inode_data(parent)?;
 
-        // Intern the name
-        let symbol = self.intern_name(name)?;
+        // Ensure parent directory is in the top layer
+        let parent_data = self.ensure_top_layer(parent_data)?;
 
-        // Create the path for the new directory
-        let mut dir_path = parent_data.path.clone();
-        dir_path.push(symbol);
+        // Get the path for the new directory
+        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
 
-        // TODO: Create a directory
-        todo!("implement mkdir")
+        // Create the directory with initial permissions
+        let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+        if res == 0 {
+            // Set security context if provided
+            if let Some(secctx) = extensions.secctx {
+                Self::set_secctx(&FileId::Path(c_path.clone()), secctx, false)?;
+            }
+
+            // Get the initial stat for the directory
+            let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
+
+            // Set ownership and permissions
+            Self::set_owner_perms_attr(
+                &FileId::Path(c_path.clone()),
+                &stat,
+                Some((ctx.uid, ctx.gid)),
+                Some((mode & !umask) as u16),
+            )?;
+
+            // Get the updated stat for the directory
+            let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
+
+            let mut path = parent_data.path.clone();
+            path.push(self.intern_name(name)?);
+
+            // Create the inode for the newly created directory
+            let (inode, _) = self.create_inode(
+                updated_stat.st_ino,
+                updated_stat.st_dev,
+                path,
+                parent_data.layer_idx,
+            );
+
+            // Create the entry for the newly created directory
+            let entry = self.create_entry(inode, updated_stat);
+
+            // Bump the reference count for the parent inode
+            self.bump_refcount(entry.inode);
+
+            return Ok(entry);
+        }
+
+        // Return the error
+        Err(linux_error(io::Error::last_os_error()))
     }
 
     fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
@@ -866,22 +1614,6 @@ impl FileSystem for OverlayFs {
         // Validate the name to prevent path traversal
         Self::validate_name(name)?;
 
-        // Get the parent inode data
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        // Intern the name
-        let symbol = self.intern_name(name)?;
-
-        // Create the path for the new symlink
-        let mut link_path = parent_data.path.clone();
-        link_path.push(symbol);
-
         // TODO: Create a symbolic link
         todo!("implement symlink")
     }
@@ -899,36 +1631,6 @@ impl FileSystem for OverlayFs {
         Self::validate_name(old_name)?;
         Self::validate_name(new_name)?;
 
-        // Get the old parent inode data
-        let old_parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&old_parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        // Get the new parent inode data
-        let new_parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&new_parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        // Intern the old and new names
-        let old_symbol = self.intern_name(old_name)?;
-        let new_symbol = self.intern_name(new_name)?;
-
-        // Create the old path
-        let mut old_path = old_parent_data.path.clone();
-        old_path.push(old_symbol);
-
-        // Create the new path
-        let mut new_path = new_parent_data.path.clone();
-        new_path.push(new_symbol);
-
         // TODO: Rename a file
         todo!("implement rename")
     }
@@ -942,22 +1644,6 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<Entry> {
         // Validate the name to prevent path traversal
         Self::validate_name(new_name)?;
-
-        // Get the parent inode data
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&new_parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        // Intern the name
-        let symbol = self.intern_name(new_name)?;
-
-        // Create the path for the new hard link
-        let mut link_path = parent_data.path.clone();
-        link_path.push(symbol);
 
         // TODO: Create a hard link
         todo!("implement link")
@@ -1143,22 +1829,6 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
         // Validate the name to prevent path traversal
         Self::validate_name(name)?;
-
-        // Get the parent inode data
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .ok_or_else(ebadf)?
-            .clone();
-
-        // Intern the name
-        let symbol = self.intern_name(name)?;
-
-        // Create the path for the new file
-        let mut file_path = parent_data.path.clone();
-        file_path.push(symbol);
 
         // TODO: Create and open a file
         todo!("implement create")
