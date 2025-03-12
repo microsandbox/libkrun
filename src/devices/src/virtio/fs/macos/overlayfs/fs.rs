@@ -376,6 +376,10 @@ impl OverlayFs {
             .ok_or_else(ebadf)
     }
 
+    fn get_top_layer_idx(&self) -> usize {
+        self.layer_roots.read().unwrap().len() - 1
+    }
+
     fn bump_refcount(&self, inode: Inode) {
         let inodes = self.inodes.write().unwrap();
         let inode_data = inodes.get(&inode).unwrap();
@@ -392,6 +396,25 @@ impl OverlayFs {
     fn dev_ino_and_name_to_vol_path(&self, dev: i32, ino: u64, name: &CStr) -> io::Result<CString> {
         let path = format!("/{}/{}/{}/{}", VOL_DIR, dev, ino, name.to_string_lossy());
         CString::new(path).map_err(|_| einval())
+    }
+
+    fn dev_ino_and_name_to_vol_whiteout_path(
+        &self,
+        dev: i32,
+        ino: u64,
+        name: &CStr,
+    ) -> io::Result<CString> {
+        // Create whiteout file (.wh.<name>) in parent directory
+        let whiteout_name = format!(
+            "{}{}",
+            WHITEOUT_PREFIX,
+            name.to_str().map_err(|_| einval())?
+        );
+
+        let whiteout_cstr = CString::new(whiteout_name).map_err(|_| einval())?;
+
+        // Get full path for whiteout file
+        self.dev_ino_and_name_to_vol_path(dev, ino, &whiteout_cstr)
     }
 
     /// Converts an inode number to a volume path
@@ -957,8 +980,7 @@ impl OverlayFs {
     /// Copies up a file or directory from a lower layer to the top layer
     pub(crate) fn do_copyup(&self, path_inodes: &[Arc<InodeData>]) -> io::Result<()> {
         // Get the top layer root
-        let layer_roots = self.layer_roots.read().unwrap();
-        let top_layer_idx = layer_roots.len() - 1;
+        let top_layer_idx = self.get_top_layer_idx();
         let top_layer_root = self.get_layer_root(top_layer_idx)?;
 
         // Start from root and copy up each segment that's not in the top layer
@@ -1165,9 +1187,7 @@ impl OverlayFs {
     /// * `Ok(InodeData)` - The inode data for the file in the top layer
     /// * `Err(io::Error)` - If the copy-up operation fails
     fn ensure_top_layer(&self, inode_data: Arc<InodeData>) -> io::Result<Arc<InodeData>> {
-        let layer_roots = self.layer_roots.read().unwrap();
-        let top_layer_idx = layer_roots.len() - 1;
-        drop(layer_roots);
+        let top_layer_idx = self.get_top_layer_idx();
 
         // If already in top layer, return early
         if inode_data.layer_idx == top_layer_idx {
@@ -1307,28 +1327,169 @@ impl OverlayFs {
         self.do_getattr(inode)
     }
 
-    /// Performs an unlink operation
-    fn do_unlink(
+    fn do_mkdir(
         &self,
         ctx: Context,
         parent: Inode,
         name: &CStr,
-        flags: libc::c_int,
-    ) -> io::Result<()> {
-        // TODO: Implement do_unlink
-        todo!("implement do_unlink")
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Check if an entry with the same name already exists in the parent directory
+        match self.do_lookup(parent, name) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Entry already exists",
+                ))
+            }
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(e);
+                }
+                // Expected ENOENT means it does not exist, so continue.
+            }
+        }
+
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Ensure parent directory is in the top layer
+        let parent_data = self.ensure_top_layer(parent_data)?;
+
+        // Get the path for the new directory
+        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
+
+        // Create the directory with initial permissions
+        let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+        if res == 0 {
+            // Set security context if provided
+            if let Some(secctx) = extensions.secctx {
+                Self::set_secctx(&FileId::Path(c_path.clone()), secctx, false)?;
+            }
+
+            // Get the initial stat for the directory
+            let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
+
+            // Set ownership and permissions
+            Self::set_owner_perms_attr(
+                &FileId::Path(c_path.clone()),
+                &stat,
+                Some((ctx.uid, ctx.gid)),
+                Some((mode & !umask) as u16),
+            )?;
+
+            // Get the updated stat for the directory
+            let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
+
+            let mut path = parent_data.path.clone();
+            path.push(self.intern_name(name)?);
+
+            // Create the inode for the newly created directory
+            let (inode, _) = self.create_inode(
+                updated_stat.st_ino,
+                updated_stat.st_dev,
+                path,
+                parent_data.layer_idx,
+            );
+
+            // Create the entry for the newly created directory
+            let entry = self.create_entry(inode, updated_stat);
+
+            return Ok(entry);
+        }
+
+        // Return the error
+        Err(linux_error(io::Error::last_os_error()))
+    }
+
+    /// Performs an unlink operation
+    fn do_unlink(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        let top_layer_idx = self.get_top_layer_idx();
+        let (entry, _) = self.do_lookup(parent, name)?;
+
+        // If the inode is in the top layer, we need to unlink it.
+        let entry_data = self.get_inode_data(entry.inode)?;
+        if entry_data.layer_idx == top_layer_idx {
+            // Get the path for the inode
+            let c_path = self.inode_number_to_vol_path(entry.inode)?;
+
+            // Remove the inode from the overlayfs
+            let res = unsafe { libc::unlink(c_path.as_ptr()) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // If after an unlink, the entry still exists in a lower layer, we need to  add a whiteout for
+        // the unlinked entry
+        if let Ok((_, _)) = self.do_lookup(parent, name) {
+            // Copy up the parent directory if needed
+            let parent_data = self.ensure_top_layer(self.get_inode_data(parent)?)?;
+
+            // Create the whiteout file
+            let whiteout_path = self.dev_ino_and_name_to_vol_whiteout_path(
+                parent_data.dev,
+                parent_data.ino,
+                name,
+            )?;
+
+            let fd = unsafe {
+                libc::open(
+                    whiteout_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
+                    0o000, // Whiteout files have no permissions
+                )
+            };
+
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // Decrement the reference count for the inode
+        self.do_forget(entry.inode, 1);
+
+        Ok(())
     }
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
-    fn forget_one(&self, inode: Inode, count: u64) {
+    fn do_forget(&self, inode: Inode, count: u64) {
+        // Skip forgetting the root inode
+        if inode == self.init_inode {
+            return;
+        }
+
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.get(&inode) {
-            let previous = data.refcount.fetch_sub(count, Ordering::SeqCst);
+            // Acquiring the write lock on the inode map prevents new lookups from incrementing the
+            // refcount but there is the possibility that a previous lookup already acquired a
+            // reference to the inode data and is in the process of updating the refcount so we need
+            // to loop here until we can decrement successfully.
+            loop {
+                let refcount = data.refcount.load(Ordering::Relaxed);
 
-            // If the reference count drops to zero or below, remove the inode
-            if previous <= count {
-                // Remove the inode from the map
-                inodes.remove(&inode);
+                // Saturating sub because it doesn't make sense for a refcount to go below zero and
+                // we don't want misbehaving clients to cause integer overflow.
+                let new_count = refcount.saturating_sub(count);
+
+                if data
+                    .refcount
+                    .compare_exchange(refcount, new_count, Ordering::Release, Ordering::Relaxed)
+                    .unwrap()
+                    == refcount
+                {
+                    if new_count == 0 {
+                        // We just removed the last refcount for this inode. There's no need for an
+                        // acquire fence here because we hold a write lock on the inode map and any
+                        // thread that is waiting to do a forget on the same inode will have to wait
+                        // until we release the lock. So there's is no other release store for us to
+                        // synchronize with before deleting the entry.
+                        inodes.remove(&inode);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1462,22 +1623,13 @@ impl FileSystem for OverlayFs {
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         Self::validate_name(name)?;
-
         let (entry, _) = self.do_lookup(parent, name)?;
-
-        // Increment the reference count for the inode
         self.bump_refcount(entry.inode);
-
         Ok(entry)
     }
 
     fn forget(&self, _ctx: Context, inode: Self::Inode, count: u64) {
-        // Skip forgetting the root inode
-        if inode == self.init_inode {
-            return;
-        }
-
-        self.forget_one(inode, count);
+        self.do_forget(inode, count);
     }
 
     fn getattr(
@@ -1513,86 +1665,16 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Validate the name
         Self::validate_name(name)?;
-
-        // Check if an entry with the same name already exists in the parent directory
-        match self.lookup(ctx, parent, name) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "Entry already exists",
-                ))
-            }
-            Err(e) => {
-                if e.raw_os_error() != Some(libc::ENOENT) {
-                    return Err(e);
-                }
-                // Expected ENOENT means it does not exist, so continue.
-            }
-        }
-
-        // Get the parent inode data
-        let parent_data = self.get_inode_data(parent)?;
-
-        // Ensure parent directory is in the top layer
-        let parent_data = self.ensure_top_layer(parent_data)?;
-
-        // Get the path for the new directory
-        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
-
-        // Create the directory with initial permissions
-        let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
-        if res == 0 {
-            // Set security context if provided
-            if let Some(secctx) = extensions.secctx {
-                Self::set_secctx(&FileId::Path(c_path.clone()), secctx, false)?;
-            }
-
-            // Get the initial stat for the directory
-            let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
-
-            // Set ownership and permissions
-            Self::set_owner_perms_attr(
-                &FileId::Path(c_path.clone()),
-                &stat,
-                Some((ctx.uid, ctx.gid)),
-                Some((mode & !umask) as u16),
-            )?;
-
-            // Get the updated stat for the directory
-            let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
-
-            let mut path = parent_data.path.clone();
-            path.push(self.intern_name(name)?);
-
-            // Create the inode for the newly created directory
-            let (inode, _) = self.create_inode(
-                updated_stat.st_ino,
-                updated_stat.st_dev,
-                path,
-                parent_data.layer_idx,
-            );
-
-            // Create the entry for the newly created directory
-            let entry = self.create_entry(inode, updated_stat);
-
-            // Bump the reference count for the parent inode
-            self.bump_refcount(entry.inode);
-
-            return Ok(entry);
-        }
-
-        // Return the error
-        Err(linux_error(io::Error::last_os_error()))
+        let entry = self.do_mkdir(ctx, parent, name, mode, umask, extensions)?;
+        self.bump_refcount(entry.inode);
+        Ok(entry)
     }
 
     fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         // Validate the name to prevent path traversal
         Self::validate_name(name)?;
-
-        // TODO: Remove a file
-        todo!("implement unlink")
+        self.do_unlink(parent, name)
     }
 
     fn rmdir(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
