@@ -367,7 +367,7 @@ impl OverlayFs {
     }
 
     /// Gets the InodeData for an inode
-    fn get_inode_data(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
+    pub(super) fn get_inode_data(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
         self.inodes
             .read()
             .unwrap()
@@ -656,24 +656,23 @@ impl OverlayFs {
                             data.clone()
                         } else {
                             drop(inodes); // Drop read lock before write lock
-                            let mut path = if depth > 0 {
-                                path_inodes[depth - 1].path.clone()
-                            } else {
-                                Vec::new()
-                            };
+
+                            let mut path = path_inodes[depth].path.clone();
                             path.push(*segment);
+
                             let (_, data) = self.create_inode(
                                 st.st_ino,
                                 st.st_dev as i32,
                                 path,
                                 layer_root.layer_idx,
                             );
+
                             data
                         }
                     };
 
                     // Update path_inodes with the current segment's inode data
-                    if depth >= path_inodes.len() {
+                    if (depth + 1) >= path_inodes.len() {
                         // Haven't seen this depth before, append
                         path_inodes.push(inode_data);
                     }
@@ -726,6 +725,11 @@ impl OverlayFs {
         for layer_idx in (0..=start_layer_idx).rev() {
             let layer_root = self.get_layer_root(layer_idx)?;
 
+            // If path_inodes has only the root inode or is empty, we need to restart the lookup with the new layer root.
+            if path_inodes.len() < 2 {
+                path_inodes = vec![layer_root.clone()];
+            }
+
             match self.lookup_segment_by_segment(&layer_root, &path_segments, &mut path_inodes) {
                 Some(Ok(st)) => {
                     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev as i32);
@@ -752,7 +756,9 @@ impl OverlayFs {
                     // Continue to check lower layers
                     continue;
                 }
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => {
+                    return Err(e);
+                }
                 None => {
                     // Hit a whiteout or opaque marker, stop searching lower layers
                     return Err(io::Error::from_raw_os_error(libc::ENOENT));
@@ -987,7 +993,8 @@ impl OverlayFs {
         let mut parent_dev = top_layer_root.dev;
         let mut parent_ino = top_layer_root.ino;
 
-        for inode_data in path_inodes.iter() {
+        // Skip the root inode
+        for inode_data in path_inodes.iter().skip(1) {
             // Skip if this segment is already in the top layer
             if inode_data.layer_idx == top_layer_idx {
                 parent_dev = inode_data.dev;
@@ -1424,16 +1431,63 @@ impl OverlayFs {
 
         // If after an unlink, the entry still exists in a lower layer, we need to  add a whiteout for
         // the unlinked entry
-        if let Ok((_, _)) = self.do_lookup(parent, name) {
+        if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
             // Copy up the parent directory if needed
-            let parent_data = self.ensure_top_layer(self.get_inode_data(parent)?)?;
+            path_inodes.pop();
+            self.do_copyup(&path_inodes)?;
+            let parent_data = self.get_inode_data(parent)?;
 
             // Create the whiteout file
-            let whiteout_path = self.dev_ino_and_name_to_vol_whiteout_path(
-                parent_data.dev,
-                parent_data.ino,
-                name,
-            )?;
+            let whiteout_path =
+                self.dev_ino_and_name_to_vol_whiteout_path(parent_data.dev, parent_data.ino, name)?;
+
+            let fd = unsafe {
+                libc::open(
+                    whiteout_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
+                    0o000, // Whiteout files have no permissions
+                )
+            };
+
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // Decrement the reference count for the inode
+        self.do_forget(entry.inode, 1);
+
+        Ok(())
+    }
+
+    /// Performs an rmdir operation
+    fn do_rmdir(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        let top_layer_idx = self.get_top_layer_idx();
+        let (entry, _) = self.do_lookup(parent, name)?;
+
+        // If the inode is in the top layer, we need to unlink it.
+        let entry_data = self.get_inode_data(entry.inode)?;
+        if entry_data.layer_idx == top_layer_idx {
+            // Get the path for the inode
+            let c_path = self.inode_number_to_vol_path(entry.inode)?;
+
+            // Remove the inode from the overlayfs
+            let res = unsafe { libc::rmdir(c_path.as_ptr()) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // If after an unlink, the entry still exists in a lower layer, we need to  add a whiteout for
+        // the unlinked entry
+        if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
+            // Copy up the parent directory if needed
+            path_inodes.pop();
+            self.do_copyup(&path_inodes)?;
+            let parent_data = self.get_inode_data(parent)?;
+            // Create the whiteout file
+            let whiteout_path =
+                self.dev_ino_and_name_to_vol_whiteout_path(parent_data.dev, parent_data.ino, name)?;
 
             let fd = unsafe {
                 libc::open(
@@ -1672,17 +1726,13 @@ impl FileSystem for OverlayFs {
     }
 
     fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        // Validate the name to prevent path traversal
         Self::validate_name(name)?;
         self.do_unlink(parent, name)
     }
 
     fn rmdir(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        // Validate the name to prevent path traversal
         Self::validate_name(name)?;
-
-        // TODO: Remove a directory
-        todo!("implement rmdir")
+        self.do_rmdir(parent, name)
     }
 
     fn symlink(
