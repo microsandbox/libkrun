@@ -2914,6 +2914,262 @@ fn test_rename_complex_layers() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_link_basic() -> io::Result<()> {
+    // Create test layers with simple structure:
+    // Layer 0 (bottom):
+    //   - file1
+    // Layer 1 (top):
+    //   - dir1/
+    let layers = vec![vec![("file1", false, 0o644)], vec![("dir1", true, 0o755)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Create hard link from file1 to dir1/link1
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    let link1_name = CString::new("link1").unwrap();
+    let link1_entry = fs.link(ctx, file1_entry.inode, dir1_entry.inode, &link1_name)?;
+
+    // Verify the link was created
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(top_layer.join("dir1/link1").exists());
+
+    // Verify the link has the same inode number as the original file
+    let updated_file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+    assert_eq!(link1_entry.attr.st_ino, updated_file1_entry.attr.st_ino);
+    assert_eq!(link1_entry.attr.st_nlink, updated_file1_entry.attr.st_nlink);
+
+    Ok(())
+}
+
+#[test]
+fn test_link_multiple_layers() -> io::Result<()> {
+    // Create test layers with multiple files:
+    // Layer 0 (bottom):
+    //   - file1
+    //   - dir1/
+    //   - dir1/file2
+    // Layer 1 (middle):
+    //   - file3
+    // Layer 2 (top):
+    //   - dir2/
+    let layers = vec![
+        vec![
+            ("file1", false, 0o644),
+            ("dir1", true, 0o755),
+            ("dir1/file2", false, 0o644),
+        ],
+        vec![("file3", false, 0o644)],
+        vec![("dir2", true, 0o755)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Create links to files from different layers
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+
+    let file3_name = CString::new("file3").unwrap();
+    let file3_entry = fs.lookup(ctx, 1, &file3_name)?;
+
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+
+    // Create links in top layer
+    let link1_name = CString::new("link1").unwrap();
+    let link2_name = CString::new("link2").unwrap();
+
+    let link1_entry = fs.link(ctx, file1_entry.inode, dir2_entry.inode, &link1_name)?;
+    let link2_entry = fs.link(ctx, file3_entry.inode, dir2_entry.inode, &link2_name)?;
+
+    // Verify the links were created in the top layer
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(top_layer.join("dir2/link1").exists());
+    assert!(top_layer.join("dir2/link2").exists());
+
+    // Verify source files were copied up
+    assert!(top_layer.join("file1").exists());
+    assert!(top_layer.join("file3").exists());
+
+    // Verify link attributes
+    let updated_file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+    let updated_file3_entry = fs.lookup(ctx, 1, &file3_name)?;
+    assert_eq!(link1_entry.attr.st_ino, updated_file1_entry.attr.st_ino);
+    assert_eq!(link2_entry.attr.st_ino, updated_file3_entry.attr.st_ino);
+
+    Ok(())
+}
+
+#[test]
+fn test_link_errors() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom):
+    //   - file1
+    //   - dir1/
+    let layers = vec![vec![("file1", false, 0o644), ("dir1", true, 0o755)]];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    // Test linking to invalid parent
+    let invalid_name = CString::new("link1").unwrap();
+    assert!(fs
+        .link(ctx, file1_entry.inode, 999999, &invalid_name)
+        .is_err());
+
+    // Test linking with invalid source inode
+    assert!(fs
+        .link(ctx, 999999, dir1_entry.inode, &invalid_name)
+        .is_err());
+
+    // Test linking with invalid name
+    let invalid_name = CString::new("../link1").unwrap();
+    assert!(fs
+        .link(ctx, file1_entry.inode, dir1_entry.inode, &invalid_name)
+        .is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_link_nested() -> io::Result<()> {
+    // Create test layers with nested structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    //   - dir1/subdir/file2
+    // Layer 1 (top):
+    //   - dir2/
+    //   - dir2/subdir/
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/file2", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/subdir", true, 0o755)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Create links to nested files
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, dir1_entry.inode, &file1_name)?;
+
+    let subdir_name = CString::new("subdir").unwrap();
+    let subdir_entry = fs.lookup(ctx, dir1_entry.inode, &subdir_name)?;
+
+    let file2_name = CString::new("file2").unwrap();
+    let file2_entry = fs.lookup(ctx, subdir_entry.inode, &file2_name)?;
+
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+
+    let dir2_subdir_entry = fs.lookup(ctx, dir2_entry.inode, &subdir_name)?;
+
+    // Create links in different locations
+    let link1_name = CString::new("link1").unwrap();
+    let link2_name = CString::new("link2").unwrap();
+
+    let link1_entry = fs.link(ctx, file1_entry.inode, dir2_entry.inode, &link1_name)?;
+    let link2_entry = fs.link(ctx, file2_entry.inode, dir2_subdir_entry.inode, &link2_name)?;
+
+    // Verify the links were created
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(top_layer.join("dir2/link1").exists());
+    assert!(top_layer.join("dir2/subdir/link2").exists());
+
+    // Verify source files were copied up
+    assert!(top_layer.join("dir1/file1").exists());
+    assert!(top_layer.join("dir1/subdir/file2").exists());
+
+    // Verify link attributes
+    let updated_file1_entry = fs.lookup(ctx, dir1_entry.inode, &file1_name)?;
+    let updated_file2_entry = fs.lookup(ctx, subdir_entry.inode, &file2_name)?;
+    assert_eq!(link1_entry.attr.st_ino, updated_file1_entry.attr.st_ino);
+    assert_eq!(link2_entry.attr.st_ino, updated_file2_entry.attr.st_ino);
+
+    Ok(())
+}
+
+#[test]
+fn test_link_existing_name() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom):
+    //   - file1
+    //   - dir1/
+    //   - dir1/existing
+    let layers = vec![vec![
+        ("file1", false, 0o644),
+        ("dir1", true, 0o755),
+        ("dir1/existing", false, 0o644),
+    ]];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    let file1_name = CString::new("file1").unwrap();
+    let file1_entry = fs.lookup(ctx, 1, &file1_name)?;
+
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    // Try to create a link with an existing name
+    let existing_name = CString::new("existing").unwrap();
+    assert!(fs
+        .link(ctx, file1_entry.inode, dir1_entry.inode, &existing_name)
+        .is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_link_whiteout() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom):
+    //   - file1
+    //   - dir1/
+    // Layer 1 (top):
+    //   - .wh.file1  (whiteout for file1)
+    let layers = vec![
+        vec![("file1", false, 0o644), ("dir1", true, 0o755)],
+        vec![(".wh.file1", false, 0o000)],
+    ];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    let file1_name = CString::new("file1").unwrap();
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    // Try to create a link to a whited-out file
+    let link_name = CString::new("link1").unwrap();
+    assert!(fs.lookup(ctx, 1, &file1_name).is_err());
+    assert!(fs.link(ctx, 1, dir1_entry.inode, &link_name).is_err());
+
+    Ok(())
+}
+
 mod helper {
     use std::{
         fs::{self, File},

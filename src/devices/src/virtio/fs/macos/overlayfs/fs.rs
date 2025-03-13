@@ -1205,7 +1205,7 @@ impl OverlayFs {
         let path_segments = inode_data.path.clone();
 
         // Lookup the file to get all path inodes
-        let (_, path_inodes) = self.lookup_layer_by_layer(inode_data.layer_idx, &path_segments)?;
+        let (_, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
 
         // Copy up the file
         self.do_copyup(&path_inodes)?;
@@ -1630,12 +1630,7 @@ impl OverlayFs {
             };
 
             let stat = Self::unpatched_stat(&FileId::Fd(fd))?;
-            Self::set_owner_perms_attr(
-                &FileId::Fd(fd),
-                &stat,
-                None,
-                Some(libc::S_IFCHR | 0o600),
-            )?;
+            Self::set_owner_perms_attr(&FileId::Fd(fd), &stat, None, Some(libc::S_IFCHR | 0o600))?;
 
             if fd < 0 {
                 return Err(io::Error::last_os_error());
@@ -1645,6 +1640,47 @@ impl OverlayFs {
         }
 
         Ok(())
+    }
+
+    fn do_link(&self, inode: Inode, new_parent: Inode, new_name: &CStr) -> io::Result<Entry> {
+        // Get the inode data for the source file
+        let inode_data = self.get_inode_data(inode)?;
+
+        // Copy up the source file to the top layer if needed
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Get and ensure new parent is in top layer
+        let new_parent_data = self.ensure_top_layer(self.get_inode_data(new_parent)?)?;
+
+        // Get source and destination paths
+        let src_path = self.dev_ino_to_vol_path(inode_data.dev, inode_data.ino)?;
+
+        let dst_path =
+            self.dev_ino_and_name_to_vol_path(new_parent_data.dev, new_parent_data.ino, new_name)?;
+
+        // Create the hard link
+        let res = unsafe { libc::link(src_path.as_ptr(), dst_path.as_ptr()) };
+
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Get the entry for the newly created link
+        let mut path = new_parent_data.path.clone();
+        path.push(self.intern_name(new_name)?);
+
+        // Get stats for the new link
+        let stat = Self::patched_stat(&FileId::Path(dst_path))?;
+
+        // Create new inode for the link pointing to same dev/ino as source
+        let (inode, _) = self.create_inode(
+            stat.st_ino,
+            stat.st_dev as i32,
+            path,
+            new_parent_data.layer_idx,
+        );
+
+        Ok(self.create_entry(inode, stat))
     }
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
@@ -1909,11 +1945,10 @@ impl FileSystem for OverlayFs {
         new_parent: Self::Inode,
         new_name: &CStr,
     ) -> io::Result<Entry> {
-        // Validate the name to prevent path traversal
         Self::validate_name(new_name)?;
-
-        // TODO: Create a hard link
-        todo!("implement link")
+        let entry = self.do_link(inode, new_parent, new_name)?;
+        self.bump_refcount(entry.inode);
+        Ok(entry)
     }
 
     fn open(
