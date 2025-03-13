@@ -1,6 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{ffi::CString, fs, io};
 
+use crate::virtio::bindings;
 use crate::virtio::{
     fs::filesystem::{Context, Extensions, FileSystem, SetattrValid},
     fuse::FsOptions,
@@ -2508,16 +2509,15 @@ fn test_symlink_nested() -> io::Result<()> {
     assert!(fs::symlink_metadata(top_layer.join("dir2/link_to_file2")).is_ok());
     assert!(fs::symlink_metadata(top_layer.join("dir3/link_to_top_file")).is_ok());
 
-    // TODO: Uncomment this once we have readlink implemented
-    // // Verify symlink targets
-    // let link1_target = fs.readlink(ctx, link_entry.inode)?;
-    // assert_eq!(link1_target, target_name.to_bytes());
+    // Verify symlink targets
+    let link1_target = fs.readlink(ctx, link_entry.inode)?;
+    assert_eq!(link1_target, target_name.to_bytes());
 
-    // let link2_target = fs.readlink(ctx, middle_link_entry.inode)?;
-    // assert_eq!(link2_target, middle_target.to_bytes());
+    let link2_target = fs.readlink(ctx, middle_link_entry.inode)?;
+    assert_eq!(link2_target, middle_target.to_bytes());
 
-    // let link3_target = fs.readlink(ctx, top_link_entry.inode)?;
-    // assert_eq!(link3_target, top_target.to_bytes());
+    let link3_target = fs.readlink(ctx, top_link_entry.inode)?;
+    assert_eq!(link3_target, top_target.to_bytes());
 
     Ok(())
 }
@@ -2640,6 +2640,276 @@ fn test_symlink_invalid_name() -> io::Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_basic() -> io::Result<()> {
+    // Create test layers
+    let files = vec![("file1.txt", false, 0o644), ("file2.txt", false, 0o644)];
+    let layers = vec![files];
+    let (overlayfs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Lookup source and destination parents (root in this case)
+    let root = 1;
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Perform rename
+    overlayfs.rename(Context::default(), root, &old_name, root, &new_name, 0)?;
+
+    // Verify old name doesn't exist
+    assert!(overlayfs
+        .lookup(Context::default(), root, &old_name)
+        .is_err());
+
+    // Verify new name exists
+    let entry = overlayfs.lookup(Context::default(), root, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_whiteout() -> io::Result<()> {
+    // Create test layers with file in lower layer
+    let lower_files = vec![("file1.txt", false, 0o644)];
+    let upper_files = vec![];
+    let layers = vec![lower_files, upper_files];
+    let (overlayfs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let root = 1;
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Rename file from lower layer
+    overlayfs.rename(Context::default(), root, &old_name, root, &new_name, 0)?;
+
+    // Verify old name is whited out
+    assert!(overlayfs
+        .lookup(Context::default(), root, &old_name)
+        .is_err());
+
+    // Verify new name exists in upper layer
+    let entry = overlayfs.lookup(Context::default(), root, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_multiple_layers() -> io::Result<()> {
+    // Create test layers
+    let lower_files = vec![("file1.txt", false, 0o644), ("file2.txt", false, 0o644)];
+    let middle_files = vec![("file3.txt", false, 0o644)];
+    let upper_files = vec![("file4.txt", false, 0o644)];
+    let layers = vec![lower_files, middle_files, upper_files];
+    let (overlayfs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let root = 1;
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Rename file from lowest layer
+    overlayfs.rename(Context::default(), root, &old_name, root, &new_name, 0)?;
+
+    // Verify old name is whited out
+    assert!(overlayfs
+        .lookup(Context::default(), root, &old_name)
+        .is_err());
+
+    // Verify new name exists in upper layer
+    let entry = overlayfs.lookup(Context::default(), root, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_errors() -> io::Result<()> {
+    // Create test layers
+    let files = vec![
+        ("dir1", true, 0o755),
+        ("dir1/file1.txt", false, 0o644),
+        ("file2.txt", false, 0o644),
+    ];
+    let layers = vec![files];
+    let (overlayfs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let root = 1;
+    let dir1_name = CString::new("dir1")?;
+    let dir1_entry = overlayfs.lookup(Context::default(), root, &dir1_name)?;
+
+    // Test renaming non-existent file
+    let nonexistent = CString::new("nonexistent.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+    assert!(overlayfs
+        .rename(Context::default(), root, &nonexistent, root, &new_name, 0,)
+        .is_err());
+
+    // Test renaming to invalid parent
+    let file2_name = CString::new("file2.txt")?;
+    let invalid_parent = 99999;
+    assert!(overlayfs
+        .rename(
+            Context::default(),
+            root,
+            &file2_name,
+            invalid_parent,
+            &new_name,
+            0,
+        )
+        .is_err());
+
+    // Test renaming directory to non-empty directory
+    let dir1_new = CString::new("dir1_new")?;
+    assert!(overlayfs
+        .rename(Context::default(), root, &dir1_name, root, &file2_name, 0,)
+        .is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_whiteout_flag() -> io::Result<()> {
+    // Create test layers with file in lower layer
+    let lower_files = vec![("file1.txt", false, 0o644)];
+    let upper_files = vec![];
+    let layers = vec![lower_files, upper_files];
+    let (overlayfs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let root = 1;
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Use the whiteout flag
+    let flags = bindings::LINUX_RENAME_WHITEOUT;
+    overlayfs.rename(
+        Context::default(),
+        root,
+        &old_name,
+        root,
+        &new_name,
+        flags as u32,
+    )?;
+
+    // Verify that lookup for the old name fails
+    assert!(overlayfs
+        .lookup(Context::default(), root, &old_name)
+        .is_err());
+
+    // Verify new name exists
+    let entry = overlayfs.lookup(Context::default(), root, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    // Check that a whiteout file is created in the top layer
+    let top_layer = temp_dirs.last().unwrap().path();
+    // For root parent, the whiteout should be at the top layer root with prefix '.wh.'
+    let whiteout_path = top_layer.join(".wh.file1.txt");
+    let meta = fs::metadata(&whiteout_path)?;
+    // Updated check: expect a regular file with mode 0o600
+    assert!(
+        meta.file_type().is_file(),
+        "Expected whiteout to be a regular file"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_nested_files() -> io::Result<()> {
+    // Create test layers with nested structure
+    let files = vec![
+        ("dir1", true, 0o755),
+        ("dir1/file1.txt", false, 0o644),
+        ("dir2", true, 0o755),
+    ];
+    let (overlayfs, _temp_dirs) = helper::create_overlayfs(vec![files])?;
+
+    let root = 1;
+    let dir1_name = CString::new("dir1")?;
+    let dir2_name = CString::new("dir2")?;
+
+    // Lookup directory inodes
+    let dir1_entry = overlayfs.lookup(Context::default(), root, &dir1_name)?;
+    let dir2_entry = overlayfs.lookup(Context::default(), root, &dir2_name)?;
+
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Rename file between directories
+    overlayfs.rename(
+        Context::default(),
+        dir1_entry.inode,
+        &old_name,
+        dir2_entry.inode,
+        &new_name,
+        0,
+    )?;
+
+    // Verify old location is empty
+    assert!(overlayfs
+        .lookup(Context::default(), dir1_entry.inode, &old_name)
+        .is_err());
+
+    // Verify new location has the file
+    let entry = overlayfs.lookup(Context::default(), dir2_entry.inode, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    Ok(())
+}
+
+#[test]
+fn test_rename_complex_layers() -> io::Result<()> {
+    // Create test layers with complex structure
+    let lower_files = vec![
+        ("dir1", true, 0o755),
+        ("dir1/file1.txt", false, 0o644),
+        ("dir2", true, 0o755),
+        ("dir2/file2.txt", false, 0o644),
+    ];
+    let middle_files = vec![("dir3", true, 0o755), ("dir3/file3.txt", false, 0o644)];
+    let upper_files = vec![("dir4", true, 0o755), ("dir4/file4.txt", false, 0o644)];
+    let layers = vec![lower_files, middle_files, upper_files];
+    let (overlayfs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let root = 1;
+
+    // Test renaming between different layer directories
+    let dir1_name = CString::new("dir1")?;
+    let dir4_name = CString::new("dir4")?;
+    let dir1_entry = overlayfs.lookup(Context::default(), root, &dir1_name)?;
+    let dir4_entry = overlayfs.lookup(Context::default(), root, &dir4_name)?;
+
+    let old_name = CString::new("file1.txt")?;
+    let new_name = CString::new("renamed.txt")?;
+
+    // Rename from lower to upper layer directory
+    overlayfs.rename(
+        Context::default(),
+        dir1_entry.inode,
+        &old_name,
+        dir4_entry.inode,
+        &new_name,
+        0,
+    )?;
+
+    // Verify file moved correctly
+    assert!(overlayfs
+        .lookup(Context::default(), dir1_entry.inode, &old_name)
+        .is_err());
+    let entry = overlayfs.lookup(Context::default(), dir4_entry.inode, &new_name)?;
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+    // Check whiteout file in the old parent's directory (dir1) in the top layer
+    let top_layer = temp_dirs.last().unwrap().path();
+    let whiteout_path = top_layer.join("dir1").join(".wh.file1.txt");
+    assert!(
+        fs::metadata(&whiteout_path).is_ok(),
+        "Expected whiteout file at {:?}",
+        whiteout_path
+    );
 
     Ok(())
 }

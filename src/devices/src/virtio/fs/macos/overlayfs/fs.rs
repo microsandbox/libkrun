@@ -1354,7 +1354,7 @@ impl OverlayFs {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 // Expected ENOENT means it does not exist, so continue.
             }
-            Err(e) => return Err(e)
+            Err(e) => return Err(e),
         }
 
         // Get the parent inode data
@@ -1409,26 +1409,17 @@ impl OverlayFs {
         Err(linux_error(io::Error::last_os_error()))
     }
 
-    /// Performs an unlink operation
-    fn do_unlink(&self, parent: Inode, name: &CStr) -> io::Result<()> {
-        let top_layer_idx = self.get_top_layer_idx();
-        let (entry, _) = self.do_lookup(parent, name)?;
-
-        // If the inode is in the top layer, we need to unlink it.
-        let entry_data = self.get_inode_data(entry.inode)?;
-        if entry_data.layer_idx == top_layer_idx {
-            // Get the path for the inode
-            let c_path = self.inode_number_to_vol_path(entry.inode)?;
-
-            // Remove the inode from the overlayfs
-            let res = unsafe { libc::unlink(c_path.as_ptr()) };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        // If after an unlink, the entry still exists in a lower layer, we need to  add a whiteout for
-        // the unlinked entry
+    /// Creates a whiteout file for a given parent directory and name.
+    /// This is used to hide files that exist in lower layers.
+    ///
+    /// # Arguments
+    /// * `parent` - The inode of the parent directory
+    /// * `name` - The name of the file to create a whiteout for
+    ///
+    /// # Returns
+    /// * `Ok(())` if the whiteout was created successfully
+    /// * `Err(io::Error)` if there was an error creating the whiteout
+    fn create_whiteout_for_lower(&self, parent: Inode, name: &CStr) -> io::Result<()> {
         if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
             // Copy up the parent directory if needed
             path_inodes.pop();
@@ -1450,10 +1441,33 @@ impl OverlayFs {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+
+            unsafe { libc::close(fd) };
         }
 
-        // Decrement the reference count for the inode
-        self.do_forget(entry.inode, 1);
+        Ok(())
+    }
+
+    /// Performs an unlink operation
+    fn do_unlink(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        let top_layer_idx = self.get_top_layer_idx();
+        let (entry, _) = self.do_lookup(parent, name)?;
+
+        // If the inode is in the top layer, we need to unlink it.
+        let entry_data = self.get_inode_data(entry.inode)?;
+        if entry_data.layer_idx == top_layer_idx {
+            // Get the path for the inode
+            let c_path = self.inode_number_to_vol_path(entry.inode)?;
+
+            // Remove the inode from the overlayfs
+            let res = unsafe { libc::unlink(c_path.as_ptr()) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // If after an unlink, the entry still exists in a lower layer, we need to add a whiteout
+        self.create_whiteout_for_lower(parent, name)?;
 
         Ok(())
     }
@@ -1476,32 +1490,8 @@ impl OverlayFs {
             }
         }
 
-        // If after an unlink, the entry still exists in a lower layer, we need to  add a whiteout for
-        // the unlinked entry
-        if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
-            // Copy up the parent directory if needed
-            path_inodes.pop();
-            self.do_copyup(&path_inodes)?;
-            let parent_data = self.get_inode_data(parent)?;
-            // Create the whiteout file
-            let whiteout_path =
-                self.dev_ino_and_name_to_vol_whiteout_path(parent_data.dev, parent_data.ino, name)?;
-
-            let fd = unsafe {
-                libc::open(
-                    whiteout_path.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
-                    0o000, // Whiteout files have no permissions
-                )
-            };
-
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        // Decrement the reference count for the inode
-        self.do_forget(entry.inode, 1);
+        // If after an rmdir, the entry still exists in a lower layer, we need to add a whiteout
+        self.create_whiteout_for_lower(parent, name)?;
 
         Ok(())
     }
@@ -1526,7 +1516,7 @@ impl OverlayFs {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 // Expected ENOENT means it does not exist, so continue.
             }
-            Err(e) => return Err(e)
+            Err(e) => return Err(e),
         }
 
         // Get the parent inode data
@@ -1580,6 +1570,81 @@ impl OverlayFs {
 
         // Return the error
         Err(linux_error(io::Error::last_os_error()))
+    }
+
+    fn do_rename(
+        &self,
+        old_parent: Inode,
+        old_name: &CStr,
+        new_parent: Inode,
+        new_name: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        // Copy up the old path to the top layer if not already in the top layer
+        let (_, old_path_inodes) = self.do_lookup(old_parent, old_name)?;
+        self.do_copyup(&old_path_inodes)?;
+        let old_parent_data = self.get_inode_data(old_parent)?;
+
+        // Copy up the new parent to the top layer if not already in the top layer
+        let new_parent_data = self.ensure_top_layer(self.get_inode_data(new_parent)?)?;
+
+        // Get the paths for rename operation
+        let old_path =
+            self.dev_ino_and_name_to_vol_path(old_parent_data.dev, old_parent_data.ino, old_name)?;
+        let new_path =
+            self.dev_ino_and_name_to_vol_path(new_parent_data.dev, new_parent_data.ino, new_name)?;
+
+        // Set up rename flags
+        let mut mflags: u32 = 0;
+        if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
+            mflags |= libc::RENAME_EXCL;
+        }
+        if ((flags as i32) & bindings::LINUX_RENAME_EXCHANGE) != 0 {
+            mflags |= libc::RENAME_SWAP;
+        }
+
+        // Check for invalid flag combinations
+        if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0
+            && ((flags as i32) & bindings::LINUX_RENAME_EXCHANGE) != 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        // Perform the rename
+        let res = unsafe { libc::renamex_np(old_path.as_ptr(), new_path.as_ptr(), mflags) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // After successful rename, check if we need to add a whiteout for the old path
+        self.create_whiteout_for_lower(old_parent, old_name)?;
+
+        // If LINUX_RENAME_WHITEOUT is set, create a character device at the old path location
+        if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
+            let fd = unsafe {
+                libc::open(
+                    old_path.as_ptr(),
+                    libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+
+            let stat = Self::unpatched_stat(&FileId::Fd(fd))?;
+            Self::set_owner_perms_attr(
+                &FileId::Fd(fd),
+                &stat,
+                None,
+                Some(libc::S_IFCHR | 0o600),
+            )?;
+
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            unsafe { libc::close(fd) };
+        }
+
+        Ok(())
     }
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
@@ -1832,12 +1897,9 @@ impl FileSystem for OverlayFs {
         new_name: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        // Validate both names to prevent path traversal
         Self::validate_name(old_name)?;
         Self::validate_name(new_name)?;
-
-        // TODO: Rename a file
-        todo!("implement rename")
+        self.do_rename(old_parent, old_name, new_parent, new_name, flags)
     }
 
     fn link(
@@ -1968,6 +2030,7 @@ impl FileSystem for OverlayFs {
         // TODO: Release an open directory
         todo!("implement releasedir")
     }
+
     fn fsyncdir(
         &self,
         _ctx: Context,
