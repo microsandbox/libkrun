@@ -1351,12 +1351,10 @@ impl OverlayFs {
                     "Entry already exists",
                 ))
             }
-            Err(e) => {
-                if e.raw_os_error() != Some(libc::ENOENT) {
-                    return Err(e);
-                }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                 // Expected ENOENT means it does not exist, so continue.
             }
+            Err(e) => return Err(e)
         }
 
         // Get the parent inode data
@@ -1506,6 +1504,82 @@ impl OverlayFs {
         self.do_forget(entry.inode, 1);
 
         Ok(())
+    }
+
+    /// Performs a symlink operation
+    fn do_symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: Inode,
+        name: &CStr,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Check if an entry with the same name already exists in the parent directory
+        match self.do_lookup(parent, name) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Entry already exists",
+                ))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // Expected ENOENT means it does not exist, so continue.
+            }
+            Err(e) => return Err(e)
+        }
+
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Ensure parent directory is in the top layer
+        let parent_data = self.ensure_top_layer(parent_data)?;
+
+        // Get the path for the new directory
+        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
+
+        // Create the directory with initial permissions
+        let res = unsafe { libc::symlink(linkname.as_ptr(), c_path.as_ptr()) };
+        if res == 0 {
+            // Set security context if provided
+            if let Some(secctx) = extensions.secctx {
+                Self::set_secctx(&FileId::Path(c_path.clone()), secctx, true)?;
+            }
+
+            // Get the initial stat for the directory
+            let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
+
+            // Set ownership and permissions
+            let mode = libc::S_IFLNK | 0o777;
+            Self::set_owner_perms_attr(
+                &FileId::Path(c_path.clone()),
+                &stat,
+                Some((ctx.uid, ctx.gid)),
+                Some(mode),
+            )?;
+
+            // Get the updated stat for the directory
+            let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
+
+            let mut path = parent_data.path.clone();
+            path.push(self.intern_name(name)?);
+
+            // Create the inode for the newly created directory
+            let (inode, _) = self.create_inode(
+                updated_stat.st_ino,
+                updated_stat.st_dev,
+                path,
+                parent_data.layer_idx,
+            );
+
+            // Create the entry for the newly created directory
+            let entry = self.create_entry(inode, updated_stat);
+
+            return Ok(entry);
+        }
+
+        // Return the error
+        Err(linux_error(io::Error::last_os_error()))
     }
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
@@ -1737,17 +1811,16 @@ impl FileSystem for OverlayFs {
 
     fn symlink(
         &self,
-        _ctx: Context,
+        ctx: Context,
         linkname: &CStr,
-        parent: Self::Inode,
+        parent: Inode,
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Validate the name to prevent path traversal
         Self::validate_name(name)?;
-
-        // TODO: Create a symbolic link
-        todo!("implement symlink")
+        let entry = self.do_symlink(ctx, linkname, parent, name, extensions)?;
+        self.bump_refcount(entry.inode);
+        Ok(entry)
     }
 
     fn rename(

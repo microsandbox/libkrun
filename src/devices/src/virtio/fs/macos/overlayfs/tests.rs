@@ -2323,6 +2323,14 @@ fn test_rmdir_errors() -> io::Result<()> {
         }
     }
 
+    // Test: Try to remove a file using rmdir
+    let file_name = CString::new("file1.txt").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir_name)?;
+    match fs.rmdir(ctx, dir1_entry.inode, &file_name) {
+        Ok(_) => panic!("rmdir succeeded on a file"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR)),
+    }
+
     Ok(())
 }
 
@@ -2377,6 +2385,261 @@ fn test_rmdir_complex_layers() -> io::Result<()> {
     // Expect a whiteout in the top layer but the original directory remains in lower layer
     assert!(temp_dirs[2].path().join("dir1/.wh.subdir1").exists());
     assert!(temp_dirs[0].path().join("dir1/subdir1").exists());
+
+    Ok(())
+}
+
+#[test]
+fn test_symlink_basic() -> io::Result<()> {
+    // Create test layers:
+    // Single layer with a file
+    let layers = vec![vec![("target_file", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    // Create a new symlink
+    let link_name = CString::new("link").unwrap();
+    let target_name = CString::new("target_file").unwrap();
+    let ctx = Context::default();
+    let entry = fs.symlink(ctx, &target_name, 1, &link_name, Extensions::default())?;
+
+    // Verify the symlink was created with correct mode
+    assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+    assert_eq!(entry.attr.st_mode & 0o777, 0o777); // Symlinks are typically 0777
+
+    // Verify we can look it up
+    let lookup_entry = fs.lookup(ctx, 1, &link_name)?;
+    assert_eq!(lookup_entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+    // Verify the symlink exists on disk in the top layer
+    let link_path = temp_dirs.last().unwrap().path().join("link");
+    assert!(link_path.exists());
+    assert!(link_path.is_symlink());
+
+    // Verify the symlink points to the correct target
+    let target = fs.readlink(ctx, lookup_entry.inode)?;
+    assert_eq!(target, target_name.to_bytes());
+
+    Ok(())
+}
+
+#[test]
+fn test_symlink_nested() -> io::Result<()> {
+    // Create test layers with complex structure:
+    // Layer 0 (bottom):
+    //   - dir1/
+    //   - dir1/file1
+    //   - dir1/subdir/
+    //   - dir1/subdir/bottom_file
+    // Layer 1 (middle):
+    //   - dir2/
+    //   - dir2/file2
+    // Layer 2 (top):
+    //   - dir3/
+    //   - dir3/top_file
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/subdir", true, 0o755),
+            ("dir1/subdir/bottom_file", false, 0o644),
+        ],
+        vec![("dir2", true, 0o755), ("dir2/file2", false, 0o644)],
+        vec![("dir3", true, 0o755), ("dir3/top_file", false, 0o644)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Test 1: Create symlink in dir1 (should trigger copy-up)
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+    let link_name = CString::new("link_to_file1").unwrap();
+    let target_name = CString::new("file1").unwrap();
+    let link_entry = fs.symlink(
+        ctx,
+        &target_name,
+        dir1_entry.inode,
+        &link_name,
+        Extensions::default(),
+    )?;
+    assert_eq!(link_entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+    // Test 2: Create symlink in dir2 (middle layer, should trigger copy-up)
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, 1, &dir2_name)?;
+    let middle_link_name = CString::new("link_to_file2").unwrap();
+    let middle_target = CString::new("file2").unwrap();
+    let middle_link_entry = fs.symlink(
+        ctx,
+        &middle_target,
+        dir2_entry.inode,
+        &middle_link_name,
+        Extensions::default(),
+    )?;
+    assert_eq!(middle_link_entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+    // Test 3: Create symlink in dir3 (top layer, no copy-up needed)
+    let dir3_name = CString::new("dir3").unwrap();
+    let dir3_entry = fs.lookup(ctx, 1, &dir3_name)?;
+    let top_link_name = CString::new("link_to_top_file").unwrap();
+    let top_target = CString::new("top_file").unwrap();
+    let top_link_entry = fs.symlink(
+        ctx,
+        &top_target,
+        dir3_entry.inode,
+        &top_link_name,
+        Extensions::default(),
+    )?;
+    assert_eq!(top_link_entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+    // Verify all symlinks exist in appropriate layers
+    let top_layer = temp_dirs.last().unwrap().path();
+    assert!(fs::symlink_metadata(top_layer.join("dir1/link_to_file1")).is_ok());
+    assert!(fs::symlink_metadata(top_layer.join("dir2/link_to_file2")).is_ok());
+    assert!(fs::symlink_metadata(top_layer.join("dir3/link_to_top_file")).is_ok());
+
+    // TODO: Uncomment this once we have readlink implemented
+    // // Verify symlink targets
+    // let link1_target = fs.readlink(ctx, link_entry.inode)?;
+    // assert_eq!(link1_target, target_name.to_bytes());
+
+    // let link2_target = fs.readlink(ctx, middle_link_entry.inode)?;
+    // assert_eq!(link2_target, middle_target.to_bytes());
+
+    // let link3_target = fs.readlink(ctx, top_link_entry.inode)?;
+    // assert_eq!(link3_target, top_target.to_bytes());
+
+    Ok(())
+}
+
+#[test]
+fn test_symlink_existing_name() -> io::Result<()> {
+    // Create test layers with a file and directory
+    let layers = vec![vec![
+        ("target_file", false, 0o644),
+        ("existing_name", false, 0o644),
+    ]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+    let link_name = CString::new("existing_name").unwrap();
+    let target_name = CString::new("target_file").unwrap();
+
+    // Try to create a symlink with an existing name
+    match fs.symlink(ctx, &target_name, 1, &link_name, Extensions::default()) {
+        Ok(_) => panic!("Expected error when creating symlink with existing name"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_symlink_multiple_layers() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom): base files
+    // Layer 1 (middle): some files
+    // Layer 2 (top): more files
+    let layers = vec![
+        vec![
+            ("bottom_dir", true, 0o755),
+            ("bottom_dir/target1", false, 0o644),
+        ],
+        vec![
+            ("middle_dir", true, 0o755),
+            ("middle_dir/target2", false, 0o644),
+        ],
+        vec![("top_dir", true, 0o755), ("top_dir/target3", false, 0o644)],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+
+    // Create symlinks to files in different layers
+    let test_cases = vec![
+        ("link_to_bottom", "bottom_dir/target1"),
+        ("link_to_middle", "middle_dir/target2"),
+        ("link_to_top", "top_dir/target3"),
+    ];
+
+    for (link, target) in test_cases.clone() {
+        let link_name = CString::new(link).unwrap();
+        let target_name = CString::new(target).unwrap();
+
+        let entry = fs.symlink(ctx, &target_name, 1, &link_name, Extensions::default())?;
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+        // Verify symlink target
+        let target_bytes = fs.readlink(ctx, entry.inode)?;
+        assert_eq!(target_bytes, target_name.to_bytes());
+    }
+
+    // Verify all symlinks exist in the top layer
+    let top_layer = temp_dirs.last().unwrap().path();
+    for (link, _) in test_cases {
+        assert!(fs::symlink_metadata(top_layer.join(link)).is_ok());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_symlink_invalid_name() -> io::Result<()> {
+    // Create a simple test layer
+    let layers = vec![vec![("target_file", false, 0o644)]];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    fs.init(FsOptions::empty())?;
+
+    let ctx = Context::default();
+    let target_name = CString::new("target_file").unwrap();
+
+    // Test cases with invalid names
+    let invalid_names = vec![
+        "..",           // Path traversal attempt
+        "invalid/name", // Contains slash
+        ".wh.name",     // Contains whiteout prefix
+        ".wh..wh..opq", // Opaque directory marker
+    ];
+
+    for name in invalid_names {
+        let link_name = CString::new(name).unwrap();
+        match fs.symlink(ctx, &target_name, 1, &link_name, Extensions::default()) {
+            Ok(_) => panic!("Expected error for invalid name: {}", name),
+            Err(e) => {
+                assert!(
+                    e.kind() == io::ErrorKind::InvalidInput
+                        || e.kind() == io::ErrorKind::PermissionDenied,
+                    "Unexpected error kind for name {}: {:?}",
+                    name,
+                    e.kind()
+                );
+            }
+        }
+    }
 
     Ok(())
 }
