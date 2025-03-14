@@ -406,7 +406,11 @@ impl OverlayFs {
     }
 
     /// Gets the HandleData for a handle
-    pub(super) fn get_inode_handle_data(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+    pub(super) fn get_inode_handle_data(
+        &self,
+        inode: Inode,
+        handle: Handle,
+    ) -> io::Result<Arc<HandleData>> {
         self.handles
             .read()
             .unwrap()
@@ -2173,8 +2177,6 @@ impl FileSystem for OverlayFs {
             return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
         }
 
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
         let f = data.file.read().unwrap();
         w.write_from(&f, size as usize, offset)
     }
@@ -2192,8 +2194,9 @@ impl FileSystem for OverlayFs {
         _kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        // TODO: Write data to a file
-        todo!("implement write")
+        let data = self.get_inode_handle_data(inode, handle)?;
+        let f = data.file.read().unwrap();
+        r.read_to(&f, size as usize, offset)
     }
 
     fn flush(

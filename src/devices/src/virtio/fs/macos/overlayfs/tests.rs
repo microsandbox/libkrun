@@ -2,12 +2,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::{ffi::CString, fs, io};
 
-use helper::NotReallyZeroCopyWriter;
+use helper::TestContainer;
 use tempfile::TempDir;
 
 use crate::virtio::bindings;
 use crate::virtio::{
-    fs::filesystem::{Context, Extensions, FileSystem, SetattrValid},
+    fs::filesystem::{
+        Context, Extensions, FileSystem, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    },
     fuse::{FsOptions, OpenOptions},
 };
 
@@ -3434,33 +3436,6 @@ fn test_open_whiteout() -> io::Result<()> {
     Ok(())
 }
 
-// #[test]
-// fn test_open_root_directory() -> io::Result<()> {
-//     // Create a simple overlayfs with a single layer
-//     let layers = vec![vec![("file1", false, 0o644)]];
-
-//     let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-//     let ctx = Context::default();
-
-//     // Open the root directory (inode 1)
-//     let (handle, opts) = fs.open(ctx, 1, (libc::O_RDONLY | libc::O_DIRECTORY) as u32)?;
-
-//     // Verify we got a valid handle
-//     assert!(handle.is_some());
-
-//     // Verify the options are appropriate for a directory
-//     match fs.get_config().cache_policy {
-//         CachePolicy::Never => assert!(!opts.contains(OpenOptions::DIRECT_IO)),
-//         CachePolicy::Always => assert!(opts.contains(OpenOptions::CACHE_DIR)),
-//         _ => {}
-//     }
-
-//     // Release the handle
-//     fs.release(ctx, 1, 0, handle.unwrap(), false, false, None)?;
-
-//     Ok(())
-// }
-
 #[test]
 fn test_open_and_release_multiple_times() -> io::Result<()> {
     // Create a simple overlayfs with a single layer containing a file
@@ -3546,7 +3521,7 @@ fn test_read_basic() -> io::Result<()> {
     let handle = handle.unwrap();
 
     // Read the entire content
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, entry.inode, handle, &mut writer, 100, 0, None, 0)?;
 
     assert_eq!(bytes_read, 13); // Length of "Hello, World!"
@@ -3576,7 +3551,7 @@ fn test_read_with_offset() -> io::Result<()> {
     let handle = handle.unwrap();
 
     // Read with offset
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(
         ctx,
         entry.inode,
@@ -3615,7 +3590,7 @@ fn test_read_partial() -> io::Result<()> {
     let handle = handle.unwrap();
 
     // Read only first 5 bytes
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(
         ctx,
         entry.inode,
@@ -3684,7 +3659,7 @@ fn test_read_after_copy_up() -> io::Result<()> {
     assert!(temp_dirs[1].path().join("file1").exists());
 
     // Read the content after copy-up
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, entry.inode, handle, &mut writer, 100, 0, None, 0)?;
 
     assert_eq!(bytes_read, 13);
@@ -3704,7 +3679,7 @@ fn test_read_invalid_handle() -> io::Result<()> {
     let ctx = Context::default();
 
     // Try to read with an invalid handle
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let result = fs.read(
         ctx,
         1,
@@ -3740,14 +3715,11 @@ fn test_read_multiple_times() -> io::Result<()> {
     let handle = handle.unwrap();
 
     // Read the file multiple times with different offsets
-    let test_cases: Vec<(u64, u32, &[u8])> = vec![
-        (0, 5, b"Hello"),
-        (7, 5, b"World"),
-        (12, 1, b"!"),
-    ];
+    let test_cases: Vec<(u64, u32, &[u8])> =
+        vec![(0, 5, b"Hello"), (7, 5, b"World"), (12, 1, b"!")];
 
     for (offset, size, expected) in test_cases {
-        let mut writer = NotReallyZeroCopyWriter(Vec::new());
+        let mut writer = TestContainer(Vec::new());
         let bytes_read = fs.read(ctx, entry.inode, handle, &mut writer, size, offset, None, 0)?;
 
         assert_eq!(bytes_read, expected.len());
@@ -3822,7 +3794,7 @@ fn test_read_nested_directories() -> io::Result<()> {
     let (handle, _) = fs.open(ctx, file1_entry.inode, libc::O_RDONLY as u32)?;
     let handle = handle.unwrap();
 
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, file1_entry.inode, handle, &mut writer, 100, 0, None, 0)?;
     assert_eq!(bytes_read, 9);
     assert_eq!(&writer.0, b"top file1");
@@ -3834,7 +3806,7 @@ fn test_read_nested_directories() -> io::Result<()> {
     let (handle, _) = fs.open(ctx, file3_entry.inode, libc::O_RDONLY as u32)?;
     let handle = handle.unwrap();
 
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, file3_entry.inode, handle, &mut writer, 100, 0, None, 0)?;
     assert_eq!(bytes_read, 12);
     assert_eq!(&writer.0, b"middle file3");
@@ -3850,7 +3822,7 @@ fn test_read_nested_directories() -> io::Result<()> {
     let (handle, _) = fs.open(ctx, file2_entry.inode, libc::O_RDONLY as u32)?;
     let handle = handle.unwrap();
 
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, file2_entry.inode, handle, &mut writer, 100, 0, None, 0)?;
     assert_eq!(bytes_read, 12);
     assert_eq!(&writer.0, b"bottom file2");
@@ -3916,7 +3888,7 @@ fn test_read_with_whiteouts_and_opaque_dirs() -> io::Result<()> {
     let (handle, _) = fs.open(ctx, file4_entry.inode, libc::O_RDONLY as u32)?;
     let handle = handle.unwrap();
 
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, file4_entry.inode, handle, &mut writer, 100, 0, None, 0)?;
     assert_eq!(bytes_read, 5);
     assert_eq!(&writer.0, b"file4");
@@ -3936,11 +3908,426 @@ fn test_read_with_whiteouts_and_opaque_dirs() -> io::Result<()> {
     let (handle, _) = fs.open(ctx, file3_entry.inode, libc::O_RDONLY as u32)?;
     let handle = handle.unwrap();
 
-    let mut writer = NotReallyZeroCopyWriter(Vec::new());
+    let mut writer = TestContainer(Vec::new());
     let bytes_read = fs.read(ctx, file3_entry.inode, handle, &mut writer, 100, 0, None, 0)?;
     assert_eq!(bytes_read, 5);
     assert_eq!(&writer.0, b"file3");
     fs.release(ctx, file3_entry.inode, 0, handle, false, false, None)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_write_basic() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing an empty file
+    let layers = vec![vec![("file1", false, 0o644)]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file with write permissions
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+    let (handle, _opts) = fs.open(ctx, entry.inode, (libc::O_WRONLY | libc::O_TRUNC) as u32)?;
+    let handle = handle.unwrap();
+
+    // Write content to the file
+    let content = b"Hello, World!";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader,
+        content.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+
+    assert_eq!(bytes_written, content.len());
+
+    // Release the handle
+    fs.release(ctx, entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly
+    let file_content = std::fs::read(temp_dirs[0].path().join("file1"))?;
+    assert_eq!(file_content, content);
+
+    Ok(())
+}
+
+#[test]
+fn test_write_with_offset() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing a file with initial content
+    let layers = vec![vec![("file1", false, 0o644)]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Write some initial content to the file
+    std::fs::write(temp_dirs[0].path().join("file1"), b"Hello, World!")?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file with write permissions
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+    let (handle, _opts) = fs.open(ctx, entry.inode, libc::O_WRONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Write content at an offset
+    let content = b"Rusty";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader,
+        content.len() as u32,
+        7,
+        None,
+        false,
+        false,
+        0,
+    )?;
+
+    assert_eq!(bytes_written, content.len());
+
+    // Release the handle
+    fs.release(ctx, entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly
+    let file_content = std::fs::read(temp_dirs[0].path().join("file1"))?;
+    assert_eq!(&file_content, b"Hello, Rusty!");
+
+    Ok(())
+}
+
+#[test]
+fn test_write_partial() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing an empty file
+    let layers = vec![vec![("file1", false, 0o644)]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file with write permissions
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+    let (handle, _opts) = fs.open(ctx, entry.inode, (libc::O_WRONLY | libc::O_TRUNC) as u32)?;
+    let handle = handle.unwrap();
+
+    // Write content to the file, but request to write more than we have
+    let content = b"Hello, World!";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader,
+        100,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+
+    // Should only write what's available
+    assert_eq!(bytes_written, content.len());
+
+    // Release the handle
+    fs.release(ctx, entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly
+    let file_content = std::fs::read(temp_dirs[0].path().join("file1"))?;
+    assert_eq!(file_content, content);
+
+    Ok(())
+}
+
+#[test]
+fn test_write_whiteout() -> io::Result<()> {
+    // Create an overlayfs with two layers, where the top layer has a whiteout for file1
+    let layers = vec![
+        vec![("file1", false, 0o644)],
+        vec![(".wh.file1", false, 0o644)], // Whiteout for file1
+    ];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file (should fail because it's whited out)
+    let file_name = CString::new("file1").unwrap();
+    let lookup_result = fs.lookup(ctx, 1, &file_name);
+    assert!(lookup_result.is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_write_after_copy_up() -> io::Result<()> {
+    // Create an overlayfs with two layers, where file1 exists in the lower layer
+    let layers = vec![vec![("file1", false, 0o644)], vec![]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Write some initial content to the file in the lower layer
+    std::fs::write(temp_dirs[0].path().join("file1"), b"Hello, World!")?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file with write permissions (should trigger copy-up)
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+    let (handle, _opts) = fs.open(ctx, entry.inode, libc::O_WRONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Write new content to the file
+    let content = b"Hello, Rusty!";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader,
+        content.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+
+    assert_eq!(bytes_written, content.len());
+
+    // Release the handle
+    fs.release(ctx, entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly to the upper layer
+    let file_content = std::fs::read(temp_dirs[1].path().join("file1"))?;
+    assert_eq!(file_content, content);
+
+    // The lower layer should remain unchanged
+    let lower_content = std::fs::read(temp_dirs[0].path().join("file1"))?;
+    assert_eq!(lower_content, b"Hello, World!");
+
+    Ok(())
+}
+
+#[test]
+fn test_write_invalid_handle() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing a file
+    let layers = vec![vec![("file1", false, 0o644)]];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup the file
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+
+    // Try to write with an invalid handle
+    let invalid_handle = 12345;
+    let mut reader = TestContainer(b"Hello".to_vec());
+    let result = fs.write(
+        ctx,
+        entry.inode,
+        invalid_handle,
+        &mut reader,
+        5,
+        0,
+        None,
+        false,
+        false,
+        0,
+    );
+
+    // Should fail with EBADF
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+
+    Ok(())
+}
+
+#[test]
+fn test_write_multiple_times() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing an empty file
+    let layers = vec![vec![("file1", false, 0o644)]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the file with write permissions
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+    let (handle, _opts) = fs.open(ctx, entry.inode, (libc::O_WRONLY | libc::O_TRUNC) as u32)?;
+    let handle = handle.unwrap();
+
+    // Write content to the file in multiple operations
+    let content1 = b"Hello, ";
+    let mut reader1 = TestContainer(content1.to_vec());
+    let bytes_written1 = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader1,
+        content1.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+    assert_eq!(bytes_written1, content1.len());
+
+    let content2 = b"World!";
+    let mut reader2 = TestContainer(content2.to_vec());
+    let bytes_written2 = fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader2,
+        content2.len() as u32,
+        bytes_written1 as u64,
+        None,
+        false,
+        false,
+        0,
+    )?;
+    assert_eq!(bytes_written2, content2.len());
+
+    // Release the handle
+    fs.release(ctx, entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly
+    let file_content = std::fs::read(temp_dirs[0].path().join("file1"))?;
+    assert_eq!(file_content, b"Hello, World!");
+
+    Ok(())
+}
+
+#[test]
+fn test_write_nested_directories() -> io::Result<()> {
+    // Create an overlayfs with nested directories
+    let layers = vec![vec![
+        ("dir1", true, 0o755),
+        ("dir1/dir2", true, 0o755),
+        ("dir1/dir2/file1", false, 0o644),
+    ]];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Lookup the nested directories and file
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = fs.lookup(ctx, dir1_entry.inode, &dir2_name)?;
+
+    let file_name = CString::new("file1").unwrap();
+    let file_entry = fs.lookup(ctx, dir2_entry.inode, &file_name)?;
+
+    // Open the file with write permissions
+    let (handle, _opts) = fs.open(
+        ctx,
+        file_entry.inode,
+        (libc::O_WRONLY | libc::O_TRUNC) as u32,
+    )?;
+    let handle = handle.unwrap();
+
+    // Write content to the file
+    let content = b"Nested file content";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        file_entry.inode,
+        handle,
+        &mut reader,
+        content.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+    assert_eq!(bytes_written, content.len());
+
+    // Release the handle
+    fs.release(ctx, file_entry.inode, 0, handle, false, false, None)?;
+
+    // Verify the content was written correctly
+    let file_path = temp_dirs[0].path().join("dir1").join("dir2").join("file1");
+    let file_content = std::fs::read(file_path)?;
+    assert_eq!(file_content, content);
+
+    Ok(())
+}
+
+#[test]
+fn test_write_with_whiteouts_and_opaque_dirs() -> io::Result<()> {
+    // Create an overlayfs with multiple layers, whiteouts, and opaque directories
+    let layers = vec![
+        // Lower layer
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/file2", false, 0o644),
+            ("file3", false, 0o644),
+        ],
+        // Upper layer with whiteout for file2 and opaque dir1
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/.wh..wh..opq", false, 0o644), // Opaque dir marker
+            ("dir1/file4", false, 0o644),    // New file in opaque dir
+            (".wh.file3", false, 0o644),     // Whiteout for file3
+        ],
+    ];
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    let ctx = Context::default();
+
+    // Test 1: Write to file4 in opaque directory
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = fs.lookup(ctx, 1, &dir1_name)?;
+
+    let file4_name = CString::new("file4").unwrap();
+    let file4_entry = fs.lookup(ctx, dir1_entry.inode, &file4_name)?;
+
+    let (handle, _opts) = fs.open(ctx, file4_entry.inode, libc::O_WRONLY as u32)?;
+    let handle = handle.unwrap();
+
+    let content = b"File in opaque dir";
+    let mut reader = TestContainer(content.to_vec());
+    let bytes_written = fs.write(
+        ctx,
+        file4_entry.inode,
+        handle,
+        &mut reader,
+        content.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )?;
+    assert_eq!(bytes_written, content.len());
+
+    fs.release(ctx, file4_entry.inode, 0, handle, false, false, None)?;
+
+    // Verify content
+    let file_path = temp_dirs[1].path().join("dir1").join("file4");
+    let file_content = std::fs::read(file_path)?;
+    assert_eq!(file_content, content);
+
+    // Test 2: Try to access file1 through opaque directory (should fail)
+    let file1_name = CString::new("file1").unwrap();
+    assert!(fs.lookup(ctx, dir1_entry.inode, &file1_name).is_err());
+
+    // Test 3: Try to access file3 (should fail due to whiteout)
+    let file3_name = CString::new("file3").unwrap();
+    assert!(fs.lookup(ctx, 1, &file3_name).is_err());
 
     Ok(())
 }
@@ -3952,7 +4339,7 @@ mod helper {
         process::Command,
     };
 
-    use crate::virtio::fs::filesystem::ZeroCopyWriter;
+    use crate::virtio::fs::filesystem::{ZeroCopyReader, ZeroCopyWriter};
 
     use super::*;
     use tempfile::TempDir;
@@ -3961,13 +4348,13 @@ mod helper {
     // Types
     //--------------------------------------------------------------------------------------------------
 
-    pub(super) struct NotReallyZeroCopyWriter(pub(super) Vec<u8>);
+    pub(super) struct TestContainer(pub(super) Vec<u8>);
 
     //--------------------------------------------------------------------------------------------------
     // Trait Implementations
     //--------------------------------------------------------------------------------------------------
 
-    impl io::Write for NotReallyZeroCopyWriter {
+    impl io::Write for TestContainer {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.extend_from_slice(buf);
             Ok(buf.len())
@@ -3978,22 +4365,56 @@ mod helper {
         }
     }
 
-    impl ZeroCopyWriter for NotReallyZeroCopyWriter {
+    impl ZeroCopyWriter for TestContainer {
         fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
             use std::os::unix::fs::FileExt;
 
-            let mut buffer = vec![0; count];
-            let bytes_read = f.read_at(&mut buffer, off)?;
+            // Pre-allocate space in our vector to avoid reallocations
+            let original_len = self.0.len();
+            self.0.resize(original_len + count, 0);
 
-            if bytes_read == 0 {
+            // Read directly into our vector's buffer
+            let bytes_read = f.read_at(&mut self.0[original_len..original_len + count], off)?;
+
+            // Adjust the size to match what was actually read
+            self.0.truncate(original_len + bytes_read);
+
+            if bytes_read == 0 && count > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "unexpected EOF",
                 ));
             }
 
-            self.0.extend_from_slice(&buffer[..bytes_read]);
             Ok(bytes_read)
+        }
+    }
+
+    impl io::Read for TestContainer {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let available = self.0.len();
+            if available == 0 {
+                return Ok(0);
+            }
+
+            let amt = std::cmp::min(buf.len(), available);
+            buf[..amt].copy_from_slice(&self.0[..amt]);
+            Ok(amt)
+        }
+    }
+
+    impl ZeroCopyReader for TestContainer {
+        fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+            use std::os::unix::fs::FileExt;
+
+            let available = self.0.len();
+            if available == 0 {
+                return Ok(0);
+            }
+
+            let to_write = std::cmp::min(count, available);
+            let written = f.write_at(&self.0[..to_write], off)?;
+            Ok(written)
         }
     }
 
