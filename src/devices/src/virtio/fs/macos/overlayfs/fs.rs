@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -91,6 +92,28 @@ struct DirStream {
     offset: i64,
 }
 
+/// The caching policy that the file system should report to the FUSE client. By default the FUSE
+/// protocol uses close-to-open consistency. This means that any cached contents of the file are
+/// invalidated the next time that file is opened.
+#[derive(Debug, Default, Clone)]
+pub enum CachePolicy {
+    /// The client should never cache file data and all I/O should be directly forwarded to the
+    /// server. This policy must be selected when file contents may change without the knowledge of
+    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
+    Never,
+
+    /// The client is free to choose when and how to cache file data. This is the default policy and
+    /// uses close-to-open consistency as described in the enum documentation.
+    #[default]
+    Auto,
+
+    /// The client should always cache file data. This means that the FUSE client will not
+    /// invalidate any cached data that was returned by the file system the last time the file was
+    /// opened. This policy should only be selected when the file system has exclusive access to the
+    /// directory.
+    Always,
+}
+
 /// Data associated with an open file handle
 #[derive(Debug)]
 struct HandleData {
@@ -126,6 +149,9 @@ pub struct Config {
     /// If the attributes of a file or directory can only be modified by the FUSE client,
     /// this should be a large value.
     pub attr_timeout: Duration,
+
+    /// The caching policy the file system should use.
+    pub cache_policy: CachePolicy,
 
     /// Whether writeback caching is enabled.
     /// This can improve performance but increases the risk of data corruption if file
@@ -246,7 +272,7 @@ impl OverlayFs {
             init_inode: 1,
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
-            init_handle: 1,
+            init_handle: 0,
             map_windows: Mutex::new(HashMap::new()),
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
@@ -421,6 +447,73 @@ impl OverlayFs {
     fn inode_number_to_vol_path(&self, inode: Inode) -> io::Result<CString> {
         let data = self.get_inode_data(inode)?;
         self.dev_ino_to_vol_path(data.dev, data.ino)
+    }
+
+    /// Turns an inode into an opened file.
+    fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
+        // When writeback caching is enabled, the kernel may send read requests even if the
+        // userspace program opened the file write-only. So we need to ensure that we have opened
+        // the file for reading as well as writing.
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
+            flags &= !libc::O_ACCMODE;
+            flags |= libc::O_RDWR;
+        }
+
+        // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
+        // However, this breaks atomicity as the file may have changed on disk, invalidating the
+        // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
+        // the file. Just allow this for now as it is the user's responsibility to enable writeback
+        // caching only for directories that are not shared. It also means that we need to clear the
+        // `O_APPEND` flag.
+        if writeback && flags & libc::O_APPEND != 0 {
+            flags &= !libc::O_APPEND;
+        }
+
+        let c_path = self.inode_number_to_vol_path(inode)?;
+
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW) & (!libc::O_EXLOCK),
+            )
+        };
+
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        // Safe because we just opened this fd.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Parses open flags
+    fn parse_open_flags(&self, flags: i32) -> i32 {
+        let mut mflags: i32 = flags & 0b11;
+
+        if (flags & bindings::LINUX_O_NONBLOCK) != 0 {
+            mflags |= libc::O_NONBLOCK;
+        }
+        if (flags & bindings::LINUX_O_APPEND) != 0 {
+            mflags |= libc::O_APPEND;
+        }
+        if (flags & bindings::LINUX_O_CREAT) != 0 {
+            mflags |= libc::O_CREAT;
+        }
+        if (flags & bindings::LINUX_O_TRUNC) != 0 {
+            mflags |= libc::O_TRUNC;
+        }
+        if (flags & bindings::LINUX_O_EXCL) != 0 {
+            mflags |= libc::O_EXCL;
+        }
+        if (flags & bindings::LINUX_O_NOFOLLOW) != 0 {
+            mflags |= libc::O_NOFOLLOW;
+        }
+        if (flags & bindings::LINUX_O_CLOEXEC) != 0 {
+            mflags |= libc::O_CLOEXEC;
+        }
+
+        mflags
     }
 
     /// Creates an Entry from stat information and inode data
@@ -984,7 +1077,7 @@ impl OverlayFs {
     }
 
     /// Copies up a file or directory from a lower layer to the top layer
-    pub(crate) fn do_copyup(&self, path_inodes: &[Arc<InodeData>]) -> io::Result<()> {
+    pub(crate) fn copy_up(&self, path_inodes: &[Arc<InodeData>]) -> io::Result<()> {
         // Get the top layer root
         let top_layer_idx = self.get_top_layer_idx();
         let top_layer_root = self.get_layer_root(top_layer_idx)?;
@@ -1021,58 +1114,28 @@ impl OverlayFs {
             // Copy up the file/directory
             match file_type {
                 libc::S_IFREG => {
-                    // Regular file: copy contents and permissions
-                    unsafe {
-                        let src_file = libc::open(src_path.as_ptr(), libc::O_RDONLY);
-                        if src_file < 0 {
-                            return Err(io::Error::last_os_error());
-                        }
+                    // Regular file: use clonefile for COW semantics if available
+                    // Use clonefile for COW semantics
+                    let result = unsafe { clonefile(src_path.as_ptr(), dst_path.as_ptr(), 0) };
 
-                        let mode = (src_stat.st_mode & 0o777) as u32;
-                        let dst_file = libc::open(
-                            dst_path.as_ptr(),
-                            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                            mode,
-                        );
-                        if dst_file < 0 {
-                            libc::close(src_file);
-                            return Err(io::Error::last_os_error());
+                    if result < 0 {
+                        println!("clonefile failed: {}", result);
+                        let err = io::Error::last_os_error();
+                        // If clonefile fails (e.g., across filesystems), fall back to regular copy
+                        if err.raw_os_error() == Some(libc::EXDEV)
+                            || err.raw_os_error() == Some(libc::ENOTSUP)
+                        {
+                            // Fall back to regular copy
+                            self.copy_file_contents(
+                                &src_path,
+                                &dst_path,
+                                (src_stat.st_mode & 0o777) as u32,
+                            )?;
+                        } else {
+                            return Err(err);
                         }
-
-                        // Copy file contents
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            let n_read =
-                                libc::read(src_file, buf.as_mut_ptr() as *mut _, buf.len());
-                            if n_read <= 0 {
-                                break;
-                            }
-                            let mut pos = 0;
-                            while pos < n_read {
-                                let n_written = libc::write(
-                                    dst_file,
-                                    buf.as_ptr().add(pos as usize) as *const _,
-                                    (n_read - pos) as usize,
-                                );
-                                if n_written <= 0 {
-                                    libc::close(src_file);
-                                    libc::close(dst_file);
-                                    return Err(io::Error::last_os_error());
-                                }
-                                pos += n_written;
-                            }
-                        }
-
-                        // Explicitly set permissions to match source file
-                        // This will override any effects from the umask
-                        if libc::fchmod(dst_file, src_stat.st_mode & 0o777) < 0 {
-                            libc::close(src_file);
-                            libc::close(dst_file);
-                            return Err(io::Error::last_os_error());
-                        }
-
-                        libc::close(src_file);
-                        libc::close(dst_file);
+                    } else {
+                        println!("clonefile succeeded: {}", result);
                     }
                 }
                 libc::S_IFDIR => {
@@ -1143,6 +1206,67 @@ impl OverlayFs {
         Ok(())
     }
 
+    /// Helper method to copy file contents when clonefile is not available or fails
+    fn copy_file_contents(
+        &self,
+        src_path: &CString,
+        dst_path: &CString,
+        mode: u32,
+    ) -> io::Result<()> {
+        unsafe {
+            let src_file = libc::open(src_path.as_ptr(), libc::O_RDONLY);
+            if src_file < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let dst_file = libc::open(
+                dst_path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                mode,
+            );
+            if dst_file < 0 {
+                libc::close(src_file);
+                return Err(io::Error::last_os_error());
+            }
+
+            // Copy file contents
+            let mut buf = [0u8; 8192];
+            loop {
+                let n_read = libc::read(src_file, buf.as_mut_ptr() as *mut _, buf.len());
+                if n_read <= 0 {
+                    break;
+                }
+                let mut pos = 0;
+                while pos < n_read {
+                    let n_written = libc::write(
+                        dst_file,
+                        buf.as_ptr().add(pos as usize) as *const _,
+                        (n_read - pos) as usize,
+                    );
+                    if n_written <= 0 {
+                        libc::close(src_file);
+                        libc::close(dst_file);
+                        return Err(io::Error::last_os_error());
+                    }
+                    pos += n_written;
+                }
+            }
+
+            // Explicitly set permissions to match source file
+            // This will override any effects from the umask
+            if libc::fchmod(dst_file, mode as libc::mode_t) < 0 {
+                libc::close(src_file);
+                libc::close(dst_file);
+                return Err(io::Error::last_os_error());
+            }
+
+            libc::close(src_file);
+            libc::close(dst_file);
+        }
+
+        Ok(())
+    }
+
     /// Performs a readdir operation
     fn do_readdir<F>(
         &self,
@@ -1161,14 +1285,69 @@ impl OverlayFs {
 
     /// Performs an open operation
     fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
-        // TODO: Implement do_open
-        todo!("implement do_open")
+        // Parse and normalize the open flags
+        let flags = self.parse_open_flags(flags as i32);
+
+        // Ensure the file exists in the top layer (copy up if needed)
+        let inode_data = self.get_inode_data(inode)?;
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Open the file with the appropriate flags and generate a new unique handle ID
+        let file = RwLock::new(self.open_inode(inode_data.inode, flags)?);
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+
+        // Create handle data structure with file and empty dirstream
+        let data = HandleData {
+            inode,
+            file,
+            dirstream: Mutex::new(DirStream {
+                stream: 0,
+                offset: 0,
+            }),
+        };
+
+        // Store the handle data in the handles map
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+
+        // Set up OpenOptions based on the cache policy configuration
+        let mut opts = OpenOptions::empty();
+        match self.config.cache_policy {
+            // For CachePolicy::Never, set DIRECT_IO to bypass kernel caching for files (not directories)
+            CachePolicy::Never => opts.set(OpenOptions::DIRECT_IO, flags & libc::O_DIRECTORY == 0),
+
+            // For CachePolicy::Always, set different caching options based on whether it's a file or directory
+            CachePolicy::Always => {
+                if flags & libc::O_DIRECTORY == 0 {
+                    // For files: KEEP_CACHE maintains kernel cache between open/close operations
+                    opts |= OpenOptions::KEEP_CACHE;
+                } else {
+                    // For directories: CACHE_DIR enables caching of directory entries
+                    opts |= OpenOptions::CACHE_DIR;
+                }
+            }
+
+            // For CachePolicy::Auto, use default caching behavior
+            _ => {}
+        };
+
+        // Return the handle and options
+        Ok((Some(handle), opts))
     }
 
     /// Performs a release operation
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
-        // TODO: Implement do_release
-        todo!("implement do_release")
+        let mut handles = self.handles.write().unwrap();
+
+        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
+            if e.get().inode == inode {
+                // We don't need to close the file here because that will happen automatically when
+                // the last `Arc` is dropped.
+                e.remove();
+                return Ok(());
+            }
+        }
+
+        Err(ebadf())
     }
 
     /// Performs a getattr operation
@@ -1208,7 +1387,7 @@ impl OverlayFs {
         let (_, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
 
         // Copy up the file
-        self.do_copyup(&path_inodes)?;
+        self.copy_up(&path_inodes)?;
 
         // Get the inode data for the copied file
         self.get_inode_data(inode_data.inode)
@@ -1423,7 +1602,7 @@ impl OverlayFs {
         if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
             // Copy up the parent directory if needed
             path_inodes.pop();
-            self.do_copyup(&path_inodes)?;
+            self.copy_up(&path_inodes)?;
             let parent_data = self.get_inode_data(parent)?;
 
             // Create the whiteout file
@@ -1582,7 +1761,7 @@ impl OverlayFs {
     ) -> io::Result<()> {
         // Copy up the old path to the top layer if not already in the top layer
         let (_, old_path_inodes) = self.do_lookup(old_parent, old_name)?;
-        self.do_copyup(&old_path_inodes)?;
+        self.copy_up(&old_path_inodes)?;
         let old_parent_data = self.get_inode_data(old_parent)?;
 
         // Copy up the new parent to the top layer if not already in the top layer
@@ -1957,8 +2136,11 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        // TODO: Open a file
-        todo!("implement open")
+        if inode == self.init_inode {
+            Ok((Some(self.init_handle), OpenOptions::empty()))
+        } else {
+            self.do_open(inode, flags)
+        }
     }
 
     fn read<W: io::Write + ZeroCopyWriter>(
@@ -2014,8 +2196,7 @@ impl FileSystem for OverlayFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        // TODO: Release an open file
-        todo!("implement release")
+        self.do_release(inode, handle)
     }
 
     fn fsync(
@@ -2143,6 +2324,7 @@ impl Default for Config {
         Self {
             entry_timeout: Duration::from_secs(5),
             attr_timeout: Duration::from_secs(5),
+            cache_policy: CachePolicy::default(), // Use the default cache policy (Auto)
             writeback: false,
             xattr: false,
             proc_sfd_rawfd: None,
@@ -2161,4 +2343,30 @@ impl Default for Context {
             pid: 0,
         }
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// External Functions
+//--------------------------------------------------------------------------------------------------
+
+extern "C" {
+    /// macOS system call for cloning a file with COW semantics
+    ///
+    /// Creates a copy-on-write clone of a file.
+    ///
+    /// ## Arguments
+    ///
+    /// * `src` - Path to the source file
+    /// * `dst` - Path to the destination file
+    /// * `flags` - Currently unused, must be 0
+    ///
+    /// ## Returns
+    ///
+    /// * `0` on success
+    /// * `-1` on error with errno set
+    fn clonefile(
+        src: *const libc::c_char,
+        dst: *const libc::c_char,
+        flags: libc::c_int,
+    ) -> libc::c_int;
 }
