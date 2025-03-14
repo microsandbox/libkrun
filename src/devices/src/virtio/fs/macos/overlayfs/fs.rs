@@ -40,6 +40,9 @@ const VOL_DIR: &str = ".vol";
 /// The owner and permissions attribute
 const OWNER_PERMS_XATTR_KEY: &[u8] = b"user.vm.owner_perms\0";
 
+#[cfg(not(feature = "efi"))]
+static INIT_BINARY: &[u8] = include_bytes!("../../../../../../../init/init");
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -116,7 +119,7 @@ pub enum CachePolicy {
 
 /// Data associated with an open file handle
 #[derive(Debug)]
-struct HandleData {
+pub(crate) struct HandleData {
     /// The inode this handle refers to
     inode: Inode,
 
@@ -398,6 +401,17 @@ impl OverlayFs {
             .read()
             .unwrap()
             .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)
+    }
+
+    /// Gets the HandleData for a handle
+    pub(super) fn get_inode_handle_data(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
             .cloned()
             .ok_or_else(ebadf)
     }
@@ -1119,7 +1133,6 @@ impl OverlayFs {
                     let result = unsafe { clonefile(src_path.as_ptr(), dst_path.as_ptr(), 0) };
 
                     if result < 0 {
-                        println!("clonefile failed: {}", result);
                         let err = io::Error::last_os_error();
                         // If clonefile fails (e.g., across filesystems), fall back to regular copy
                         if err.raw_os_error() == Some(libc::EXDEV)
@@ -1134,8 +1147,6 @@ impl OverlayFs {
                         } else {
                             return Err(err);
                         }
-                    } else {
-                        println!("clonefile succeeded: {}", result);
                     }
                 }
                 libc::S_IFDIR => {
@@ -2154,8 +2165,18 @@ impl FileSystem for OverlayFs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        // TODO: Read data from a file
-        todo!("implement read")
+        let data = self.get_inode_handle_data(inode, handle)?;
+
+        #[cfg(not(feature = "efi"))]
+        if inode == self.init_inode {
+            println!("init inode");
+            return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
+        }
+
+        // This is safe because write_from uses preadv64, so the underlying file descriptor
+        // offset is not affected by this operation.
+        let f = data.file.read().unwrap();
+        w.write_from(&f, size as usize, offset)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
