@@ -3504,6 +3504,31 @@ fn test_open_with_different_flags() -> io::Result<()> {
 }
 
 #[test]
+fn test_open_readonly_no_copy_up() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom): file1 (regular file)
+    // Layer 1 (top): empty
+    let layers = vec![vec![("file1", false, 0o644)], vec![]];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Look up the file
+    let file_name = CString::new("file1").unwrap();
+    let entry = fs.lookup(ctx, 1, &file_name)?;
+
+    // Open the file read-only
+    let (handle, _) = fs.open(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    assert!(handle.is_some());
+
+    // Verify the file is still in the bottom layer
+    let inode_data = fs.get_inode_data(entry.inode)?;
+    assert_eq!(inode_data.layer_idx, 0);
+
+    Ok(())
+}
+
+#[test]
 fn test_read_basic() -> io::Result<()> {
     // Create a simple overlayfs with a single layer containing a file with content
     let layers = vec![vec![("file1", false, 0o644)]];
@@ -4499,6 +4524,31 @@ fn test_opendir_with_different_flags() -> io::Result<()> {
         // Release the handle
         fs.release(ctx, entry.inode, 0, handle.unwrap(), false, false, None)?;
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_opendir_readonly_no_copy_up() -> io::Result<()> {
+    // Create test layers:
+    // Layer 0 (bottom): dir1/ (directory)
+    // Layer 1 (top): empty
+    let layers = vec![vec![("dir1", true, 0o755)], vec![]];
+
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Look up the directory
+    let dir_name = CString::new("dir1").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+
+    // Open the directory read-only
+    let (handle, _) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    assert!(handle.is_some());
+
+    // Verify the directory is still in the bottom layer
+    let inode_data = fs.get_inode_data(entry.inode)?;
+    assert_eq!(inode_data.layer_idx, 0);
 
     Ok(())
 }

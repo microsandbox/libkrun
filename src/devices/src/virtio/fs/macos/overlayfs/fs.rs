@@ -1303,9 +1303,15 @@ impl OverlayFs {
         // Parse and normalize the open flags
         let flags = self.parse_open_flags(flags as i32);
 
-        // Ensure the file exists in the top layer (copy up if needed)
+        // Get the inode data
         let inode_data = self.get_inode_data(inode)?;
-        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Only ensure top layer if write access is requested
+        let inode_data = if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
+            self.ensure_top_layer(inode_data)?
+        } else {
+            inode_data
+        };
 
         // Open the file with the appropriate flags and generate a new unique handle ID
         let file = RwLock::new(self.open_inode(inode_data.inode, flags)?);
