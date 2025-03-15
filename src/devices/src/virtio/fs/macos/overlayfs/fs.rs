@@ -2206,8 +2206,23 @@ impl FileSystem for OverlayFs {
         handle: Self::Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // TODO: Flush file contents
-        todo!("implement flush")
+        let data = self.get_inode_handle_data(inode, handle)?;
+
+        // Since this method is called whenever an fd is closed in the client, we can emulate that
+        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
+        // because this doesn't modify any memory and we check the return values.
+        unsafe {
+            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
+            if newfd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+
+            if libc::close(newfd) < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+
+            Ok(())
+        }
     }
 
     fn release(
@@ -2230,8 +2245,15 @@ impl FileSystem for OverlayFs {
         _datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        // TODO: Synchronize file contents
-        todo!("implement fsync")
+        let data = self.get_inode_handle_data(inode, handle)?;
+
+        // Safe because this doesn't modify any memory and we check the return values.
+        let res = unsafe { libc::fsync(data.file.write().unwrap().as_raw_fd()) };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        Ok(())
     }
 
     fn opendir(
@@ -2240,8 +2262,7 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        // TODO: Open a directory
-        todo!("implement opendir")
+        self.do_open(inode, flags | libc::O_DIRECTORY as u32)
     }
 
     fn readdir<F>(
@@ -2258,6 +2279,21 @@ impl FileSystem for OverlayFs {
     {
         // TODO: Read directory contents
         todo!("implement readdir")
+    }
+
+    fn readdirplus<F>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        size: u32,
+        offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+    {
+        todo!("implement readdirplus")
     }
 
     fn releasedir(
@@ -2340,6 +2376,69 @@ impl FileSystem for OverlayFs {
 
         // TODO: Create and open a file
         todo!("implement create")
+    }
+
+    fn mknod(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        todo!("implement mknod")
+    }
+
+    fn fallocate(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        todo!("implement fallocate")
+    }
+
+    fn lseek(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        todo!("implement lseek")
+    }
+
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<MemoryMapping>>,
+    ) -> io::Result<()> {
+        todo!("implement setupmapping")
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<fuse::RemovemappingOne>,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<MemoryMapping>>,
+    ) -> io::Result<()> {
+        todo!("implement removemapping")
     }
 }
 
