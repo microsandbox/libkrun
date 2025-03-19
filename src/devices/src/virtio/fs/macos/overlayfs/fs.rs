@@ -1,23 +1,22 @@
 use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, CString};
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Path, PathBuf};
-use std::result::Result;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::Sender;
 use hvf::MemoryMapping;
 use intaglio::cstr::SymbolTable;
 use intaglio::Symbol;
 
-use crate::virtio::bindings::{self, LINUX_ENODATA};
+use crate::virtio::bindings;
 use crate::virtio::fs::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
     ListxattrReply, OpenOptions, SecContext, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
@@ -222,9 +221,6 @@ pub struct OverlayFs {
     /// Whether writeback caching is enabled
     writeback: AtomicBool,
 
-    /// Whether to announce submounts
-    announce_submounts: AtomicBool,
-
     /// Configuration options
     config: Config,
 
@@ -277,7 +273,6 @@ impl OverlayFs {
             init_handle: 0,
             map_windows: Mutex::new(HashMap::new()),
             writeback: AtomicBool::new(false),
-            announce_submounts: AtomicBool::new(false),
             config,
             filenames: Arc::new(RwLock::new(SymbolTable::new())),
             layer_roots: Arc::new(RwLock::new(layer_roots)),
@@ -2365,6 +2360,205 @@ impl OverlayFs {
 
         Ok(())
     }
+
+    fn do_create(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        // Check if an entry with the same name already exists in the parent directory
+        match self.do_lookup(parent, name) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Entry already exists",
+                ))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // Expected ENOENT means it does not exist, so continue.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Ensure parent directory is in the top layer
+        let parent_data = self.ensure_top_layer(parent_data)?;
+
+        // Get the path for the new directory
+        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
+
+        let flags = self.parse_open_flags(flags as i32);
+        let hostmode = if (flags & libc::O_DIRECTORY) != 0 {
+            0o700
+        } else {
+            0o600
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value. We don't
+        // really check `flags` because if the kernel can't handle poorly specified flags then we
+        // have much bigger problems.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                hostmode,
+            )
+        };
+
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        // Set security context
+        if let Some(secctx) = extensions.secctx {
+            Self::set_secctx(&FileId::Fd(fd), secctx, false)?
+        };
+
+        // Get the initial stat for the directory
+        let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
+
+        // Set ownership and permissions
+        if let Err(e) = Self::set_owner_perms_attr(
+            &FileId::Fd(fd),
+            &stat,
+            Some((ctx.uid, ctx.gid)),
+            Some((libc::S_IFREG as u32 | (mode & !(umask & 0o777))) as u16),
+        ) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+
+        // Get the updated stat for the directory
+        let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
+
+        let mut path = parent_data.path.clone();
+        path.push(self.intern_name(name)?);
+
+        // Create the inode for the newly created directory
+        let (inode, _) = self.create_inode(
+            updated_stat.st_ino,
+            updated_stat.st_dev,
+            path,
+            parent_data.layer_idx,
+        );
+
+        // Create the entry for the newly created directory
+        let entry = self.create_entry(inode, updated_stat);
+
+        // Safe because we just opened this fd.
+        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData {
+            inode: entry.inode,
+            file,
+        };
+
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+
+        let mut opts = OpenOptions::empty();
+        match self.config.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+
+        Ok((entry, Some(handle), opts))
+    }
+
+    fn do_mknod(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Check if an entry with the same name already exists in the parent directory
+        match self.do_lookup(parent, name) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Entry already exists",
+                ))
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // Expected ENOENT means it does not exist, so continue.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Get the parent inode data
+        let parent_data = self.get_inode_data(parent)?;
+
+        // Ensure parent directory is in the top layer
+        let parent_data = self.ensure_top_layer(parent_data)?;
+
+        // Get the path for the new directory
+        let c_path = self.dev_ino_and_name_to_vol_path(parent_data.dev, parent_data.ino, name)?;
+
+        // NOTE: file nodes are created as regular file on macos following the passthroughfs
+        // behavior.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        // Set security context
+        if let Some(secctx) = extensions.secctx {
+            Self::set_secctx(&FileId::Fd(fd), secctx, false)?
+        };
+
+        // Get the initial stat for the directory
+        let stat = Self::unpatched_stat(&FileId::Path(c_path.clone()))?;
+
+        // Set ownership and permissions
+        if let Err(e) = Self::set_owner_perms_attr(
+            &FileId::Fd(fd),
+            &stat,
+            Some((ctx.uid, ctx.gid)),
+            Some((mode & !umask) as u16),
+        ) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+
+        // Get the updated stat for the directory
+        let updated_stat = Self::patched_stat(&FileId::Path(c_path))?;
+
+        let mut path = parent_data.path.clone();
+        path.push(self.intern_name(name)?);
+
+        // Create the inode for the newly created directory
+        let (inode, _) = self.create_inode(
+            updated_stat.st_ino,
+            updated_stat.st_dev,
+            path,
+            parent_data.layer_idx,
+        );
+
+        // Create the entry for the newly created directory
+        let entry = self.create_entry(inode, updated_stat);
+
+        unsafe { libc::close(fd) };
+
+        Ok(entry)
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -2747,14 +2941,55 @@ impl FileSystem for OverlayFs {
         self.do_removexattr(inode, name)
     }
 
-    fn access(&self, _ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
-        // TODO: Check file access permissions
-        todo!("implement access")
+    fn access(&self, ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
+        let c_path = self.inode_number_to_vol_path(inode)?;
+
+        let st = Self::patched_stat(&FileId::Path(c_path))?;
+
+        println!("st: {:?}", st);
+
+        let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
+
+        if mode == libc::F_OK {
+            // The file exists since we were able to call `stat(2)` on it.
+            return Ok(());
+        }
+
+        if (mode & libc::R_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
+            && st.st_mode & 0o004 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        if (mode & libc::W_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
+            && st.st_mode & 0o002 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        // root can only execute something if it is executable by one of the owner, the group, or
+        // everyone.
+        if (mode & libc::X_OK) != 0
+            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
+            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
+            && st.st_mode & 0o001 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        Ok(())
     }
 
     fn create(
         &self,
-        _ctx: Context,
+        ctx: Context,
         parent: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -2762,11 +2997,8 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
-        // Validate the name to prevent path traversal
         Self::validate_name(name)?;
-
-        // TODO: Create and open a file
-        todo!("implement create")
+        self.do_create(ctx, parent, name, mode, flags, umask, extensions)
     }
 
     fn mknod(
@@ -2779,7 +3011,8 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        todo!("implement mknod")
+        Self::validate_name(name)?;
+        self.do_mknod(ctx, parent, name, mode, umask, extensions)
     }
 
     fn fallocate(
