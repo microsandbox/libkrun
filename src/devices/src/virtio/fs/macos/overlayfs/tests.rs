@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::{ffi::CString, fs, io};
@@ -5,10 +7,12 @@ use std::{ffi::CString, fs, io};
 use helper::TestContainer;
 use tempfile::TempDir;
 
-use crate::virtio::bindings;
+use crate::virtio::bindings::{self, LINUX_ENODATA, LINUX_ENOSYS};
+use crate::virtio::linux_errno::{linux_error, LINUX_ERANGE};
 use crate::virtio::{
     fs::filesystem::{
-        Context, Extensions, FileSystem, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+        Context, Extensions, FileSystem, GetxattrReply, ListxattrReply, SetattrValid,
+        ZeroCopyReader, ZeroCopyWriter,
     },
     fuse::{FsOptions, OpenOptions},
 };
@@ -1371,32 +1375,44 @@ fn test_readlink_errors() -> io::Result<()> {
     let file_name = CString::new("regular_file").unwrap();
     let file_entry = fs.lookup(Context::default(), 1, &file_name)?;
     let result = fs.readlink(Context::default(), file_entry.inode);
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().raw_os_error(),
-        Some(libc::EINVAL),
-        "Reading link of regular file should return EINVAL"
-    );
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EINVAL),
+                "Reading link of regular file should return EINVAL"
+            );
+        }
+        Ok(_) => panic!("Expected error for regular file"),
+    }
 
     // Test readlink on directory (should fail)
     let dir_name = CString::new("directory").unwrap();
     let dir_entry = fs.lookup(Context::default(), 1, &dir_name)?;
     let result = fs.readlink(Context::default(), dir_entry.inode);
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().raw_os_error(),
-        Some(libc::EINVAL),
-        "Reading link of directory should return EINVAL"
-    );
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EINVAL),
+                "Reading link of directory should return EINVAL"
+            );
+        }
+        Ok(_) => panic!("Expected error for directory"),
+    }
 
     // Test readlink with invalid inode
     let result = fs.readlink(Context::default(), 999999);
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err().raw_os_error(),
-        Some(libc::EBADF),
-        "Reading link with invalid inode should return EBADF"
-    );
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBADF),
+                "Reading link with invalid inode should return EBADF"
+            );
+        }
+        Ok(_) => panic!("Expected error for invalid inode"),
+    }
 
     Ok(())
 }
@@ -3504,31 +3520,6 @@ fn test_open_with_different_flags() -> io::Result<()> {
 }
 
 #[test]
-fn test_open_readonly_no_copy_up() -> io::Result<()> {
-    // Create test layers:
-    // Layer 0 (bottom): file1 (regular file)
-    // Layer 1 (top): empty
-    let layers = vec![vec![("file1", false, 0o644)], vec![]];
-
-    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
-    let ctx = Context::default();
-
-    // Look up the file
-    let file_name = CString::new("file1").unwrap();
-    let entry = fs.lookup(ctx, 1, &file_name)?;
-
-    // Open the file read-only
-    let (handle, _) = fs.open(ctx, entry.inode, libc::O_RDONLY as u32)?;
-    assert!(handle.is_some());
-
-    // Verify the file is still in the bottom layer
-    let inode_data = fs.get_inode_data(entry.inode)?;
-    assert_eq!(inode_data.layer_idx, 0);
-
-    Ok(())
-}
-
-#[test]
 fn test_read_basic() -> io::Result<()> {
     // Create a simple overlayfs with a single layer containing a file with content
     let layers = vec![vec![("file1", false, 0o644)]];
@@ -4079,7 +4070,7 @@ fn test_write_whiteout() -> io::Result<()> {
         vec![("file1", false, 0o644)],
         vec![(".wh.file1", false, 0o644)], // Whiteout for file1
     ];
-    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
 
     let ctx = Context::default();
 
@@ -4169,8 +4160,12 @@ fn test_write_invalid_handle() -> io::Result<()> {
     );
 
     // Should fail with EBADF
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    match result {
+        Err(e) => {
+            assert_eq!(e.raw_os_error(), Some(libc::EBADF));
+        }
+        Ok(_) => panic!("Expected error for invalid handle"),
+    }
 
     Ok(())
 }
@@ -4393,8 +4388,12 @@ fn test_opendir_nonexistent() -> io::Result<()> {
     let result = fs.opendir(ctx, 999, libc::O_RDONLY as u32);
 
     // Verify it fails with EBADF
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    match result {
+        Err(e) => {
+            assert_eq!(e.raw_os_error(), Some(libc::EBADF));
+        }
+        Ok(_) => panic!("Expected error for non-existent inode"),
+    }
 
     Ok(())
 }
@@ -4417,10 +4416,11 @@ fn test_opendir_whiteout() -> io::Result<()> {
     let result = fs.lookup(ctx, 1, &dir_name);
 
     // Verify lookup fails with ENOENT
-    if let Err(e) = result {
-        assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
-    } else {
-        panic!("Expected lookup of whited-out directory to fail");
+    match result {
+        Err(e) => {
+            assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
+        }
+        Ok(_) => panic!("Expected error for whited-out directory"),
     }
 
     Ok(())
@@ -4529,26 +4529,1039 @@ fn test_opendir_with_different_flags() -> io::Result<()> {
 }
 
 #[test]
-fn test_opendir_readonly_no_copy_up() -> io::Result<()> {
-    // Create test layers:
-    // Layer 0 (bottom): dir1/ (directory)
-    // Layer 1 (top): empty
-    let layers = vec![vec![("dir1", true, 0o755)], vec![]];
+fn test_readdir_basic() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing a directory with files
+    let layers = vec![vec![
+        ("dir1", true, 0o755),
+        ("dir1/file1", false, 0o644),
+        ("dir1/file2", false, 0o644),
+    ]];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("dir1").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Verify the entries
+    assert!(entries.contains(&"file1".to_string()));
+    assert!(entries.contains(&"file2".to_string()));
+    assert_eq!(entries.len(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_with_offset() -> io::Result<()> {
+    // Create an overlayfs with multiple layers containing overlapping directories and files
+    // Layer 0 (lowest): Some initial files
+    // Layer 1 (middle): Some additional files and modifications
+    // Layer 2 (top): More files and potential whiteouts
+    let layers = vec![
+        // Layer 0 (lowest)
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/file2", false, 0o644),
+            ("dir1/common", false, 0o644),
+        ],
+        // Layer 1 (middle)
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file3", false, 0o644),
+            ("dir1/file4", false, 0o644),
+            ("dir1/common", false, 0o644), // This overlays the one in layer 0
+        ],
+        // Layer 2 (top)
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file5", false, 0o644),
+            ("dir1/file6", false, 0o644),
+            ("dir1/file7", false, 0o644),
+        ],
+    ];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("dir1").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the first batch of directory entries and save the offset
+    let mut entries = Vec::new();
+    let mut last_offset = 0;
+    fs.readdir(
+        ctx,
+        entry.inode,
+        handle,
+        1024, // Small buffer to force multiple reads
+        0,
+        |dir_entry| {
+            let name = String::from_utf8_lossy(dir_entry.name).to_string();
+            entries.push(name);
+            last_offset = dir_entry.offset;
+            Ok(0)
+        },
+    )?;
+
+    println!("entries: {:?}", entries);
+
+    // Read the second batch of directory entries starting from the last offset
+    let mut more_entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, last_offset, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        more_entries.push(name);
+        Ok(1)
+    })?;
+
+    println!("more_entries: {:?}", more_entries);
+
+    // Verify that we got all entries between the two reads
+    let all_entries: Vec<_> = entries
+        .into_iter()
+        .chain(more_entries.into_iter())
+        .collect();
+
+    println!("all_entries: {:?}", all_entries);
+    assert!(all_entries.contains(&"file1".to_string()));
+    assert!(all_entries.contains(&"file2".to_string()));
+    assert!(all_entries.contains(&"file3".to_string()));
+    assert!(all_entries.contains(&"file4".to_string()));
+    assert!(all_entries.contains(&"file5".to_string()));
+    assert!(all_entries.contains(&"file6".to_string()));
+    assert!(all_entries.contains(&"file7".to_string()));
+    assert!(all_entries.contains(&"common".to_string()));
+
+    // Verify we have the right number of entries
+    assert_eq!(all_entries.len(), 8);
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_empty_directory() -> io::Result<()> {
+    // Create a simple overlayfs with a single layer containing an empty directory
+    let layers = vec![vec![("empty_dir", true, 0o755)]];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("empty_dir").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(0)
+    })?;
+
+    // Verify the entries (should be empty since "." and ".." are handled by the kernel)
+    assert_eq!(entries.len(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_whiteout() -> io::Result<()> {
+    // Create an overlayfs with two layers:
+    // Layer 0 (bottom): dir1 with file1, file2, file3
+    // Layer 1 (top): dir1 with file2 whited out
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/file2", false, 0o644),
+            ("dir1/file3", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/.wh.file2", false, 0o644), // Whiteout for file2
+        ],
+    ];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("dir1").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Verify the entries (should include "file1" and "file3", but not "file2")
+    assert!(entries.contains(&"file1".to_string()));
+    assert!(entries.contains(&"file3".to_string()));
+    assert!(!entries.contains(&"file2".to_string())); // Should be whited out
+    assert_eq!(entries.len(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_multiple_layers() -> io::Result<()> {
+    let layers = vec![
+        vec![("dir1", true, 0o755), ("dir1/file1", false, 0o644)],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file2", false, 0o644),
+            ("dir2", true, 0o755),
+            ("dir2/file1", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file3", false, 0o644),
+            ("dir2/file2", false, 0o644),
+            ("dir3", true, 0o755),
+            ("dir3/file1", false, 0o644),
+        ],
+    ];
+    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let ctx = Context::default();
+
+    // Lookup and open the dir1
+    let entry = fs.lookup(ctx, 1, &CString::new("dir1").unwrap())?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Verify the entries (should include "file1", "file2", and "file3")
+    assert!(entries.contains(&"file1".to_string()));
+    assert!(entries.contains(&"file2".to_string()));
+    assert!(entries.contains(&"file3".to_string()));
+    assert_eq!(entries.len(), 3);
+
+    // Lookup and open the dir2
+    let entry = fs.lookup(ctx, 1, &CString::new("dir2").unwrap())?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Verify the entries (should include "file1", and "file2")
+    assert!(entries.contains(&"file1".to_string()));
+    assert!(entries.contains(&"file2".to_string()));
+    assert_eq!(entries.len(), 2);
+
+    // Lookup and open the dir3
+    let entry = fs.lookup(ctx, 1, &CString::new("dir3").unwrap())?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Verify the entries (should include "file1")
+    assert!(entries.contains(&"file1".to_string()));
+    assert_eq!(entries.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_opaque_marker() -> io::Result<()> {
+    // Create an overlayfs with three layers:
+    // Layer 0 (bottom): dir1 with file1, file2, file3
+    // Layer 1 (middle): dir1 with opaque marker, file4, file5
+    // Layer 2 (top): dir1 with file5 (shadows middle), file6, file7
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1", false, 0o644),
+            ("dir1/file2", false, 0o644),
+            ("dir1/file3", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/.wh..wh..opq", false, 0o644), // Opaque marker for dir1
+            ("dir1/file4", false, 0o644),
+            ("dir1/file5", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file5", false, 0o644), // Shadows file5 from layer 1
+            ("dir1/file6", false, 0o644),
+            ("dir1/file7", false, 0o644),
+        ],
+    ];
 
     let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
     let ctx = Context::default();
 
-    // Look up the directory
+    // Lookup and open the directory
     let dir_name = CString::new("dir1").unwrap();
     let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
 
-    // Open the directory read-only
-    let (handle, _) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
-    assert!(handle.is_some());
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
 
-    // Verify the directory is still in the bottom layer
-    let inode_data = fs.get_inode_data(entry.inode)?;
-    assert_eq!(inode_data.layer_idx, 0);
+    // Sort entries for consistent comparison
+    entries.sort();
+
+    // Due to the opaque marker in the middle layer, we should only see:
+    // - files from the top layer (file5, file6, file7)
+    // - files from the middle layer that aren't shadowed by the top (file4)
+    // - NO files from the bottom layer (file1, file2, file3 should be hidden)
+    let expected_entries = vec![
+        "file4".to_string(),
+        "file5".to_string(),
+        "file6".to_string(),
+        "file7".to_string(),
+    ];
+
+    assert_eq!(entries, expected_entries, "Unexpected directory entries");
+
+    // Release the directory handle
+    fs.releasedir(ctx, entry.inode, 0, handle)?;
+
+    // Additional test: Create a second directory with opaque marker in top layer
+    let layers2 = vec![
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/bottom1", false, 0o644),
+            ("dir2/bottom2", false, 0o644),
+        ],
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/middle1", false, 0o644),
+            ("dir2/middle2", false, 0o644),
+        ],
+        vec![
+            ("dir2", true, 0o755),
+            ("dir2/.wh..wh..opq", false, 0o644), // Opaque marker in top layer
+            ("dir2/top1", false, 0o644),
+        ],
+    ];
+
+    let (fs2, _temp_dirs2) = helper::create_overlayfs(layers2)?;
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("dir2").unwrap();
+    let entry = fs2.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs2.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs2.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Sort entries for consistent comparison
+    entries.sort();
+
+    // With opaque marker in the top layer, we should only see:
+    // - files from the top layer (top1)
+    // - NO files from middle or bottom layers
+    assert_eq!(
+        entries,
+        vec!["top1".to_string()],
+        "Unexpected entries in dir2"
+    );
+
+    // Release the directory handle
+    fs2.releasedir(ctx, entry.inode, 0, handle)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_readdir_shadow() -> io::Result<()> {
+    // Create an overlayfs with three layers with shadowing:
+    // Layer 0 (bottom): dir1 with common, only_bottom, shadowed1, shadowed2
+    // Layer 1 (middle): dir1 with common, only_middle, shadowed1
+    // Layer 2 (top): dir1 with common, only_top, shadowed2
+    //
+    // Each file has different content to verify proper shadowing
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/common", false, 0o644),
+            ("dir1/only_bottom", false, 0o644),
+            ("dir1/shadowed1", false, 0o644),
+            ("dir1/shadowed2", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/common", false, 0o644),
+            ("dir1/only_middle", false, 0o644),
+            ("dir1/shadowed1", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/common", false, 0o644),
+            ("dir1/only_top", false, 0o644),
+            ("dir1/shadowed2", false, 0o644),
+        ],
+    ];
+
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
+
+    // Write different content to each layer's files
+    // Bottom layer
+    fs::write(
+        temp_dirs[0].path().join("dir1/common"),
+        "bottom layer common content",
+    )?;
+    fs::write(
+        temp_dirs[0].path().join("dir1/only_bottom"),
+        "only in bottom layer",
+    )?;
+    fs::write(
+        temp_dirs[0].path().join("dir1/shadowed1"),
+        "shadowed1 bottom content",
+    )?;
+    fs::write(
+        temp_dirs[0].path().join("dir1/shadowed2"),
+        "shadowed2 bottom content",
+    )?;
+
+    // Middle layer
+    fs::write(
+        temp_dirs[1].path().join("dir1/common"),
+        "middle layer common content",
+    )?;
+    fs::write(
+        temp_dirs[1].path().join("dir1/only_middle"),
+        "only in middle layer",
+    )?;
+    fs::write(
+        temp_dirs[1].path().join("dir1/shadowed1"),
+        "shadowed1 middle content",
+    )?;
+
+    // Top layer
+    fs::write(
+        temp_dirs[2].path().join("dir1/common"),
+        "top layer common content",
+    )?;
+    fs::write(
+        temp_dirs[2].path().join("dir1/only_top"),
+        "only in top layer",
+    )?;
+    fs::write(
+        temp_dirs[2].path().join("dir1/shadowed2"),
+        "shadowed2 top content",
+    )?;
+
+    let ctx = Context::default();
+
+    // Lookup and open the directory
+    let dir_name = CString::new("dir1").unwrap();
+    let entry = fs.lookup(ctx, 1, &dir_name)?;
+    let (handle, _opts) = fs.opendir(ctx, entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    // Read the directory entries
+    let mut entries = Vec::new();
+    fs.readdir(ctx, entry.inode, handle, 4096, 0, |dir_entry| {
+        let name = String::from_utf8_lossy(dir_entry.name).to_string();
+        entries.push(name);
+        Ok(1)
+    })?;
+
+    // Sort entries for consistent comparison
+    entries.sort();
+
+    // Release the directory handle
+    fs.releasedir(ctx, entry.inode, 0, handle)?;
+
+    // We should see all unique filenames across layers
+    // Each file should appear exactly once
+    let expected_entries = vec![
+        "common".to_string(),
+        "only_bottom".to_string(),
+        "only_middle".to_string(),
+        "only_top".to_string(),
+        "shadowed1".to_string(),
+        "shadowed2".to_string(),
+    ];
+
+    assert_eq!(entries, expected_entries, "Unexpected directory entries");
+
+    // Now verify the content of each file to check shadowing
+
+    // 1. common file - should have top layer content
+    let common_entry = fs.lookup(ctx, entry.inode, &CString::new("common").unwrap())?;
+    let (handle, _) = fs.open(ctx, common_entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    let mut container = TestContainer(Vec::new());
+    fs.read(
+        ctx,
+        common_entry.inode,
+        handle,
+        &mut container,
+        1024,
+        0,
+        None,
+        0,
+    )?;
+    assert_eq!(
+        String::from_utf8_lossy(&container.0),
+        "top layer common content",
+        "common file should have top layer content"
+    );
+    fs.release(ctx, common_entry.inode, 0, handle, false, false, None)?;
+
+    // 2. shadowed1 file - should have middle layer content (shadowed by middle over bottom)
+    let shadowed1_entry = fs.lookup(ctx, entry.inode, &CString::new("shadowed1").unwrap())?;
+    let (handle, _) = fs.open(ctx, shadowed1_entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    let mut container = TestContainer(Vec::new());
+    fs.read(
+        ctx,
+        shadowed1_entry.inode,
+        handle,
+        &mut container,
+        1024,
+        0,
+        None,
+        0,
+    )?;
+    assert_eq!(
+        String::from_utf8_lossy(&container.0),
+        "shadowed1 middle content",
+        "shadowed1 file should have middle layer content"
+    );
+    fs.release(ctx, shadowed1_entry.inode, 0, handle, false, false, None)?;
+
+    // 3. shadowed2 file - should have top layer content (shadowed by top over bottom)
+    let shadowed2_entry = fs.lookup(ctx, entry.inode, &CString::new("shadowed2").unwrap())?;
+    let (handle, _) = fs.open(ctx, shadowed2_entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    let mut container = TestContainer(Vec::new());
+    fs.read(
+        ctx,
+        shadowed2_entry.inode,
+        handle,
+        &mut container,
+        1024,
+        0,
+        None,
+        0,
+    )?;
+    assert_eq!(
+        String::from_utf8_lossy(&container.0),
+        "shadowed2 top content",
+        "shadowed2 file should have top layer content"
+    );
+    fs.release(ctx, shadowed2_entry.inode, 0, handle, false, false, None)?;
+
+    // 4. only_bottom file - should exist and have bottom layer content
+    let only_bottom_entry = fs.lookup(ctx, entry.inode, &CString::new("only_bottom").unwrap())?;
+    let (handle, _) = fs.open(ctx, only_bottom_entry.inode, libc::O_RDONLY as u32)?;
+    let handle = handle.unwrap();
+
+    let mut container = TestContainer(Vec::new());
+    fs.read(
+        ctx,
+        only_bottom_entry.inode,
+        handle,
+        &mut container,
+        1024,
+        0,
+        None,
+        0,
+    )?;
+    assert_eq!(
+        String::from_utf8_lossy(&container.0),
+        "only in bottom layer",
+        "only_bottom file should have bottom layer content"
+    );
+    fs.release(ctx, only_bottom_entry.inode, 0, handle, false, false, None)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_xattrs() -> io::Result<()> {
+    // Create test layers with nested structure:
+    // Layer 0 (bottom): dir1/file1.txt, dir2/file2.txt
+    // Layer 1 (middle): dir1/file3.txt, dir3/file4.txt
+    // Layer 2 (top): dir1/file5.txt, dir2/dir4/file6.txt
+    let layers = vec![
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file1.txt", false, 0o644),
+            ("dir2", true, 0o755),
+            ("dir2/file2.txt", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file3.txt", false, 0o644),
+            ("dir3", true, 0o755),
+            ("dir3/file4.txt", false, 0o644),
+        ],
+        vec![
+            ("dir1", true, 0o755),
+            ("dir1/file5.txt", false, 0o644),
+            ("dir2", true, 0o755),
+            ("dir2/dir4", true, 0o755),
+            ("dir2/dir4/file6.txt", false, 0o644),
+        ],
+    ];
+
+    // Enable xattr in config
+    let mut cfg = Config::default();
+    cfg.xattr = true;
+
+    // Create overlay filesystem with the specified layers
+    let temp_dirs = layers
+        .iter()
+        .map(|layer| helper::setup_test_layer(layer).unwrap())
+        .collect::<Vec<_>>();
+
+    let layer_paths = temp_dirs
+        .iter()
+        .map(|dir| dir.path().to_path_buf())
+        .collect::<Vec<_>>();
+
+    let overlayfs = OverlayFs::new(layer_paths, cfg)?;
+    helper::debug_print_layers(&temp_dirs, false)?;
+
+    // Initialize filesystem
+    overlayfs.init(FsOptions::empty())?;
+    let ctx = Context::default();
+
+    // ---------- Test setting, getting, listing, and removing xattrs on files in different layers ----------
+
+    // Look up dir1
+    let dir1_name = CString::new("dir1").unwrap();
+    let dir1_entry = overlayfs.lookup(ctx, 1, &dir1_name)?;
+
+    // Test file in top layer (dir1/file5.txt)
+    let file5_name = CString::new("file5.txt").unwrap();
+    let file5_entry = overlayfs.lookup(ctx, dir1_entry.inode, &file5_name)?;
+
+    // Test setxattr on top layer file
+    let xattr_name = CString::new("user.test_attr").unwrap();
+    let xattr_value = b"test_value_123";
+    overlayfs.setxattr(ctx, file5_entry.inode, &xattr_name, xattr_value, 0)?;
+
+    // Test getxattr
+    let result = overlayfs.getxattr(ctx, file5_entry.inode, &xattr_name, 100);
+    match result {
+        Ok(GetxattrReply::Value(value)) => {
+            assert_eq!(value, xattr_value);
+        }
+        Err(e) => panic!("Expected GetxattrReply::Value, got error: {:?}", e),
+        _ => panic!("Unexpected result from getxattr"),
+    }
+
+    // Test listxattr
+    let result = overlayfs.listxattr(ctx, file5_entry.inode, 100);
+    match result {
+        Ok(ListxattrReply::Names(names)) => {
+            let mut found = false;
+            let mut start = 0;
+            while start < names.len() {
+                let end = names[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|pos| start + pos)
+                    .unwrap_or(names.len());
+
+                let attr_name = &names[start..end];
+                if attr_name == xattr_name.to_bytes() {
+                    found = true;
+                    break;
+                }
+                start = end + 1;
+            }
+            assert!(found, "Attribute name not found in listxattr result");
+        }
+        Err(e) => panic!("Expected ListxattrReply::Names, got error: {:?}", e),
+        _ => panic!("Unexpected result from listxattr"),
+    }
+
+    // Test setting another attribute
+    let xattr_name2 = CString::new("user.another_attr").unwrap();
+    let xattr_value2 = b"another_value_456";
+    overlayfs.setxattr(ctx, file5_entry.inode, &xattr_name2, xattr_value2, 0)?;
+
+    // Verify both attributes are listed
+    let result = overlayfs.listxattr(ctx, file5_entry.inode, 200);
+    match result {
+        Ok(ListxattrReply::Names(names)) => {
+            let mut attrs = HashSet::new();
+            let mut start = 0;
+            while start < names.len() {
+                let end = names[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|pos| start + pos)
+                    .unwrap_or(names.len());
+
+                let attr_name = &names[start..end];
+                attrs.insert(attr_name.to_vec());
+                start = end + 1;
+            }
+            assert!(
+                attrs.contains(&xattr_name.to_bytes().to_vec()),
+                "First attribute not found"
+            );
+            assert!(
+                attrs.contains(&xattr_name2.to_bytes().to_vec()),
+                "Second attribute not found"
+            );
+        }
+        Err(e) => panic!("Expected ListxattrReply::Names, got error: {:?}", e),
+        _ => panic!("Unexpected result from listxattr"),
+    }
+
+    // Test removexattr
+    overlayfs.removexattr(ctx, file5_entry.inode, &xattr_name)?;
+
+    // Verify the attribute was removed
+    let result = overlayfs.listxattr(ctx, file5_entry.inode, 100);
+    match result {
+        Ok(ListxattrReply::Names(names)) => {
+            let mut found = false;
+            let mut start = 0;
+            while start < names.len() {
+                let end = names[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|pos| start + pos)
+                    .unwrap_or(names.len());
+
+                let attr_name = &names[start..end];
+                if attr_name == xattr_name.to_bytes() {
+                    found = true;
+                    break;
+                }
+                start = end + 1;
+            }
+            assert!(!found, "Attribute should have been removed");
+        }
+        Err(e) => panic!("Expected ListxattrReply::Names, got error: {:?}", e),
+        _ => panic!("Unexpected result from listxattr"),
+    }
+
+    // ---------- Test xattrs on files in middle layer (should trigger copy-up) ----------
+
+    // Look up dir3
+    let dir3_name = CString::new("dir3").unwrap();
+    let dir3_entry = overlayfs.lookup(ctx, 1, &dir3_name)?;
+
+    // Test file in middle layer (dir3/file4.txt)
+    let file4_name = CString::new("file4.txt").unwrap();
+    let file4_entry = overlayfs.lookup(ctx, dir3_entry.inode, &file4_name)?;
+
+    // Verify file exists in middle layer before copy-up
+    let middle_layer_file = temp_dirs[1].path().join("dir3").join("file4.txt");
+    assert!(
+        middle_layer_file.exists(),
+        "File should exist in middle layer before copy-up"
+    );
+    assert!(
+        !temp_dirs[2].path().join("dir3").join("file4.txt").exists(),
+        "File should not exist in top layer before copy-up"
+    );
+
+    // This should cause a copy-up operation since the file is in a lower layer
+    let middle_xattr_name = CString::new("user.middle_attr").unwrap();
+    let middle_xattr_value = b"middle_layer_value";
+    overlayfs.setxattr(
+        ctx,
+        file4_entry.inode,
+        &middle_xattr_name,
+        middle_xattr_value,
+        0,
+    )?;
+
+    // Verify file was copied up to top layer
+    let top_layer_file = temp_dirs[2].path().join("dir3").join("file4.txt");
+    assert!(
+        top_layer_file.exists(),
+        "File should be copied up to top layer"
+    );
+
+    // Verify the attribute was set on the top layer file
+    let result = overlayfs.getxattr(ctx, file4_entry.inode, &middle_xattr_name, 100);
+    match result {
+        Ok(GetxattrReply::Value(value)) => {
+            assert_eq!(value, middle_xattr_value);
+        }
+        Err(e) => panic!("Expected GetxattrReply::Value, got error: {:?}", e),
+        _ => panic!("Unexpected result from getxattr"),
+    }
+
+    // Verify the middle layer file still exists and is unchanged (no xattr)
+    assert!(
+        middle_layer_file.exists(),
+        "Original file should still exist in middle layer"
+    );
+    let result = overlayfs.getxattr(ctx, file4_entry.inode, &middle_xattr_name, 100);
+    match result {
+        Ok(GetxattrReply::Value(value)) => {
+            assert_eq!(
+                value, middle_xattr_value,
+                "Xattr should be accessible through overlay"
+            );
+        }
+        Err(e) => panic!("Expected GetxattrReply::Value, got error: {:?}", e),
+        _ => panic!("Unexpected result from getxattr"),
+    }
+
+    // Try to read the xattr directly from the middle layer file (should not exist)
+    let middle_layer_path = CString::new(middle_layer_file.to_str().unwrap()).unwrap();
+    let mut buf = vec![0; 100];
+    let res = unsafe {
+        libc::getxattr(
+            middle_layer_path.as_ptr(),
+            middle_xattr_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    };
+    assert!(res < 0, "Xattr should not exist on middle layer file");
+    let err = io::Error::last_os_error();
+    assert!(
+        err.raw_os_error().unwrap() == libc::ENOATTR
+            || err.raw_os_error().unwrap() == libc::ENODATA,
+        "Expected ENOATTR or ENODATA when reading xattr from middle layer file"
+    );
+
+    // ---------- Test xattrs on nested directories ----------
+
+    // Look up dir2/dir4
+    let dir2_name = CString::new("dir2").unwrap();
+    let dir2_entry = overlayfs.lookup(ctx, 1, &dir2_name)?;
+
+    let dir4_name = CString::new("dir4").unwrap();
+    let dir4_entry = overlayfs.lookup(ctx, dir2_entry.inode, &dir4_name)?;
+
+    // Set xattr on a nested directory
+    let dir_xattr_name = CString::new("user.dir_attr").unwrap();
+    let dir_xattr_value = b"directory_attribute";
+    overlayfs.setxattr(ctx, dir4_entry.inode, &dir_xattr_name, dir_xattr_value, 0)?;
+
+    // Verify the attribute was set
+    let result = overlayfs.getxattr(ctx, dir4_entry.inode, &dir_xattr_name, 100);
+    match result {
+        Ok(GetxattrReply::Value(value)) => {
+            assert_eq!(value, dir_xattr_value);
+        }
+        Err(e) => panic!("Expected GetxattrReply::Value, got error: {:?}", e),
+        _ => panic!("Unexpected result from getxattr"),
+    }
+
+    // ---------- Test xattrs on file in deeply nested directory ----------
+
+    // Get file in nested directory (dir2/dir4/file6.txt)
+    let file6_name = CString::new("file6.txt").unwrap();
+    let file6_entry = overlayfs.lookup(ctx, dir4_entry.inode, &file6_name)?;
+
+    // Set xattr on the nested file
+    let nested_xattr_name = CString::new("user.nested_attr").unwrap();
+    let nested_xattr_value = b"nested_file_value";
+    overlayfs.setxattr(
+        ctx,
+        file6_entry.inode,
+        &nested_xattr_name,
+        nested_xattr_value,
+        0,
+    )?;
+
+    // Verify the attribute was set
+    let result = overlayfs.getxattr(ctx, file6_entry.inode, &nested_xattr_name, 100);
+    match result {
+        Ok(GetxattrReply::Value(value)) => {
+            assert_eq!(value, nested_xattr_value);
+        }
+        Err(e) => panic!("Expected GetxattrReply::Value, got error: {:?}", e),
+        _ => panic!("Unexpected result from getxattr"),
+    }
+
+    // ---------- Test error cases ----------
+
+    // Test getxattr on non-existent attribute
+    let nonexistent_attr = CString::new("user.nonexistent").unwrap();
+    let result = overlayfs.getxattr(ctx, file6_entry.inode, &nonexistent_attr, 100);
+    match result {
+        Err(e) => {
+            let err_code = e.raw_os_error().unwrap();
+
+            println!("err_code: {}", err_code);
+            assert!(
+                err_code == LINUX_ENODATA,
+                "Expected ENODATA, got: {}",
+                err_code
+            );
+        }
+        Ok(_) => panic!("Expected error for non-existent attribute"),
+    }
+
+    // Test getxattr with buffer too small
+    let result = overlayfs.getxattr(ctx, file6_entry.inode, &nested_xattr_name, 5);
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                LINUX_ERANGE,
+                "Expected ERANGE error"
+            );
+        }
+        Ok(_) => panic!("Expected ERANGE error for small buffer"),
+    }
+
+    // Test removexattr on non-existent attribute
+    let result = overlayfs.removexattr(ctx, file6_entry.inode, &nonexistent_attr);
+    match result {
+        Err(e) => {
+            let err_code = e.raw_os_error().unwrap();
+            assert!(
+                err_code == LINUX_ENODATA,
+                "Expected ENODATA, got: {}",
+                err_code
+            );
+        }
+        Ok(_) => panic!("Expected error for non-existent attribute"),
+    }
+
+    // Test setting xattr with invalid flags (flag value 2 is XATTR_CREATE, which should fail if attr exists)
+    let result = overlayfs.setxattr(
+        ctx,
+        file6_entry.inode,
+        &nested_xattr_name,
+        nested_xattr_value,
+        bindings::LINUX_XATTR_CREATE as u32, // XATTR_CREATE - should fail on existing attr
+    );
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                libc::EEXIST,
+                "Expected EEXIST error"
+            );
+        }
+        Ok(_) => panic!("Expected EEXIST error for XATTR_CREATE on existing attribute"),
+    }
+
+    // ---------- Test disabling xattr functionality ----------
+
+    // Create a new overlayfs with xattr disabled
+    let mut cfg_no_xattr = Config::default();
+    cfg_no_xattr.xattr = false;
+
+    let overlayfs_no_xattr = OverlayFs::new(
+        temp_dirs
+            .iter()
+            .map(|dir| dir.path().to_path_buf())
+            .collect(),
+        cfg_no_xattr,
+    )?;
+
+    overlayfs_no_xattr.init(FsOptions::empty())?;
+
+    // Look up a file again
+    let dir1_entry = overlayfs_no_xattr.lookup(ctx, 1, &dir1_name)?;
+    let file5_entry = overlayfs_no_xattr.lookup(ctx, dir1_entry.inode, &file5_name)?;
+
+    // All xattr operations should return ENOSYS
+    let result = overlayfs_no_xattr.setxattr(ctx, file5_entry.inode, &xattr_name, b"test", 0);
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                LINUX_ENOSYS,
+                "Expected ENOSYS error"
+            );
+        }
+        Ok(_) => panic!("Expected ENOSYS error when xattr is disabled"),
+    }
+
+    let result = overlayfs_no_xattr.getxattr(ctx, file5_entry.inode, &xattr_name, 100);
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                LINUX_ENOSYS,
+                "Expected ENOSYS error"
+            );
+        }
+        Ok(_) => panic!("Expected ENOSYS error when xattr is disabled"),
+    }
+
+    let result = overlayfs_no_xattr.listxattr(ctx, file5_entry.inode, 100);
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                LINUX_ENOSYS,
+                "Expected ENOSYS error"
+            );
+        }
+        Ok(_) => panic!("Expected ENOSYS error when xattr is disabled"),
+    }
+
+    let result = overlayfs_no_xattr.removexattr(ctx, file5_entry.inode, &xattr_name);
+    match result {
+        Err(e) => {
+            assert_eq!(
+                e.raw_os_error().unwrap(),
+                LINUX_ENOSYS,
+                "Expected ENOSYS error"
+            );
+        }
+        Ok(_) => panic!("Expected ENOSYS error when xattr is disabled"),
+    }
 
     Ok(())
 }

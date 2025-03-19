@@ -1,8 +1,10 @@
-use std::collections::{btree_map, BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::result::Result;
@@ -15,14 +17,14 @@ use hvf::MemoryMapping;
 use intaglio::cstr::SymbolTable;
 use intaglio::Symbol;
 
-use crate::virtio::bindings;
+use crate::virtio::bindings::{self, LINUX_ENODATA};
 use crate::virtio::fs::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
     ListxattrReply, OpenOptions, SecContext, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::virtio::fs::fuse;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
-use crate::virtio::linux_errno::linux_error;
+use crate::virtio::linux_errno::{linux_error, LINUX_ERANGE};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -39,6 +41,9 @@ const VOL_DIR: &str = ".vol";
 
 /// The owner and permissions attribute
 const OWNER_PERMS_XATTR_KEY: &[u8] = b"user.vm.owner_perms\0";
+
+/// Maximum allowed number of layers for the overlay filesystem.
+const MAX_LAYERS: usize = 128;
 
 #[cfg(not(feature = "efi"))]
 static INIT_BINARY: &[u8] = include_bytes!("../../../../../../../init/init");
@@ -85,16 +90,6 @@ pub(crate) struct InodeData {
     pub(crate) layer_idx: usize,
 }
 
-/// State for directory stream iteration
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-struct DirStream {
-    /// Opaque handle for the directory stream
-    stream: u64,
-
-    /// Current position in the directory stream
-    offset: i64,
-}
-
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
@@ -121,13 +116,10 @@ pub enum CachePolicy {
 #[derive(Debug)]
 pub(crate) struct HandleData {
     /// The inode this handle refers to
-    inode: Inode,
+    pub(crate) inode: Inode,
 
     /// The underlying file object
-    file: RwLock<std::fs::File>,
-
-    /// Directory stream state (used for directory handles)
-    dirstream: Mutex<DirStream>,
+    pub(crate) file: RwLock<std::fs::File>,
 }
 
 /// Represents either a file descriptor or a path
@@ -260,6 +252,13 @@ impl OverlayFs {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "at least one layer must be provided",
+            ));
+        }
+
+        if layers.len() > MAX_LAYERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "maximum overlayfs layer count exceeded",
             ));
         }
 
@@ -428,6 +427,38 @@ impl OverlayFs {
         let inodes = self.inodes.write().unwrap();
         let inode_data = inodes.get(&inode).unwrap();
         inode_data.refcount.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn set_secctx(file: &FileId, secctx: SecContext, symlink: bool) -> io::Result<()> {
+        let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
+        let ret = match file {
+            FileId::Path(path) => unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    secctx.name.as_ptr(),
+                    secctx.secctx.as_ptr() as *const libc::c_void,
+                    secctx.secctx.len(),
+                    0,
+                    options,
+                )
+            },
+            FileId::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    *fd,
+                    secctx.name.as_ptr(),
+                    secctx.secctx.as_ptr() as *const libc::c_void,
+                    secctx.secctx.len(),
+                    0,
+                    options,
+                )
+            },
+        };
+
+        if ret != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// Converts a dev/ino pair to a volume path
@@ -727,6 +758,7 @@ impl OverlayFs {
                 Err(e) => return Some(Err(e)),
             };
 
+            // TODO: whiteout should not override entry at the same level. so this check should be in not found case.
             // Check for whiteout at current level
             match self.check_whiteout(&parent_vol_path, segment_name) {
                 Ok(true) => return None, // Found whiteout, stop searching
@@ -1282,20 +1314,282 @@ impl OverlayFs {
         Ok(())
     }
 
-    /// Performs a readdir operation
-    fn do_readdir<F>(
+    /// Ensures the file is in the top layer by copying it up if necessary.
+    ///
+    /// This function:
+    /// 1. Checks if the file is already in the top layer
+    /// 2. If not, looks up the complete path to the file
+    /// 3. Copies the file and all its parent directories to the top layer
+    /// 4. Returns the inode data for the copied file
+    ///
+    /// ### Arguments
+    /// * `inode_data` - The inode data for the file to copy up
+    ///
+    /// ### Returns
+    /// * `Ok(InodeData)` - The inode data for the file in the top layer
+    /// * `Err(io::Error)` - If the copy-up operation fails
+    fn ensure_top_layer(&self, inode_data: Arc<InodeData>) -> io::Result<Arc<InodeData>> {
+        let top_layer_idx = self.get_top_layer_idx();
+
+        // If already in top layer, return early
+        if inode_data.layer_idx == top_layer_idx {
+            return Ok(inode_data);
+        }
+
+        // Build the path segments
+        let path_segments = inode_data.path.clone();
+
+        // Lookup the file to get all path inodes
+        let (_, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
+
+        // Copy up the file
+        self.copy_up(&path_inodes)?;
+
+        // Get the inode data for the copied file
+        self.get_inode_data(inode_data.inode)
+    }
+
+    /// Creates a whiteout file for a given parent directory and name.
+    /// This is used to hide files that exist in lower layers.
+    ///
+    /// # Arguments
+    /// * `parent` - The inode of the parent directory
+    /// * `name` - The name of the file to create a whiteout for
+    ///
+    /// # Returns
+    /// * `Ok(())` if the whiteout was created successfully
+    /// * `Err(io::Error)` if there was an error creating the whiteout
+    fn create_whiteout_for_lower(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
+            // Copy up the parent directory if needed
+            path_inodes.pop();
+            self.copy_up(&path_inodes)?;
+            let parent_data = self.get_inode_data(parent)?;
+
+            // Create the whiteout file
+            let whiteout_path =
+                self.dev_ino_and_name_to_vol_whiteout_path(parent_data.dev, parent_data.ino, name)?;
+
+            let fd = unsafe {
+                libc::open(
+                    whiteout_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
+                    0o000, // Whiteout files have no permissions
+                )
+            };
+
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            unsafe { libc::close(fd) };
+        }
+
+        Ok(())
+    }
+
+    /// Returns an iterator over all valid entries in the directory across all layers.
+    ///
+    /// Note: OverlayFs is a high-level, layered filesystem. A simple readdir on a single directory does not produce the complete view.
+    /// This function traverses the directory across multiple layers, merging entries while handling duplicates,
+    /// whiteout files, and opaque markers.
+    ///
+    /// ## Arguments
+    /// * `dir` - The inode of the directory to iterate over.
+    /// * `add_entry` - A callback function that processes each directory entry. If the callback returns 0,
+    ///                it signals that the directory buffer is full and iteration should stop.
+    ///
+    /// ## Returns
+    /// * `Ok(())` if the directory was iterated successfully.
+    /// * `Err(io::Error)` if an error occurred during iteration.
+    pub(super) fn process_dir_entries<F>(&self, dir: Inode, mut add_entry: F) -> io::Result<()>
+    where
+        F: FnMut(DirEntry) -> io::Result<usize>,
+    {
+        // Local state to track iteration over layers
+        struct LazyReaddirState {
+            current_layer: isize, // current layer (top-down)
+            inode_data: Option<Arc<InodeData>>,
+            current_iter: Option<std::fs::ReadDir>,
+            seen: HashSet<Vec<u8>>,
+        }
+
+        let inode_data = self.get_inode_data(dir)?;
+        let top_layer = self.get_top_layer_idx() as isize;
+        let path = inode_data.path.clone();
+        let mut state = LazyReaddirState {
+            current_layer: top_layer,
+            inode_data: None,
+            current_iter: None,
+            seen: HashSet::new(),
+        };
+
+        let mut current_offset = 0u64;
+        let mut opaque_marker_found = false;
+        loop {
+            // If no current iterator, attempt to initialize one for the current layer
+            if state.current_iter.is_none() {
+                if state.current_layer < 0 {
+                    break; // All layers exhausted
+                }
+
+                let layer_root = self.get_layer_root(state.current_layer as usize)?;
+                let mut path_inodes = vec![layer_root.clone()];
+
+                match self.lookup_segment_by_segment(&layer_root, &path, &mut path_inodes) {
+                    Some(Ok(_)) => {
+                        let last_inode = path_inodes.last().unwrap();
+                        let vol_path = self.inode_number_to_vol_path((**last_inode).inode)?;
+                        let dir_str = vol_path.as_c_str().to_str().map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "Invalid path string")
+                        })?;
+
+                        state.inode_data = Some(last_inode.clone());
+                        state.current_iter = Some(std::fs::read_dir(dir_str)?);
+                    }
+                    Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                        state.current_layer -= 1;
+                        continue;
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => {
+                        state.current_layer = -1;
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(iter) = state.current_iter.as_mut() {
+                if let Some(entry_result) = iter.next() {
+                    let entry = entry_result?;
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    let inode_data = state.inode_data.as_ref().unwrap();
+
+                    if state.seen.contains(name.as_bytes()) {
+                        continue;
+                    }
+
+                    // Handle opaque marker and whiteout files
+                    if name_str == OPAQUE_MARKER {
+                        // Opaque marker found; mark it and skip this entry
+                        opaque_marker_found = true;
+                        continue;
+                    } else if name_str.starts_with(WHITEOUT_PREFIX) {
+                        // Whiteout file: extract the actual name
+                        let actual = &name_str[WHITEOUT_PREFIX.len()..];
+                        let actual_bytes = actual.as_bytes();
+                        if state.seen.contains(actual_bytes) {
+                            continue;
+                        }
+
+                        let actual_cstring = CString::new(actual).map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "Invalid whiteout name")
+                        })?;
+
+                        let vol_path = self.dev_ino_and_name_to_vol_path(
+                            inode_data.dev,
+                            inode_data.ino,
+                            &actual_cstring,
+                        )?;
+
+                        match Self::unpatched_stat(&FileId::Path(vol_path)) {
+                            Ok(_) => continue,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                state.seen.insert(actual_bytes.to_vec());
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        state.seen.insert(name.as_bytes().to_vec());
+                    }
+
+                    let metadata = entry.metadata()?;
+                    let mode = metadata.mode() as u32;
+                    let s_ifmt = libc::S_IFMT as u32;
+                    let type_ = if mode & s_ifmt == (libc::S_IFDIR as u32) {
+                        libc::DT_DIR
+                    } else if mode & s_ifmt == (libc::S_IFREG as u32) {
+                        libc::DT_REG
+                    } else if mode & s_ifmt == (libc::S_IFLNK as u32) {
+                        libc::DT_LNK
+                    } else if mode & s_ifmt == (libc::S_IFIFO as u32) {
+                        libc::DT_FIFO
+                    } else if mode & s_ifmt == (libc::S_IFCHR as u32) {
+                        libc::DT_CHR
+                    } else if mode & s_ifmt == (libc::S_IFBLK as u32) {
+                        libc::DT_BLK
+                    } else if mode & s_ifmt == (libc::S_IFSOCK as u32) {
+                        libc::DT_SOCK
+                    } else {
+                        libc::DT_UNKNOWN
+                    };
+
+                    current_offset += 1;
+
+                    let dir_entry = DirEntry {
+                        ino: metadata.ino(),
+                        offset: current_offset,
+                        type_: type_ as u32,
+                        name: name.as_bytes(),
+                    };
+
+                    if add_entry(dir_entry)? == 0 {
+                        return Ok(());
+                    }
+                } else {
+                    state.current_iter = None;
+                    if opaque_marker_found {
+                        break;
+                    }
+                    state.current_layer -= 1;
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reads directory entries for the given inode by merging entries from all underlying layers.
+    ///
+    /// Unlike conventional filesystems that simply call readdir on a directory file descriptor,
+    /// OverlayFs must aggregate entries from multiple layers. The `offset` parameter specifies the starting
+    /// index in the merged list of directory entries. The provided `add_entry` callback is invoked for each
+    /// entry; a return value of 0 indicates that the directory buffer is full and reading should cease.
+    ///
+    /// NOTE: The current implementation of offset does not entirely follow FUSE expected behaviors.
+    /// Changes to entries in the write layer can affect the offset, potentially causing inconsistencies
+    /// in directory listing between calls.
+    ///
+    /// TODO: Implement a more robust offset handling mechanism that maintains consistency even when
+    /// the underlying directory structure changes. One way is making offset a composite value of
+    /// layer (1 MSB) + offset (7 LSB). This will also require having multiple open dirs from lower layers
+    /// in [HandleData].
+    pub(super) fn do_readdir<F>(
         &self,
         inode: Inode,
-        handle: Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
+        mut add_entry: F,
     ) -> io::Result<()>
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
-        // TODO: Implement do_readdir
-        todo!("implement do_readdir")
+        if size == 0 {
+            return Ok(());
+        }
+
+        let mut current_offset = 0u64;
+        self.process_dir_entries(inode, |entry| {
+            if current_offset < offset {
+                current_offset += 1;
+                return Ok(1);
+            }
+
+            add_entry(entry)
+        })
     }
 
     /// Performs an open operation
@@ -1306,26 +1600,15 @@ impl OverlayFs {
         // Get the inode data
         let inode_data = self.get_inode_data(inode)?;
 
-        // Only ensure top layer if write access is requested
-        let inode_data = if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
-            self.ensure_top_layer(inode_data)?
-        } else {
-            inode_data
-        };
+        // Ensure the file is in the top layer
+        let inode_data = self.ensure_top_layer(inode_data)?;
 
         // Open the file with the appropriate flags and generate a new unique handle ID
         let file = RwLock::new(self.open_inode(inode_data.inode, flags)?);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
 
         // Create handle data structure with file and empty dirstream
-        let data = HandleData {
-            inode,
-            file,
-            dirstream: Mutex::new(DirStream {
-                stream: 0,
-                offset: 0,
-            }),
-        };
+        let data = HandleData { inode, file };
 
         // Store the handle data in the handles map
         self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1377,41 +1660,6 @@ impl OverlayFs {
         let st = Self::patched_stat(&FileId::Path(c_path))?;
 
         Ok((st, self.config.attr_timeout))
-    }
-
-    /// Ensures the file is in the top layer by copying it up if necessary.
-    ///
-    /// This function:
-    /// 1. Checks if the file is already in the top layer
-    /// 2. If not, looks up the complete path to the file
-    /// 3. Copies the file and all its parent directories to the top layer
-    /// 4. Returns the inode data for the copied file
-    ///
-    /// ### Arguments
-    /// * `inode_data` - The inode data for the file to copy up
-    ///
-    /// ### Returns
-    /// * `Ok(InodeData)` - The inode data for the file in the top layer
-    /// * `Err(io::Error)` - If the copy-up operation fails
-    fn ensure_top_layer(&self, inode_data: Arc<InodeData>) -> io::Result<Arc<InodeData>> {
-        let top_layer_idx = self.get_top_layer_idx();
-
-        // If already in top layer, return early
-        if inode_data.layer_idx == top_layer_idx {
-            return Ok(inode_data);
-        }
-
-        // Build the path segments
-        let path_segments = inode_data.path.clone();
-
-        // Lookup the file to get all path inodes
-        let (_, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
-
-        // Copy up the file
-        self.copy_up(&path_inodes)?;
-
-        // Get the inode data for the copied file
-        self.get_inode_data(inode_data.inode)
     }
 
     /// Performs a setattr operation, copying up the file if needed
@@ -1607,45 +1855,6 @@ impl OverlayFs {
 
         // Return the error
         Err(linux_error(io::Error::last_os_error()))
-    }
-
-    /// Creates a whiteout file for a given parent directory and name.
-    /// This is used to hide files that exist in lower layers.
-    ///
-    /// # Arguments
-    /// * `parent` - The inode of the parent directory
-    /// * `name` - The name of the file to create a whiteout for
-    ///
-    /// # Returns
-    /// * `Ok(())` if the whiteout was created successfully
-    /// * `Err(io::Error)` if there was an error creating the whiteout
-    fn create_whiteout_for_lower(&self, parent: Inode, name: &CStr) -> io::Result<()> {
-        if let Ok((_, mut path_inodes)) = self.do_lookup(parent, name) {
-            // Copy up the parent directory if needed
-            path_inodes.pop();
-            self.copy_up(&path_inodes)?;
-            let parent_data = self.get_inode_data(parent)?;
-
-            // Create the whiteout file
-            let whiteout_path =
-                self.dev_ino_and_name_to_vol_whiteout_path(parent_data.dev, parent_data.ino, name)?;
-
-            let fd = unsafe {
-                libc::open(
-                    whiteout_path.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
-                    0o000, // Whiteout files have no permissions
-                )
-            };
-
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            unsafe { libc::close(fd) };
-        }
-
-        Ok(())
     }
 
     /// Performs an unlink operation
@@ -1948,36 +2157,213 @@ impl OverlayFs {
         Ok(buf)
     }
 
-    fn set_secctx(file: &FileId, secctx: SecContext, symlink: bool) -> io::Result<()> {
-        let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
-        let ret = match file {
-            FileId::Path(path) => unsafe {
-                libc::setxattr(
-                    path.as_ptr(),
-                    secctx.name.as_ptr(),
-                    secctx.secctx.as_ptr() as *const libc::c_void,
-                    secctx.secctx.len(),
-                    0,
-                    options,
-                )
-            },
-            FileId::Fd(fd) => unsafe {
-                libc::fsetxattr(
-                    *fd,
-                    secctx.name.as_ptr(),
-                    secctx.secctx.as_ptr() as *const libc::c_void,
-                    secctx.secctx.len(),
-                    0,
-                    options,
-                )
-            },
+    fn do_setxattr(&self, inode: Inode, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+        // Check if extended attributes are enabled
+        if !self.config.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        // Don't allow setting the owner/permissions attribute
+        if name.to_bytes() == OWNER_PERMS_XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        // Get the inode data
+        let inode_data = self.get_inode_data(inode)?;
+
+        // Ensure the file is in the top layer before modifying attributes
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Convert flags to mflags
+        let mut mflags: i32 = 0;
+        if (flags as i32) & bindings::LINUX_XATTR_CREATE != 0 {
+            mflags |= libc::XATTR_CREATE;
+        }
+
+        if (flags as i32) & bindings::LINUX_XATTR_REPLACE != 0 {
+            mflags |= libc::XATTR_REPLACE;
+        }
+
+        // Get the path for this inode
+        let c_path = self.inode_number_to_vol_path(inode_data.inode)?;
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+                mflags as libc::c_int,
+            )
         };
 
-        if ret != 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        if res != 0 {
+            return Err(linux_error(io::Error::last_os_error()));
         }
+
+        Ok(())
+    }
+
+    fn do_getxattr(&self, inode: Inode, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        // Check if extended attributes are enabled
+        if !self.config.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        // Don't allow getting attributes for the root inode
+        if inode == self.init_inode {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
+        }
+
+        // Don't allow getting the owner/permissions attribute
+        if name.to_bytes() == OWNER_PERMS_XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        // Get the path for this inode
+        let c_path = self.inode_number_to_vol_path(inode)?;
+
+        // Safe because this will only modify the contents of `buf`
+        let mut buf = vec![0; size as usize];
+        let res = unsafe {
+            if size == 0 {
+                libc::getxattr(
+                    c_path.as_ptr(),
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    size as libc::size_t,
+                    0,
+                    0,
+                )
+            } else {
+                libc::getxattr(
+                    c_path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    size as libc::size_t,
+                    0,
+                    0,
+                )
+            }
+        };
+
+        if res < 0 {
+            let last_error = io::Error::last_os_error();
+            if last_error.raw_os_error() == Some(libc::ERANGE) {
+                return Err(io::Error::from_raw_os_error(LINUX_ERANGE));
+            }
+
+            return Err(linux_error(last_error));
+        }
+
+        if size == 0 {
+            Ok(GetxattrReply::Count(res as u32))
+        } else {
+            // Truncate the buffer to the actual length of the value
+            buf.resize(res as usize, 0);
+            Ok(GetxattrReply::Value(buf))
+        }
+    }
+
+    fn do_listxattr(&self, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+        // Check if extended attributes are enabled
+        if !self.config.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        // Get the path for this inode
+        let c_path = self.inode_number_to_vol_path(inode)?;
+
+        // Safe because this will only modify the contents of `buf`.
+        let mut buf = vec![0; 512_usize];
+        let res = unsafe {
+            libc::listxattr(
+                c_path.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                512,
+                0,
+            )
+        };
+
+        if res < 0 {
+            let last_error = io::Error::last_os_error();
+            if last_error.raw_os_error() == Some(libc::ERANGE) {
+                return Err(io::Error::from_raw_os_error(LINUX_ERANGE));
+            }
+
+            return Err(linux_error(last_error));
+        }
+
+        // Truncate the buffer to the actual length of the list of attributes
+        buf.truncate(res as usize);
+
+        if size == 0 {
+            let mut clean_size = res as usize;
+
+            // Remove the owner/permissions attribute from the list of attributes
+            for attr in buf.split(|c| *c == 0) {
+                if attr.starts_with(&OWNER_PERMS_XATTR_KEY[..OWNER_PERMS_XATTR_KEY.len() - 1]) {
+                    clean_size -= OWNER_PERMS_XATTR_KEY.len();
+                }
+            }
+
+            Ok(ListxattrReply::Count(clean_size as u32))
+        } else {
+            let mut clean_buf = Vec::new();
+
+            // Remove the owner/permissions attribute from the list of attributes
+            for attr in buf.split(|c| *c == 0) {
+                if attr.is_empty()
+                    || attr.starts_with(&OWNER_PERMS_XATTR_KEY[..OWNER_PERMS_XATTR_KEY.len() - 1])
+                {
+                    continue;
+                }
+
+                clean_buf.extend_from_slice(attr);
+                clean_buf.push(0);
+            }
+
+            // Shrink the buffer to the actual length of the list of attributes
+            clean_buf.shrink_to_fit();
+
+            // Return an error if the buffer exceeds the requested size
+            if clean_buf.len() > size as usize {
+                return Err(io::Error::from_raw_os_error(LINUX_ERANGE));
+            }
+
+            Ok(ListxattrReply::Names(clean_buf))
+        }
+    }
+
+    fn do_removexattr(&self, inode: Inode, name: &CStr) -> io::Result<()> {
+        // Check if extended attributes are enabled
+        if !self.config.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        // Don't allow setting the owner/permissions attribute
+        if name.to_bytes() == OWNER_PERMS_XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        // Get the inode data
+        let inode_data = self.get_inode_data(inode)?;
+
+        // Ensure the file is in the top layer before modifying attributes
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        // Get the path for this inode
+        let c_path = self.inode_number_to_vol_path(inode_data.inode)?;
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::removexattr(c_path.as_ptr(), name.as_ptr(), 0) };
+        if res != 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        Ok(())
     }
 }
 
@@ -2283,8 +2669,8 @@ impl FileSystem for OverlayFs {
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
-        // TODO: Read directory contents
-        todo!("implement readdir")
+        let _ = self.get_inode_handle_data(inode, handle)?;
+        self.do_readdir(inode, size, offset, add_entry)
     }
 
     fn readdirplus<F>(
@@ -2299,7 +2685,11 @@ impl FileSystem for OverlayFs {
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
-        todo!("implement readdirplus")
+        let _ = self.get_inode_handle_data(inode, handle)?;
+        self.do_readdir(inode, size, offset, |dir_entry| {
+            let (entry, _) = self.do_lookup(inode, &CString::new(dir_entry.name).unwrap())?;
+            add_entry(dir_entry, entry)
+        })
     }
 
     fn releasedir(
@@ -2309,19 +2699,18 @@ impl FileSystem for OverlayFs {
         _flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        // TODO: Release an open directory
-        todo!("implement releasedir")
+        let _ = self.get_inode_handle_data(inode, handle)?;
+        self.do_release(inode, handle)
     }
 
     fn fsyncdir(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        // TODO: Synchronize directory contents
-        todo!("implement fsyncdir")
+        self.fsync(ctx, inode, datasync, handle)
     }
 
     fn setxattr(
@@ -2332,8 +2721,7 @@ impl FileSystem for OverlayFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
-        // TODO: Set an extended attribute
-        todo!("implement setxattr")
+        self.do_setxattr(inode, name, value, flags)
     }
 
     fn getxattr(
@@ -2343,8 +2731,7 @@ impl FileSystem for OverlayFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        // TODO: Get an extended attribute
-        todo!("implement getxattr")
+        self.do_getxattr(inode, name, size)
     }
 
     fn listxattr(
@@ -2353,13 +2740,11 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         size: u32,
     ) -> io::Result<ListxattrReply> {
-        // TODO: List extended attributes
-        todo!("implement listxattr")
+        self.do_listxattr(inode, size)
     }
 
     fn removexattr(&self, _ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
-        // TODO: Remove an extended attribute
-        todo!("implement removexattr")
+        self.do_removexattr(inode, name)
     }
 
     fn access(&self, _ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
