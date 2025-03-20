@@ -15,6 +15,7 @@ snd = ["pw", "thiserror"]
 virgl_resource_map2 = []
 
 [dependencies]
+intaglio = "1.10.0"
 bitflags = "1.2.0"
 crossbeam-channel = "0.5"
 env_logger = "0.9.0"
@@ -32,7 +33,10 @@ zerocopy-derive = { version = "0.6.3", optional = true }
 arch = { path = "../arch" }
 utils = { path = "../utils" }
 polly = { path = "../polly" }
-rutabaga_gfx = { path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
+rutabaga_gfx = { path = "../rutabaga_gfx", features = [
+    "virgl_renderer",
+    "virgl_renderer_next",
+], optional = true }
 
 imago = { path = "../imago", features = ["sync-wrappers", "vm-memory"] }
 
@@ -43,3 +47,7 @@ lru = ">=0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { path = "../rutabaga_gfx", features = ["x"], optional = true }
 caps = "0.5.5"
+
+
+[dev-dependencies]
+tempfile = "3.17.1"
