@@ -7,11 +7,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{unbounded, Sender};
 use hvf::MemoryMapping;
 use intaglio::cstr::SymbolTable;
 use intaglio::Symbol;
@@ -2194,7 +2195,7 @@ impl OverlayFs {
             )
         };
 
-        if res != 0 {
+        if res < 0 {
             return Err(linux_error(io::Error::last_os_error()));
         }
 
@@ -2354,7 +2355,7 @@ impl OverlayFs {
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::removexattr(c_path.as_ptr(), name.as_ptr(), 0) };
-        if res != 0 {
+        if res < 0 {
             return Err(linux_error(io::Error::last_os_error()));
         }
 
@@ -2558,6 +2559,197 @@ impl OverlayFs {
         unsafe { libc::close(fd) };
 
         Ok(entry)
+    }
+
+    fn do_fallocate(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        let data = self.get_inode_handle_data(inode, handle)?;
+
+        let fd = data.file.write().unwrap().as_raw_fd();
+        let proposed_length = (offset + length) as i64;
+        let mut fs = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATECONTIG,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: proposed_length,
+            fst_bytesalloc: 0,
+        };
+
+        let res = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut fs as *mut _) };
+        if res < 0 {
+            fs.fst_flags = libc::F_ALLOCATEALL;
+            let res = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut fs as &mut _) };
+            if res < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        let st = Self::unpatched_stat(&FileId::Fd(fd))?;
+        if st.st_size >= proposed_length {
+            // fallocate should not shrink the file. The file is already larger than needed.
+            return Ok(());
+        }
+
+        let res = unsafe { libc::ftruncate(fd, proposed_length) };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        Ok(())
+    }
+
+    fn do_lseek(&self, inode: Inode, handle: Handle, offset: u64, whence: u32) -> io::Result<u64> {
+        let data = self.get_inode_handle_data(inode, handle)?;
+
+        // SEEK_DATA and SEEK_HOLE have slightly different semantics
+        // in Linux vs. macOS, which means we can't support them.
+        let mwhence = if whence == 3 {
+            // SEEK_DATA
+            return Ok(offset);
+        } else if whence == 4 {
+            // SEEK_HOLE
+            libc::SEEK_END
+        } else {
+            whence as i32
+        };
+
+        let fd = data.file.write().unwrap().as_raw_fd();
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::lseek(fd, offset as bindings::off64_t, mwhence as libc::c_int) };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        Ok(res as u64)
+    }
+
+    fn do_setupmapping(
+        &self,
+        inode: Inode,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<MemoryMapping>>,
+    ) -> io::Result<()> {
+        if map_sender.is_none() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+
+        if (moffset + len) > shm_size {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        let guest_addr = guest_shm_base + moffset;
+
+        let file = self.open_inode(inode, libc::O_RDWR)?;
+        let fd = file.as_raw_fd();
+
+        let host_addr = unsafe {
+            libc::mmap(
+                null_mut(),
+                len as usize,
+                prot_flags,
+                libc::MAP_SHARED,
+                fd,
+                foffset as libc::off_t,
+            )
+        };
+        if host_addr == libc::MAP_FAILED {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        let ret = unsafe { libc::close(fd) };
+        if ret == -1 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        // We've checked that map_sender is something above.
+        let sender = map_sender.as_ref().unwrap();
+        let (reply_sender, reply_receiver) = unbounded();
+        sender
+            .send(MemoryMapping::AddMapping(
+                reply_sender,
+                host_addr as u64,
+                guest_addr,
+                len,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
+            error!("Error requesting HVF the addition of a DAX window");
+            unsafe { libc::munmap(host_addr, len as usize) };
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        self.map_windows
+            .lock()
+            .unwrap()
+            .insert(guest_addr, host_addr as u64);
+
+        Ok(())
+    }
+
+    fn do_removemapping(
+        &self,
+        requests: Vec<fuse::RemovemappingOne>,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<MemoryMapping>>,
+    ) -> io::Result<()> {
+        if map_sender.is_none() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        for req in requests {
+            let guest_addr = guest_shm_base + req.moffset;
+            if (req.moffset + req.len) > shm_size {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
+            let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
+                Some(a) => a,
+                None => return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL))),
+            };
+            debug!(
+                "removemapping: guest_addr={:x} len={:?}",
+                guest_addr, req.len
+            );
+
+            let sender = map_sender.as_ref().unwrap();
+            let (reply_sender, reply_receiver) = unbounded();
+            sender
+                .send(MemoryMapping::RemoveMapping(
+                    reply_sender,
+                    guest_addr,
+                    req.len,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() {
+                error!("Error requesting HVF the removal of a DAX window");
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
+
+            let ret = unsafe { libc::munmap(host_addr as *mut libc::c_void, req.len as usize) };
+            if ret == -1 {
+                error!("Error unmapping DAX window");
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -3024,7 +3216,7 @@ impl FileSystem for OverlayFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        todo!("implement fallocate")
+        self.do_fallocate(inode, handle, offset, length)
     }
 
     fn lseek(
@@ -3035,7 +3227,7 @@ impl FileSystem for OverlayFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        todo!("implement lseek")
+        self.do_lseek(inode, handle, offset, whence)
     }
 
     fn setupmapping(
@@ -3051,7 +3243,16 @@ impl FileSystem for OverlayFs {
         shm_size: u64,
         map_sender: &Option<Sender<MemoryMapping>>,
     ) -> io::Result<()> {
-        todo!("implement setupmapping")
+        self.do_setupmapping(
+            inode,
+            foffset,
+            len,
+            flags,
+            moffset,
+            guest_shm_base,
+            shm_size,
+            map_sender,
+        )
     }
 
     fn removemapping(
@@ -3062,7 +3263,7 @@ impl FileSystem for OverlayFs {
         shm_size: u64,
         map_sender: &Option<Sender<MemoryMapping>>,
     ) -> io::Result<()> {
-        todo!("implement removemapping")
+        self.do_removemapping(requests, guest_shm_base, shm_size, map_sender)
     }
 }
 
