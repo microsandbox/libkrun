@@ -1,10 +1,11 @@
 mod device;
 #[allow(dead_code)]
 mod filesystem;
+mod server;
 pub mod fuse;
+mod kinds;
 #[allow(dead_code)]
 mod multikey;
-mod server;
 mod worker;
 
 #[cfg(target_os = "linux")]
@@ -15,8 +16,11 @@ pub use linux::fs_utils;
 pub use linux::passthrough;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub use kinds::*;
 #[cfg(target_os = "macos")]
 pub use macos::fs_utils;
+#[cfg(target_os = "macos")]
+pub use macos::overlayfs;
 #[cfg(target_os = "macos")]
 pub use macos::passthrough;
 

@@ -133,7 +133,7 @@ enum FileId {
 }
 
 /// Configuration for the overlay filesystem
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// How long the FUSE client should consider directory entries to be valid.
     /// If the contents of a directory can only be modified by the FUSE client,
@@ -166,6 +166,9 @@ pub struct Config {
 
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
+
+    /// Layers to be used for the overlay filesystem
+    pub layers: Vec<PathBuf>,
 }
 
 /// An overlay filesystem implementation that combines multiple layers into a single logical filesystem.
@@ -197,6 +200,11 @@ pub struct Config {
 /// - When reading, the top layer takes precedence over lower layers
 /// - Whiteout files in the top layer hide files from lower layers
 /// - Opaque directory markers completely mask lower layer directory contents
+/// - It is undefined behavior for whiteouts and their corresponding entries to exist at the same level in the same directory.
+///   For example, looking up such entry can result in different behavior depending on which is found first.
+///   The filesystem will try to prevent adding whiteout entries directly.
+///
+/// TODO: Need to implement entry caching to improve the performance of [`Self::lookup_segment_by_segment`].
 pub struct OverlayFs {
     /// Map of inodes by ID and alternative keys
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
@@ -244,15 +252,15 @@ impl InodeAltKey {
 
 impl OverlayFs {
     /// Creates a new OverlayFs with the given layers
-    pub fn new(layers: Vec<PathBuf>, config: Config) -> io::Result<Self> {
-        if layers.is_empty() {
+    pub fn new(config: Config) -> io::Result<Self> {
+        if config.layers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "at least one layer must be provided",
             ));
         }
 
-        if layers.len() > MAX_LAYERS {
+        if config.layers.len() > MAX_LAYERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "maximum overlayfs layer count exceeded",
@@ -263,7 +271,7 @@ impl OverlayFs {
         let mut inodes = MultikeyBTreeMap::new();
 
         // Initialize the root inodes for all layers
-        let layer_roots = Self::init_root_inodes(&layers, &mut inodes, &mut next_inode)?;
+        let layer_roots = Self::init_root_inodes(&config.layers, &mut inodes, &mut next_inode)?;
 
         Ok(OverlayFs {
             inodes: RwLock::new(inodes),
@@ -754,7 +762,6 @@ impl OverlayFs {
                 Err(e) => return Some(Err(e)),
             };
 
-            // TODO: whiteout should not override entry at the same level. so this check should be in not found case.
             // Check for whiteout at current level
             match self.check_whiteout(&parent_vol_path, segment_name) {
                 Ok(true) => return None, // Found whiteout, stop searching
@@ -1460,7 +1467,6 @@ impl OverlayFs {
                     let entry = entry_result?;
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    let inode_data = state.inode_data.as_ref().unwrap();
 
                     if state.seen.contains(name.as_bytes()) {
                         continue;
@@ -1472,31 +1478,10 @@ impl OverlayFs {
                         opaque_marker_found = true;
                         continue;
                     } else if name_str.starts_with(WHITEOUT_PREFIX) {
-                        // Whiteout file: extract the actual name
+                        // Whiteout file; skip it
                         let actual = &name_str[WHITEOUT_PREFIX.len()..];
-                        let actual_bytes = actual.as_bytes();
-                        if state.seen.contains(actual_bytes) {
-                            continue;
-                        }
-
-                        let actual_cstring = CString::new(actual).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "Invalid whiteout name")
-                        })?;
-
-                        let vol_path = self.dev_ino_and_name_to_vol_path(
-                            inode_data.dev,
-                            inode_data.ino,
-                            &actual_cstring,
-                        )?;
-
-                        match Self::unpatched_stat(&FileId::Path(vol_path)) {
-                            Ok(_) => continue,
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                                state.seen.insert(actual_bytes.to_vec());
-                                continue;
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        state.seen.insert(actual.as_bytes().to_vec());
+                        continue;
                     } else {
                         state.seen.insert(name.as_bytes().to_vec());
                     }
@@ -2656,7 +2641,11 @@ impl OverlayFs {
 
         let guest_addr = guest_shm_base + moffset;
 
-        let file = self.open_inode(inode, libc::O_RDWR)?;
+        // Ensure the inode is in the top layer
+        let inode_data = self.get_inode_data(inode)?;
+        let inode_data = self.ensure_top_layer(inode_data)?;
+
+        let file = self.open_inode(inode_data.inode, libc::O_RDWR)?;
         let fd = file.as_raw_fd();
 
         let host_addr = unsafe {
@@ -3278,6 +3267,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            layers: vec![],
         }
     }
 }

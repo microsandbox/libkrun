@@ -127,8 +127,6 @@ fn test_open_whiteout() -> io::Result<()> {
     // Verify lookup fails
     assert!(result.is_err());
 
-    // Since we can't directly check the error code with assert_eq! due to Debug trait issues,
-    // we'll just verify the file doesn't exist by trying to open a non-existent inode
     let non_existent_inode = 999; // Use a high number that shouldn't exist
     let open_result = fs.open(ctx, non_existent_inode, libc::O_RDONLY as u32);
     assert!(open_result.is_err());

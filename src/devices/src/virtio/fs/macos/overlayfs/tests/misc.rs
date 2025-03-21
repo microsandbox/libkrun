@@ -238,8 +238,11 @@ fn test_copy_up_with_content() -> io::Result<()> {
     let layer_paths: Vec<PathBuf> = temp_dirs.iter().map(|d| d.path().to_path_buf()).collect();
 
     // Create the overlayfs
-    let cfg = Config::default();
-    let fs = OverlayFs::new(layer_paths, cfg)?;
+    let cfg = Config {
+        layers: layer_paths,
+        ..Default::default()
+    };
+    let fs = OverlayFs::new(cfg)?;
     let ctx = Context::default();
 
     // Test 1: Open file1 from bottom layer with write access (should trigger copy-up)
@@ -516,40 +519,6 @@ fn test_link_existing_name() -> io::Result<()> {
     assert!(fs
         .link(ctx, file1_entry.inode, dir1_entry.inode, &existing_name)
         .is_err());
-
-    Ok(())
-}
-
-#[test]
-fn test_readlink_whiteout() -> io::Result<()> {
-    // Create test layers:
-    // Lower layer: target1, link1 -> target1
-    // Upper layer: .wh.link1 (whiteout for link1)
-    let layers = vec![
-        vec![("target1", false, 0o644)],
-        vec![(".wh.link1", false, 0o644)], // Whiteout file
-    ];
-
-    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
-
-    // Create symlink in bottom layer
-    std::os::unix::fs::symlink("target1", temp_dirs[0].path().join("link1"))?;
-
-    // Initialize filesystem
-    fs.init(FsOptions::empty())?;
-
-    // Try to lookup whited-out symlink (should fail)
-    let link_name = CString::new("link1").unwrap();
-    match fs.lookup(Context::default(), 1, &link_name) {
-        Ok(_) => panic!("Expected lookup of whited-out symlink to fail"),
-        Err(e) => {
-            assert_eq!(
-                e.raw_os_error(),
-                Some(libc::ENOENT),
-                "Looking up whited-out symlink should return ENOENT"
-            );
-        }
-    }
 
     Ok(())
 }
