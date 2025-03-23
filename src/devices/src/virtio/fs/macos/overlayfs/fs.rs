@@ -48,6 +48,8 @@ const MAX_LAYERS: usize = 128;
 #[cfg(not(feature = "efi"))]
 static INIT_BINARY: &[u8] = include_bytes!("../../../../../../../init/init");
 
+const INIT_CSTR: &[u8] = b"init.krun\0";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -2813,6 +2815,27 @@ impl FileSystem for OverlayFs {
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         Self::validate_name(name)?;
+
+        #[cfg(not(feature = "efi"))]
+        let init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
+
+        #[cfg(not(feature = "efi"))]
+        if self.init_inode != 0 && name == init_name {
+            let mut st: bindings::stat64 = unsafe { std::mem::zeroed() };
+            st.st_size = INIT_BINARY.len() as i64;
+            st.st_ino = self.init_inode;
+            st.st_mode = 0o100_755;
+
+            return Ok(Entry {
+                inode: self.init_inode,
+                generation: 0,
+                attr: st,
+                attr_flags: 0,
+                attr_timeout: self.config.attr_timeout,
+                entry_timeout: self.config.entry_timeout,
+            })
+        }
+
         let (entry, _) = self.do_lookup(parent, name)?;
         self.bump_refcount(entry.inode);
         Ok(entry)
