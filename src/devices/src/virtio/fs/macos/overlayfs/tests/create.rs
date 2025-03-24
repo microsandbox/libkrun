@@ -1,10 +1,4 @@
-use std::{
-    ffi::CString,
-    fs::{self, FileType},
-    io,
-    os::unix::fs::FileTypeExt,
-    path::Path,
-};
+use std::{ffi::CString, fs, io};
 
 use crate::virtio::{
     bindings,
@@ -1409,12 +1403,12 @@ fn test_mknod_basic() -> io::Result<()> {
     let ctx = Context::default();
 
     // Test creating different types of nodes
-    let test_cases: Vec<(&str, u32, &str)> = vec![
-        ("fifo1", libc::S_IFIFO as u32 | 0o644, "named pipe"),
-        ("sock1", libc::S_IFSOCK as u32 | 0o644, "unix domain socket"),
+    let test_cases: Vec<(&str, u32)> = vec![
+        ("fifo1", libc::S_IFIFO as u32 | 0o644),
+        ("sock1", libc::S_IFSOCK as u32 | 0o644),
     ];
 
-    for (name, mode, node_type) in test_cases {
+    for (name, mode) in test_cases {
         let node_name = CString::new(name).unwrap();
         let entry = fs.mknod(ctx, 1, &node_name, mode, 0, 0o022, Extensions::default())?;
 

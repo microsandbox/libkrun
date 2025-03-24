@@ -15,6 +15,8 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::super::{
     ActivateResult, DeviceState, FsError, Queue as VirtQueue, VirtioDevice, VirtioShmRegion,
 };
+use super::kinds::{FsImplConfig, FsImplShare};
+use super::macos::overlayfs;
 use super::passthrough;
 use super::worker::FsWorker;
 use super::ExportTable;
@@ -51,7 +53,7 @@ pub struct Fs {
     device_state: DeviceState,
     config: VirtioFsConfig,
     shm_region: Option<VirtioShmRegion>,
-    passthrough_cfg: passthrough::Config,
+    fs_config: FsImplConfig,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     #[cfg(target_os = "macos")]
@@ -61,7 +63,7 @@ pub struct Fs {
 impl Fs {
     pub(crate) fn with_queues(
         fs_id: String,
-        shared_dir: String,
+        fs_share: FsImplShare,
         queues: Vec<VirtQueue>,
     ) -> super::Result<Fs> {
         let mut queue_events = Vec::new();
@@ -76,10 +78,15 @@ impl Fs {
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
-
-        let fs_cfg = passthrough::Config {
-            root_dir: shared_dir,
-            ..Default::default()
+        let fs_config = match fs_share {
+            FsImplShare::Passthrough(root_dir) => FsImplConfig::Passthrough(passthrough::Config {
+                root_dir,
+                ..Default::default()
+            }),
+            FsImplShare::Overlayfs(layers) => FsImplConfig::Overlayfs(overlayfs::Config {
+                layers,
+                ..Default::default()
+            }),
         };
 
         Ok(Fs {
@@ -94,7 +101,7 @@ impl Fs {
             device_state: DeviceState::Inactive,
             config,
             shm_region: None,
-            passthrough_cfg: fs_cfg,
+            fs_config,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             #[cfg(target_os = "macos")]
@@ -102,12 +109,12 @@ impl Fs {
         })
     }
 
-    pub fn new(fs_id: String, shared_dir: String) -> super::Result<Fs> {
+    pub fn new(fs_id: String, fs_share: FsImplShare) -> super::Result<Fs> {
         let queues: Vec<VirtQueue> = defs::QUEUE_SIZES
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
             .collect();
-        Self::with_queues(fs_id, shared_dir, queues)
+        Self::with_queues(fs_id, fs_share, queues)
     }
 
     pub fn id(&self) -> &str {
@@ -124,11 +131,20 @@ impl Fs {
 
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
+        let fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
 
-        self.passthrough_cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-        self.passthrough_cfg.export_table = Some(export_table);
+        match &mut self.fs_config {
+            FsImplConfig::Passthrough(cfg) => {
+                cfg.export_fsid = fsid;
+                cfg.export_table = Some(export_table);
+            }
+            FsImplConfig::Overlayfs(cfg) => {
+                cfg.export_fsid = fsid;
+                cfg.export_table = Some(export_table);
+            }
+        }
 
-        self.passthrough_cfg.export_fsid
+        fsid
     }
 
     #[cfg(target_os = "macos")]
@@ -215,6 +231,7 @@ impl VirtioDevice for Fs {
             .iter()
             .map(|e| e.try_clone().unwrap())
             .collect();
+
         let worker = FsWorker::new(
             self.queues.clone(),
             queue_evts,
@@ -224,13 +241,13 @@ impl VirtioDevice for Fs {
             self.irq_line,
             mem.clone(),
             self.shm_region.clone(),
-            self.passthrough_cfg.clone(),
+            self.fs_config.clone(),
             self.worker_stopfd.try_clone().unwrap(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
         );
-        self.worker_thread = Some(worker.run());
 
+        self.worker_thread = Some(worker.run());
         self.device_state = DeviceState::Activated(mem);
         Ok(())
     }

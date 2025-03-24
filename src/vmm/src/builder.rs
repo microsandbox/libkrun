@@ -1203,7 +1203,7 @@ fn attach_fs_devices(
 
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
-            devices::virtio::Fs::new(config.fs_id.clone(), config.shared_dir.clone()).unwrap(),
+            devices::virtio::Fs::new(config.fs_id.clone(), config.fs_share.clone()).unwrap(),
         ));
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
