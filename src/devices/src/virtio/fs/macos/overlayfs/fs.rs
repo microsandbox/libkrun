@@ -2970,7 +2970,6 @@ impl FileSystem for OverlayFs {
     ) -> io::Result<usize> {
         #[cfg(not(feature = "efi"))]
         if inode == self.init_inode {
-            println!("init inode");
             return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
         }
 
@@ -3158,8 +3157,6 @@ impl FileSystem for OverlayFs {
         let c_path = self.inode_number_to_vol_path(inode)?;
 
         let st = Self::patched_stat(&FileId::Path(c_path))?;
-
-        println!("st: {:?}", st);
 
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
