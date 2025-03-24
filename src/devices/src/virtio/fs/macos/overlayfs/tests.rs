@@ -154,8 +154,12 @@ mod helper {
             temp_dirs.push(temp_dir);
         }
 
-        let cfg = Config::default();
-        let overlayfs = OverlayFs::new(layer_paths, cfg)?;
+        let cfg = Config {
+            layers: layer_paths,
+            ..Default::default()
+        };
+        
+        let overlayfs = OverlayFs::new(cfg)?;
         Ok((overlayfs, temp_dirs))
     }
 

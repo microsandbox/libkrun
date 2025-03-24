@@ -1,7 +1,3 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE file.
-
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
@@ -18,61 +14,47 @@ use std::sync::Arc;
 use vm_memory::ByteValued;
 
 use super::super::linux_errno::linux_error;
-use super::bindings;
 use super::descriptor_utils::{Reader, Writer};
-use super::filesystem::{
-    Context, DirEntry, Entry, Extensions, FileSystem, GetxattrReply, ListxattrReply, SecContext,
-    ZeroCopyReader, ZeroCopyWriter,
-};
+use super::filesystem::{Context, DirEntry, Entry, Extensions, FileSystem, GetxattrReply, ListxattrReply, SecContext, ZeroCopyReader, ZeroCopyWriter};
 use super::fs_utils::einval;
 use super::fuse::*;
+use super::{bindings, FsImpl};
 use super::{FsError as Error, Result};
 use crate::virtio::VirtioShmRegion;
 
-const MAX_BUFFER_SIZE: u32 = 1 << 20;
-const BUFFER_HEADER_SIZE: u32 = 0x1000;
-const DIRENT_PADDING: [u8; 8] = [0; 8];
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
 
-struct ZCReader<'a>(Reader<'a>);
+pub(super) const MAX_BUFFER_SIZE: u32 = 1 << 20;
+pub(super) const BUFFER_HEADER_SIZE: u32 = 0x1000;
+pub(super) const DIRENT_PADDING: [u8; 8] = [0; 8];
 
-impl ZeroCopyReader for ZCReader<'_> {
-    fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
-        self.0.read_to_at(f, count, off)
-    }
-}
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
 
-impl io::Read for ZCReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-struct ZCWriter<'a>(Writer<'a>);
-
-impl ZeroCopyWriter for ZCWriter<'_> {
-    fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
-        self.0.write_from_at(f, count, off)
-    }
-}
-
-impl io::Write for ZCWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
-pub struct Server<F: FileSystem + Sync> {
-    fs: F,
+/// `FsImplServer` is a concrete FUSE server implementation designed to work with specific
+/// filesystem implementations provided by libkrun, particularly:
+///
+/// - [`PassthroughFs`]: For direct passthrough access to the host filesystem
+/// - [`OverlayFs`]: For overlayfs functionality to combine multiple filesystem layers
+pub struct FsImplServer {
+    fs: FsImpl,
     options: AtomicU64,
 }
 
-impl<F: FileSystem + Sync> Server<F> {
-    pub fn new(fs: F) -> Server<F> {
-        Server {
+struct ZCReader<'a>(Reader<'a>);
+
+struct ZCWriter<'a>(Writer<'a>);
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl FsImplServer {
+    pub fn new(fs: FsImpl) -> FsImplServer {
+        FsImplServer {
             fs,
             options: AtomicU64::new(FsOptions::empty().bits()),
         }
@@ -96,7 +78,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             );
         }
-        debug!("opcode: {}", in_header.opcode);
+
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -1417,6 +1399,42 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl ZeroCopyReader for ZCReader<'_> {
+    fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+        self.0.read_to_at(f, count, off)
+    }
+}
+
+impl io::Read for ZCReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl ZeroCopyWriter for ZCWriter<'_> {
+    fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+        self.0.write_from_at(f, count, off)
+    }
+}
+
+impl io::Write for ZCWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
 
 fn reply_ok<T: ByteValued>(
     out: Option<T>,

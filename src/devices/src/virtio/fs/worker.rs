@@ -15,8 +15,10 @@ use vm_memory::GuestMemoryMmap;
 use super::super::{FsError, Queue, VIRTIO_MMIO_INT_VRING};
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
-use super::passthrough::{self, PassthroughFs};
-use super::server::Server;
+use super::server::FsImplServer;
+use super::overlayfs::OverlayFs;
+use super::passthrough::PassthroughFs;
+use super::{FsImpl, FsImplConfig};
 use crate::legacy::IrqChip;
 use crate::virtio::VirtioShmRegion;
 
@@ -30,7 +32,7 @@ pub struct FsWorker {
 
     mem: GuestMemoryMmap,
     shm_region: Option<VirtioShmRegion>,
-    server: Server<PassthroughFs>,
+    server: FsImplServer,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -48,11 +50,20 @@ impl FsWorker {
         irq_line: Option<u32>,
         mem: GuestMemoryMmap,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: passthrough::Config,
+        fs_config: FsImplConfig,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Self {
+        let server = match fs_config {
+            FsImplConfig::Passthrough(passthrough_cfg) => FsImplServer::new(FsImpl::Passthrough(
+                PassthroughFs::new(passthrough_cfg).unwrap(),
+            )),
+            FsImplConfig::Overlayfs(overlayfs_cfg) => {
+                FsImplServer::new(FsImpl::Overlayfs(OverlayFs::new(overlayfs_cfg).unwrap()))
+            }
+        };
+
         Self {
             queues,
             queue_evts,
@@ -60,10 +71,9 @@ impl FsWorker {
             interrupt_evt,
             intc,
             irq_line,
-
             mem,
             shm_region,
-            server: Server::new(PassthroughFs::new(passthrough_cfg).unwrap()),
+            server,
             stop_fd,
             exit_code,
             #[cfg(target_os = "macos")]

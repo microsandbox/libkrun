@@ -1,6 +1,12 @@
 use std::{collections::HashSet, ffi::CString, fs, io};
 
-use crate::virtio::{bindings::{self, LINUX_ENODATA, LINUX_ENOSYS}, fs::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply}, fuse::{FsOptions, SetattrValid}, linux_errno::LINUX_ERANGE, macos::overlayfs::{Config, OverlayFs}};
+use crate::virtio::{
+    bindings::{self, LINUX_ENODATA, LINUX_ENOSYS},
+    fs::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply},
+    fuse::{FsOptions, SetattrValid},
+    linux_errno::LINUX_ERANGE,
+    macos::overlayfs::{Config, OverlayFs},
+};
 
 use super::helper;
 
@@ -508,7 +514,9 @@ fn test_xattrs() -> io::Result<()> {
         .map(|dir| dir.path().to_path_buf())
         .collect::<Vec<_>>();
 
-    let overlayfs = OverlayFs::new(layer_paths, cfg)?;
+    cfg.layers = layer_paths;
+
+    let overlayfs = OverlayFs::new(cfg)?;
     helper::debug_print_layers(&temp_dirs, false)?;
 
     // Initialize filesystem
@@ -836,14 +844,12 @@ fn test_xattrs() -> io::Result<()> {
     // Create a new overlayfs with xattr disabled
     let mut cfg_no_xattr = Config::default();
     cfg_no_xattr.xattr = false;
+    cfg_no_xattr.layers = temp_dirs
+        .iter()
+        .map(|dir| dir.path().to_path_buf())
+        .collect();
 
-    let overlayfs_no_xattr = OverlayFs::new(
-        temp_dirs
-            .iter()
-            .map(|dir| dir.path().to_path_buf())
-            .collect(),
-        cfg_no_xattr,
-    )?;
+    let overlayfs_no_xattr = OverlayFs::new(cfg_no_xattr)?;
 
     overlayfs_no_xattr.init(FsOptions::empty())?;
 

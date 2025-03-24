@@ -105,8 +105,33 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
+ *  Documented errors:
+ *       -EEXIST when a root device is already set
+ *
+ * Notes:
+ *  This function is mutually exclusive with krun_set_overlayfs_root.
  */
 int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
+
+/**
+ * Sets up an OverlayFS to be used as root for the microVM. Not available in libkrun-SEV.
+ *
+ * Arguments:
+ *  "ctx_id"      - the configuration context ID.
+ *  "root_layers" - an array of string pointers to filesystem paths representing
+ *                  the layers to be used for the OverlayFS. The array must be
+ *                  NULL-terminated and contain at least one layer.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  Documented errors:
+ *       -EINVAL when no layers are provided
+ *       -EEXIST when a root device is already set
+ *
+ * Notes:
+ *  This function is mutually exclusive with krun_set_root.
+ */
+int32_t krun_set_overlayfs_root(uint32_t ctx_id, const char *const root_layers[]);
 
 /**
  * DEPRECATED. Use krun_add_disk instead.

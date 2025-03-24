@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::ImageType;
+use devices::virtio::fs::FsImplShare;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
@@ -442,14 +443,76 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
     };
 
     let fs_id = "/dev/root".to_string();
-    let shared_dir = root_path.to_string();
+    let fs_share = FsImplShare::Passthrough(root_path.to_string());
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+
+            // Check if root device is already set
+            for device in &cfg.vmr.fs {
+                if device.fs_id == fs_id {
+                    return -libc::EEXIST;
+                }
+            }
+
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id,
-                shared_dir,
+                fs_share,
+                // Default to a conservative 512 MB window.
+                shm_size: Some(1 << 29),
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_set_overlayfs_root(
+    ctx_id: u32,
+    c_root_layers: *const *const c_char,
+) -> i32 {
+    let mut layers = Vec::new();
+    let layers_array: &[*const c_char] = slice::from_raw_parts(c_root_layers, MAX_ARGS);
+
+    for item in layers_array.iter().take(MAX_ARGS) {
+        if item.is_null() {
+            break;
+        } else {
+            let layer_path = match CStr::from_ptr(*item).to_str() {
+                Ok(path) => path,
+                Err(_) => return -libc::EINVAL,
+            };
+            layers.push(PathBuf::from(layer_path));
+        }
+    }
+
+    // Need at least one layer
+    if layers.is_empty() {
+        return -libc::EINVAL;
+    }
+
+    let fs_id = "/dev/root".to_string();
+    let fs_share = FsImplShare::Overlayfs(layers);
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+
+            // Check if root device is already set
+            for device in &cfg.vmr.fs {
+                if device.fs_id == fs_id {
+                    return -libc::EEXIST;
+                }
+            }
+
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id,
+                fs_share,
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
             });
@@ -480,9 +543,18 @@ pub unsafe extern "C" fn krun_add_virtiofs(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+
+            // Check if a device with the same tag already exists
+            let fs_id = tag.to_string();
+            for device in &cfg.vmr.fs {
+                if device.fs_id == fs_id {
+                    return -libc::EEXIST;
+                }
+            }
+
             cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
+                fs_id,
+                fs_share: FsImplShare::Passthrough(path.to_string()),
                 shm_size: None,
             });
         }
@@ -513,9 +585,18 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+
+            // Check if a device with the same tag already exists
+            let fs_id = tag.to_string();
+            for device in &cfg.vmr.fs {
+                if device.fs_id == fs_id {
+                    return -libc::EEXIST;
+                }
+            }
+
             cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
+                fs_id,
+                fs_share: FsImplShare::Passthrough(path.to_string()),
                 shm_size: Some(shm_size.try_into().unwrap()),
             });
         }
