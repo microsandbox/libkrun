@@ -145,6 +145,8 @@ pub struct Config {
     /// How long the FUSE client should consider file and directory attributes to be valid.
     /// If the attributes of a file or directory can only be modified by the FUSE client,
     /// this should be a large value.
+    ///
+    /// The default value is 5 seconds.
     pub attr_timeout: Duration,
 
     /// The caching policy the file system should use.
@@ -160,7 +162,10 @@ pub struct Config {
     pub xattr: bool,
 
     /// Optional file descriptor for /proc/self/fd.
-    /// This is useful for sandboxing scenarios.
+    /// Callers can obtain a file descriptor and pass it here, so there's no need to open it in
+    /// OverlayFs::new(). This is specially useful for sandboxing.
+    ///
+    /// The default is `None`.
     pub proc_sfd_rawfd: Option<RawFd>,
 
     /// ID of this filesystem to uniquely identify exports.
@@ -214,7 +219,7 @@ pub struct OverlayFs {
     /// Counter for generating the next inode ID
     next_inode: AtomicU64,
 
-    /// The initial inode ID (typically 1 for the root directory)
+    /// The `init.krun` inode ID
     init_inode: u64,
 
     /// Map of open file handles by ID
@@ -223,7 +228,7 @@ pub struct OverlayFs {
     /// Counter for generating the next handle ID
     next_handle: AtomicU64,
 
-    /// The initial handle ID
+    /// The `init.krun` handle ID
     init_handle: u64,
 
     /// Map of memory-mapped windows
@@ -275,10 +280,14 @@ impl OverlayFs {
         // Initialize the root inodes for all layers
         let layer_roots = Self::init_root_inodes(&config.layers, &mut inodes, &mut next_inode)?;
 
+        // Set the `init.krun` inode
+        let init_inode = next_inode;
+        next_inode += 1;
+
         Ok(OverlayFs {
             inodes: RwLock::new(inodes),
             next_inode: AtomicU64::new(next_inode),
-            init_inode: 1,
+            init_inode,
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
             init_handle: 0,
@@ -2959,13 +2968,13 @@ impl FileSystem for OverlayFs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        let data = self.get_inode_handle_data(inode, handle)?;
-
         #[cfg(not(feature = "efi"))]
         if inode == self.init_inode {
             println!("init inode");
             return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
         }
+
+        let data = self.get_inode_handle_data(inode, handle)?;
 
         let f = data.file.read().unwrap();
         w.write_from(&f, size as usize, offset)
