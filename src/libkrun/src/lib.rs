@@ -449,7 +449,7 @@ pub unsafe extern "C" fn krun_set_overlayfs_root(
                 Ok(path) => path,
                 Err(_) => return -libc::EINVAL,
             };
-            println!("OverlayFs::set_overlayfs_root: layer_path: {:?}", layer_path);
+            println!("ffi::krun_set_overlayfs_root: layer_path: {:?}", layer_path);
             layers.push(PathBuf::from(layer_path));
         }
     }

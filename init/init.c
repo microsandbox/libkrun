@@ -917,6 +917,20 @@ int main(int argc, char **argv)
             } else {
                 printf("Failed to open root directory: %s\n", strerror(errno));
             }
+
+            // Print /.sandbox_scripts directory entries
+            dir = opendir("/.sandbox_scripts");
+            if (dir != NULL) {
+                struct dirent *entry;
+                printf("\n/.sandbox_scripts directory contents:\n");
+                while ((entry = readdir(dir)) != NULL) {
+                    printf("  %s\n", entry->d_name);
+                }
+                closedir(dir);
+            } else {
+                printf("Failed to open /.sandbox_scripts directory: %s\n", strerror(errno));
+            }
+
             exit(-3);
         }
     } else { // parent
