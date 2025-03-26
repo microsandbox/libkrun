@@ -903,6 +903,7 @@ int main(int argc, char **argv)
         if (setup_redirects() < 0) {
            exit(-4);
         }
+
         if (execvp(exec_argv[0], exec_argv) < 0) {
             printf("Couldn't execute '%s' inside the vm: %s\n", exec_argv[0], strerror(errno));
             // Print root directory entries

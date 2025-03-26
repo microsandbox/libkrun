@@ -2828,7 +2828,6 @@ impl FileSystem for OverlayFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
-        println!("OverlayFs::lookup: parent: {}, name: {:?}", parent, name);
         Self::validate_name(name)?;
 
         #[cfg(not(feature = "efi"))]
@@ -2853,6 +2852,7 @@ impl FileSystem for OverlayFs {
 
         let (entry, _) = self.do_lookup(parent, name)?;
         self.bump_refcount(entry.inode);
+        println!("OverlayFs::lookup: parent: {}, name: {:?} -> {:?}", parent, name, entry.inode);
         Ok(entry)
     }
 
