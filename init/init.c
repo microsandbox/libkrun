@@ -905,6 +905,18 @@ int main(int argc, char **argv)
         }
         if (execvp(exec_argv[0], exec_argv) < 0) {
             printf("Couldn't execute '%s' inside the vm: %s\n", exec_argv[0], strerror(errno));
+            // Print root directory entries
+            DIR *dir = opendir("/");
+            if (dir != NULL) {
+                struct dirent *entry;
+                printf("Root directory contents:\n");
+                while ((entry = readdir(dir)) != NULL) {
+                    printf("  %s\n", entry->d_name);
+                }
+                closedir(dir);
+            } else {
+                printf("Failed to open root directory: %s\n", strerror(errno));
+            }
             exit(-3);
         }
     } else { // parent
