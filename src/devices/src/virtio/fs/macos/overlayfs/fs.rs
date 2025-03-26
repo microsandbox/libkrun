@@ -284,6 +284,10 @@ impl OverlayFs {
         let init_inode = next_inode;
         next_inode += 1;
 
+        println!("OverlayFs::new: inodes: {:?}", inodes);
+        println!("OverlayFs::new: layer_roots: {:?}", layer_roots);
+        println!("OverlayFs::new: next_inode: {}", next_inode);
+
         Ok(OverlayFs {
             inodes: RwLock::new(inodes),
             next_inode: AtomicU64::new(next_inode),
@@ -2776,6 +2780,7 @@ impl FileSystem for OverlayFs {
     type Handle = u64;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        println!("OverlayFs::init: capable: {:?}", capable);
         // Set the umask to 0 to ensure that all file permissions are set correctly
         unsafe { libc::umask(0o000) };
 
@@ -2796,6 +2801,7 @@ impl FileSystem for OverlayFs {
     }
 
     fn destroy(&self) {
+        println!("OverlayFs::destroy");
         // Clear all handles
         self.handles.write().unwrap().clear();
 
@@ -2807,6 +2813,7 @@ impl FileSystem for OverlayFs {
     }
 
     fn statfs(&self, _ctx: Context, inode: Self::Inode) -> io::Result<bindings::statvfs64> {
+        println!("OverlayFs::statfs: inode: {}", inode);
         // Get the path for this inode
         let c_path = self.inode_number_to_vol_path(inode)?;
 
@@ -2823,6 +2830,8 @@ impl FileSystem for OverlayFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
+        println!("OverlayFs::lookup: parent: {}", parent);
+        println!("OverlayFs::lookup: name: {:?}", name);
         Self::validate_name(name)?;
 
         #[cfg(not(feature = "efi"))]
@@ -2851,6 +2860,8 @@ impl FileSystem for OverlayFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Self::Inode, count: u64) {
+        println!("OverlayFs::forget: inode: {}", inode);
+        println!("OverlayFs::forget: count: {}", count);
         self.do_forget(inode, count);
     }
 
@@ -2860,6 +2871,7 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        println!("OverlayFs::getattr: inode: {}", inode);
         self.do_getattr(inode)
     }
 
@@ -2871,10 +2883,12 @@ impl FileSystem for OverlayFs {
         handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        println!("OverlayFs::setattr: inode: {}", inode);
         self.do_setattr(inode, attr, handle, valid)
     }
 
     fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        println!("OverlayFs::readlink: inode: {}", inode);
         self.do_readlink(inode)
     }
 
@@ -2887,6 +2901,8 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        println!("OverlayFs::mkdir: parent: {}", parent);
+        println!("OverlayFs::mkdir: name: {:?}", name);
         Self::validate_name(name)?;
         let entry = self.do_mkdir(ctx, parent, name, mode, umask, extensions)?;
         self.bump_refcount(entry.inode);
@@ -2894,6 +2910,8 @@ impl FileSystem for OverlayFs {
     }
 
     fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        println!("OverlayFs::unlink: parent: {}", parent);
+        println!("OverlayFs::unlink: name: {:?}", name);
         Self::validate_name(name)?;
         self.do_unlink(parent, name)
     }
@@ -2968,6 +2986,10 @@ impl FileSystem for OverlayFs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
+        println!("OverlayFs::read: inode: {}", inode);
+        println!("OverlayFs::read: handle: {}", handle);
+        println!("OverlayFs::read: size: {}", size);
+        println!("OverlayFs::read: offset: {}", offset);
         #[cfg(not(feature = "efi"))]
         if inode == self.init_inode {
             return w.write(&INIT_BINARY[offset as usize..(offset + (size as u64)) as usize]);
@@ -2992,6 +3014,10 @@ impl FileSystem for OverlayFs {
         _kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
+        println!("OverlayFs::write: inode: {}", inode);
+        println!("OverlayFs::write: handle: {}", handle);
+        println!("OverlayFs::write: size: {}", size);
+        println!("OverlayFs::write: offset: {}", offset);
         let data = self.get_inode_handle_data(inode, handle)?;
         let f = data.file.read().unwrap();
         r.read_to(&f, size as usize, offset)
@@ -3004,6 +3030,8 @@ impl FileSystem for OverlayFs {
         handle: Self::Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        println!("OverlayFs::flush: inode: {}", inode);
+        println!("OverlayFs::flush: handle: {}", handle);
         let data = self.get_inode_handle_data(inode, handle)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
@@ -3033,6 +3061,8 @@ impl FileSystem for OverlayFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
+        println!("OverlayFs::release: inode: {}", inode);
+        println!("OverlayFs::release: handle: {}", handle);
         self.do_release(inode, handle)
     }
 
@@ -3043,6 +3073,8 @@ impl FileSystem for OverlayFs {
         _datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
+        println!("OverlayFs::fsync: inode: {}", inode);
+        println!("OverlayFs::fsync: handle: {}", handle);
         let data = self.get_inode_handle_data(inode, handle)?;
 
         // Safe because this doesn't modify any memory and we check the return values.
@@ -3060,6 +3092,8 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+        println!("OverlayFs::opendir: inode: {}", inode);
+        println!("OverlayFs::opendir: flags: {}", flags);
         self.do_open(inode, flags | libc::O_DIRECTORY as u32)
     }
 
@@ -3075,6 +3109,10 @@ impl FileSystem for OverlayFs {
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
+        println!("OverlayFs::readdir: inode: {}", inode);
+        println!("OverlayFs::readdir: handle: {}", handle);
+        println!("OverlayFs::readdir: size: {}", size);
+        println!("OverlayFs::readdir: offset: {}", offset);
         let _ = self.get_inode_handle_data(inode, handle)?;
         self.do_readdir(inode, size, offset, add_entry)
     }
@@ -3091,6 +3129,10 @@ impl FileSystem for OverlayFs {
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
+        println!("OverlayFs::readdirplus: inode: {}", inode);
+        println!("OverlayFs::readdirplus: handle: {}", handle);
+        println!("OverlayFs::readdirplus: size: {}", size);
+        println!("OverlayFs::readdirplus: offset: {}", offset);
         let _ = self.get_inode_handle_data(inode, handle)?;
         self.do_readdir(inode, size, offset, |dir_entry| {
             let (entry, _) = self.do_lookup(inode, &CString::new(dir_entry.name).unwrap())?;
@@ -3105,6 +3147,8 @@ impl FileSystem for OverlayFs {
         _flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
+        println!("OverlayFs::releasedir: inode: {}", inode);
+        println!("OverlayFs::releasedir: handle: {}", handle);
         let _ = self.get_inode_handle_data(inode, handle)?;
         self.do_release(inode, handle)
     }
@@ -3116,6 +3160,9 @@ impl FileSystem for OverlayFs {
         datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
+        println!("OverlayFs::fsyncdir: inode: {}", inode);
+        println!("OverlayFs::fsyncdir: datasync: {}", datasync);
+        println!("OverlayFs::fsyncdir: handle: {}", handle);
         self.fsync(ctx, inode, datasync, handle)
     }
 
@@ -3127,6 +3174,10 @@ impl FileSystem for OverlayFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
+        println!("OverlayFs::setxattr: inode: {}", inode);
+        println!("OverlayFs::setxattr: name: {:?}", name);
+        println!("OverlayFs::setxattr: value: {:?}", value);
+        println!("OverlayFs::setxattr: flags: {}", flags);
         self.do_setxattr(inode, name, value, flags)
     }
 
@@ -3137,6 +3188,9 @@ impl FileSystem for OverlayFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
+        println!("OverlayFs::getxattr: inode: {}", inode);
+        println!("OverlayFs::getxattr: name: {:?}", name);
+        println!("OverlayFs::getxattr: size: {}", size);
         self.do_getxattr(inode, name, size)
     }
 
@@ -3146,14 +3200,20 @@ impl FileSystem for OverlayFs {
         inode: Self::Inode,
         size: u32,
     ) -> io::Result<ListxattrReply> {
+        println!("OverlayFs::listxattr: inode: {}", inode);
+        println!("OverlayFs::listxattr: size: {}", size);
         self.do_listxattr(inode, size)
     }
 
     fn removexattr(&self, _ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+        println!("OverlayFs::removexattr: inode: {}", inode);
+        println!("OverlayFs::removexattr: name: {:?}", name);
         self.do_removexattr(inode, name)
     }
 
     fn access(&self, ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
+        println!("OverlayFs::access: inode: {}", inode);
+        println!("OverlayFs::access: mask: {}", mask);
         let c_path = self.inode_number_to_vol_path(inode)?;
 
         let st = Self::patched_stat(&FileId::Path(c_path))?;
@@ -3207,6 +3267,12 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        println!("OverlayFs::create: ctx: {:?}", ctx);
+        println!("OverlayFs::create: parent: {}", parent);
+        println!("OverlayFs::create: name: {:?}", name);
+        println!("OverlayFs::create: mode: {}", mode);
+        println!("OverlayFs::create: flags: {}", flags);
+        println!("OverlayFs::create: umask: {}", umask);
         Self::validate_name(name)?;
         self.do_create(ctx, parent, name, mode, flags, umask, extensions)
     }
@@ -3221,6 +3287,11 @@ impl FileSystem for OverlayFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        println!("OverlayFs::mknod: ctx: {:?}", ctx);
+        println!("OverlayFs::mknod: parent: {}", parent);
+        println!("OverlayFs::mknod: name: {:?}", name);
+        println!("OverlayFs::mknod: mode: {}", mode);
+        println!("OverlayFs::mknod: umask: {}", umask);
         Self::validate_name(name)?;
         self.do_mknod(ctx, parent, name, mode, umask, extensions)
     }
@@ -3234,6 +3305,10 @@ impl FileSystem for OverlayFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        println!("OverlayFs::fallocate: inode: {}", inode);
+        println!("OverlayFs::fallocate: handle: {}", handle);
+        println!("OverlayFs::fallocate: offset: {}", offset);
+        println!("OverlayFs::fallocate: length: {}", length);
         self.do_fallocate(inode, handle, offset, length)
     }
 
@@ -3245,6 +3320,10 @@ impl FileSystem for OverlayFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
+        println!("OverlayFs::lseek: inode: {}", inode);
+        println!("OverlayFs::lseek: handle: {}", handle);
+        println!("OverlayFs::lseek: offset: {}", offset);
+        println!("OverlayFs::lseek: whence: {}", whence);
         self.do_lseek(inode, handle, offset, whence)
     }
 
