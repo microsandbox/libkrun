@@ -29,6 +29,7 @@ virtio-bindings = "0.2.0"
 vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
 zerocopy = { version = "0.6.3", optional = true }
 zerocopy-derive = { version = "0.6.3", optional = true }
+ipnetwork = "0.21"
 
 arch = { path = "../arch" }
 utils = { path = "../utils" }

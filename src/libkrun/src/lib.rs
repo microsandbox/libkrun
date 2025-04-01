@@ -28,6 +28,7 @@ use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 use env_logger::{Env, Target};
+use ipnetwork::Ipv4Network;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
@@ -109,6 +110,9 @@ impl KrunfwBindings {
 #[derive(Default)]
 struct TsiConfig {
     port_map: Option<HashMap<u16, u16>>,
+    ip: Option<Ipv4Addr>,
+    subnet: Option<Ipv4Network>,
+    scope: u8,
 }
 
 enum NetworkConfig {
@@ -873,6 +877,77 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+pub unsafe extern "C" fn krun_set_tsi_scope(
+    ctx_id: u32,
+    c_ip: *const c_char,
+    c_subnet: *const c_char,
+    scope: u8,
+) -> i32 {
+    if scope > 3 {
+        error!("Invalid scope value: {}. Must be 0, 1, 2, or 3.", scope);
+        return -libc::EINVAL;
+    }
+
+    let ip = if c_ip.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(c_ip).to_str() {
+            Ok(s) if !s.is_empty() => {
+                // Parse IP format directly
+                match s.parse::<Ipv4Addr>() {
+                    Ok(addr) => Some(addr),
+                    Err(_) => {
+                        error!("Invalid IP address format provided: {}", s);
+                        return -libc::EINVAL;
+                    }
+                }
+            }
+            Ok(_) => None, // Treat empty string as None
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+
+    let subnet = if c_subnet.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(c_subnet).to_str() {
+            Ok(s) if !s.is_empty() => {
+                // Parse Subnet format directly
+                match s.parse::<Ipv4Network>() {
+                    Ok(net) => Some(net),
+                    Err(_) => {
+                        error!("Invalid subnet format provided: {}", s);
+                        return -libc::EINVAL;
+                    }
+                }
+            }
+            Ok(_) => None, // Treat empty string as None
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            match &mut cfg.net_cfg {
+                NetworkConfig::Tsi(tsi_config) => {
+                    tsi_config.ip = ip;
+                    tsi_config.subnet = subnet;
+                    tsi_config.scope = scope;
+                    KRUN_SUCCESS
+                }
+                _ => {
+                    error!("krun_set_tsi_scope is only supported for TSI network mode");
+                    -libc::ENOTSUP
+                }
+            }
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 pub unsafe extern "C" fn krun_set_rlimits(ctx_id: u32, c_rlimits: *const *const c_char) -> i32 {
     let rlimits = if c_rlimits.is_null() {
         return -libc::EINVAL;
@@ -1565,6 +1640,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         guest_cid: 3,
         host_port_map: None,
         unix_ipc_port_map: None,
+        ip: None,
+        subnet: None,
+        scope: 0,
     };
 
     if let Some(ref map) = ctx_cfg.unix_ipc_port_map {
@@ -1576,6 +1654,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         NetworkConfig::Tsi(tsi_cfg) => {
             vsock_config.host_port_map = tsi_cfg.port_map;
             vsock_set = true;
+            vsock_config.ip = tsi_cfg.ip;
+            vsock_config.subnet = tsi_cfg.subnet;
+            vsock_config.scope = tsi_cfg.scope;
         }
         NetworkConfig::VirtioNetPasst(_fd) => {
             #[cfg(feature = "net")]

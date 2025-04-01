@@ -1916,6 +1916,7 @@ dependencies = [
  "devices",
  "flate2",
  "hvf",
+ "ipnetwork",
  "kbs-types",
  "kernel",
  "kvm-bindings",

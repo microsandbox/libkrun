@@ -6,11 +6,13 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ipnetwork::Ipv4Network;
 use utils::byte_order;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -20,6 +22,7 @@ use super::super::{
     ActivateError, ActivateResult, DeviceState, Queue as VirtQueue, VirtioDevice, VsockError,
     VIRTIO_MMIO_INT_VRING,
 };
+use super::ip_filter::IpFilterConfig;
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::{defs, defs::uapi};
@@ -60,6 +63,9 @@ impl Vsock {
         host_port_map: Option<HashMap<u16, u16>>,
         queues: Vec<VirtQueue>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        ip: Option<Ipv4Addr>,
+        subnet: Option<Ipv4Network>,
+        scope: u8,
     ) -> super::Result<Vsock> {
         let mut queue_events = Vec::new();
         for _ in 0..queues.len() {
@@ -82,6 +88,11 @@ impl Vsock {
                 interrupt_evt.try_clone().unwrap(),
                 interrupt_status.clone(),
                 unix_ipc_port_map,
+                IpFilterConfig {
+                    ip,
+                    subnet,
+                    scope,
+                },
             ),
             queue_rx,
             queue_tx,
@@ -104,12 +115,15 @@ impl Vsock {
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        ip: Option<Ipv4Addr>,
+        subnet: Option<Ipv4Network>,
+        reach: u8,
     ) -> super::Result<Vsock> {
         let queues: Vec<VirtQueue> = defs::QUEUE_SIZES
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
             .collect();
-        Self::with_queues(cid, host_port_map, queues, unix_ipc_port_map)
+        Self::with_queues(cid, host_port_map, queues, unix_ipc_port_map, ip, subnet, reach)
     }
 
     pub fn id(&self) -> &str {

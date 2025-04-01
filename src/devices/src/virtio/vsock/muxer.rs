@@ -27,6 +27,8 @@ use vm_memory::GuestMemoryMmap;
 
 use std::net::Ipv4Addr;
 
+use super::ip_filter::IpFilterConfig;
+
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 
 /// A muxer RX queue item.
@@ -112,6 +114,7 @@ pub struct VsockMuxer {
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    ip_filter: IpFilterConfig,
 }
 
 impl VsockMuxer {
@@ -121,7 +124,12 @@ impl VsockMuxer {
         interrupt_evt: EventFd,
         interrupt_status: Arc<AtomicUsize>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        ip_filter: IpFilterConfig,
     ) -> Self {
+        if !ip_filter.is_valid() {
+            warn!("Invalid IpFilterConfig provided during VsockMuxer creation: {:?}. Check configuration.", ip_filter);
+        }
+
         VsockMuxer {
             cid,
             host_port_map,
@@ -136,6 +144,7 @@ impl VsockMuxer {
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             unix_ipc_port_map,
+            ip_filter,
         }
     }
 
@@ -325,6 +334,15 @@ impl VsockMuxer {
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("vsock: proxy connect request");
         if let Some(req) = pkt.read_connect_req() {
+            if !self.check_destination_ip(req.addr) {
+                warn!(
+                    "vsock: connect filtered: connection from guest:{}:{} to host:{} denied by IP filter rules",
+                    pkt.src_cid(), pkt.src_port(), req.addr
+                );
+                self.send_connect_rsp(pkt.src_port(), pkt.dst_port(), -libc::ECONNREFUSED);
+                return;
+            }
+
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("vsock: proxy connect request: id={}", id);
             let update = self
@@ -337,6 +355,9 @@ impl VsockMuxer {
             if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
+        } else {
+            warn!("vsock: could not parse connect request buffer for filtering");
+            self.send_connect_rsp(pkt.src_port(), pkt.dst_port(), -libc::EINVAL);
         }
     }
 
@@ -358,6 +379,17 @@ impl VsockMuxer {
     fn process_sendto_addr(&self, pkt: &VsockPacket) {
         debug!("vsock: new DGRAM sendto addr: src={}", pkt.src_port());
         if let Some(req) = pkt.read_sendto_addr() {
+            if !self.check_destination_ip(req.addr) {
+                warn!(
+                    "vsock: sendto_addr filtered: send from guest:{}:{} to host:{} denied by IP filter rules",
+                    pkt.src_cid(), pkt.src_port(), req.addr
+                );
+
+                // Send error response back to the guest
+                self.send_sendto_addr_error_rsp(pkt.src_port(), -libc::ECONNREFUSED);
+                return;
+            }
+
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("vsock: new DGRAM sendto addr: id={}", id);
             let update = self
@@ -384,6 +416,15 @@ impl VsockMuxer {
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("vsock: DGRAM listen request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_listen_req() {
+            if !self.check_bind_ip(req.addr) {
+                warn!(
+                    "vsock: listen filtered: attempt to listen on host:{} from guest:{}:{} denied by IP filter rules",
+                    req.addr, pkt.src_cid(), pkt.src_port()
+                );
+                self.send_listen_rsp(pkt.src_port(), pkt.dst_port(), -libc::EACCES);
+                return;
+            }
+
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("vsock: DGRAM listen request: id={}", id);
             let update = self
@@ -673,5 +714,83 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+
+    #[inline]
+    fn check_destination_ip(&self, dest_ip: Ipv4Addr) -> bool {
+        self.ip_filter.is_allowed_connect(dest_ip)
+    }
+
+    #[inline]
+    fn check_bind_ip(&self, bind_ip: Ipv4Addr) -> bool {
+        self.ip_filter.is_allowed_bind(bind_ip)
+    }
+
+    // Helper function to send different types of responses back to the guest
+    fn send_response(&self, rx: MuxerRx) {
+        // Get references to the needed components
+        let mem = match self.mem.as_ref() {
+            Some(m) => m,
+            None => {
+                error!("vsock: cannot send response: mem is None");
+                return;
+            }
+        };
+        let queue = match self.queue.as_ref() {
+            Some(q) => q,
+            None => {
+                error!("vsock: cannot send response: queue is None");
+                return;
+            }
+        };
+
+        // Send the response to the guest
+        push_packet(self.cid, rx, &self.rxq, queue, mem);
+    }
+
+    // Helper function for sending sendto_addr error responses
+    fn send_sendto_addr_error_rsp(&self, peer_port: u32, result: i32) {
+        debug!(
+            "vsock: sending sendto_addr error response: peer_port={}, result={}",
+            peer_port, result
+        );
+
+        // This response goes to the control port (DGRAM)
+        let rx = MuxerRx::ConnResponse {
+            local_port: defs::TSI_SENDTO_ADDR,
+            peer_port,
+            result,
+        };
+        self.send_response(rx);
+    }
+
+    fn send_connect_rsp(&self, local_port: u32, peer_port: u32, result: i32) {
+        debug!(
+            "vsock: sending connect response: local_port={}, peer_port={}, result={}",
+            local_port, peer_port, result
+        );
+
+        // This response goes to the control port (DGRAM)
+        let rx = MuxerRx::ConnResponse {
+            local_port: defs::TSI_CONNECT, // TSI_CONNECT = 1025
+            peer_port,
+            result,
+        };
+        self.send_response(rx);
+    }
+
+    fn send_listen_rsp(&self, local_port: u32, peer_port: u32, result: i32) {
+        debug!(
+            "vsock: sending listen response: local_port={}, peer_port={}, result={}",
+            local_port, peer_port, result
+        );
+
+        // This response goes to the control port (DGRAM)
+        let rx = MuxerRx::ListenResponse {
+            local_port: defs::TSI_LISTEN, // TSI_LISTEN = 1029
+            peer_port,
+            result,
+        };
+        self.send_response(rx);
     }
 }
