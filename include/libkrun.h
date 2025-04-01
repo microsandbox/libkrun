@@ -371,7 +371,12 @@ int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
  *  "ctx_id"   - the configuration context ID.
  *  "c_ip"     - an optional null-terminated string representing the guest's static IPv4 address.
  *  "c_subnet" - an optional null-terminated string representing the guest's subnet in CIDR notation (e.g., "192.168.1.0/24").
- *  "scope"    - an integer specifying the scope (0-3). Refer to TSI documentation for details.
+ *               If scope is 1 and subnet is not provided, all connections will be blocked.
+ *  "scope"    - an integer specifying the scope (0-3):
+ *               0: None - Block all IP communication
+ *               1: Group - Allow within subnet (if specified; otherwise, block all like scope 0)
+ *               2: Public - Allow public IPs
+ *               3: Any - Allow any IP
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
