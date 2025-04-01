@@ -127,7 +127,7 @@ impl VsockMuxer {
         ip_filter: IpFilterConfig,
     ) -> Self {
         if !ip_filter.is_valid() {
-            warn!("Invalid IpFilterConfig provided during VsockMuxer creation: {:?}. Check configuration.", ip_filter);
+            warn!("Invalid IpFilterConfig provided during VsockMuxer creation: {:?}. Scope value must be between 0 and 3.", ip_filter);
         }
 
         VsockMuxer {
