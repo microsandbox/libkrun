@@ -318,6 +318,30 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
 
+/**
+ * Configures the static IP, subnet, and scope for the TSI network backend.
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "c_ip"     - an optional null-terminated string representing the guest's static IPv4 address.
+ *  "c_subnet" - an optional null-terminated string representing the guest's subnet in CIDR notation (e.g., "192.168.1.0/24").
+ *  "scope"    - an integer specifying the scope (0-3). Refer to TSI documentation for details.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  Documented errors:
+ *       -EINVAL if scope value is > 3 or IP/subnet strings are invalid.
+ *       -ENOTSUP if the network mode is not TSI.
+ *
+ * Notes:
+ *  This function is only effective when the default TSI network backend is used (i.e., neither
+ *  krun_set_passt_fd nor krun_set_gvproxy_path has been called).
+ */
+int32_t krun_set_tsi_scope(uint32_t ctx_id,
+                           const char *c_ip,
+                           const char *c_subnet,
+                           uint8_t scope);
+
 /* Flags for virglrenderer.  Copied from virglrenderer bindings. */
 #define VIRGLRENDERER_USE_EGL 1 << 0
 #define VIRGLRENDERER_THREAD_SYNC 1 << 1

@@ -36,6 +36,7 @@ serde_json = { version = "1.0.64", optional = true }
 sev = { version = "4.0.0", features = ["openssl"], optional = true }
 curl = { version = "0.4", optional = true }
 nix = "0.24.1"
+ipnetwork = "0.21"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 cpuid = { path = "../cpuid" }

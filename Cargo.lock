@@ -364,6 +364,7 @@ dependencies = [
  "hvf",
  "imago",
  "intaglio",
+ "ipnetwork",
  "libc",
  "log",
  "lru",
@@ -707,6 +708,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8972d5be69940353d5347a1344cb375d9b457d6809b428b05bb1ca2fb9ce007"
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -796,6 +803,7 @@ dependencies = [
  "devices",
  "env_logger",
  "hvf",
+ "ipnetwork",
  "libc",
  "log",
  "once_cell",
@@ -1663,6 +1671,7 @@ dependencies = [
  "devices",
  "env_logger",
  "hvf",
+ "ipnetwork",
  "kbs-types",
  "kernel",
  "kvm-bindings",

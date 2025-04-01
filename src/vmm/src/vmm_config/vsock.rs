@@ -3,8 +3,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use ipnetwork::Ipv4Network;
 
 use devices::virtio::{Vsock, VsockError};
 
@@ -30,7 +33,7 @@ type Result<T> = std::result::Result<T, VsockConfigError>;
 
 /// This struct represents the strongly typed equivalent of the json body
 /// from vsock related requests.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VsockDeviceConfig {
     /// ID of the vsock device.
     pub vsock_id: String,
@@ -40,6 +43,12 @@ pub struct VsockDeviceConfig {
     pub host_port_map: Option<HashMap<u16, u16>>,
     /// An optional map of guest port to host UNIX domain sockets for IPC.
     pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    /// Optional static IP address for TSI.
+    pub ip: Option<Ipv4Addr>,
+    /// Optional subnet for TSI.
+    pub subnet: Option<Ipv4Network>,
+    /// Scope for TSI (0-3).
+    pub scope: u8,
 }
 
 struct VsockWrapper {
@@ -78,6 +87,9 @@ impl VsockBuilder {
             u64::from(cfg.guest_cid),
             cfg.host_port_map,
             cfg.unix_ipc_port_map,
+            cfg.ip,
+            cfg.subnet,
+            cfg.scope,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
     }
@@ -115,6 +127,9 @@ pub(crate) mod tests {
             guest_cid: 3,
             host_port_map: None,
             unix_ipc_port_map: None,
+            ip: None,
+            subnet: None,
+            scope: 0,
         }
     }
 

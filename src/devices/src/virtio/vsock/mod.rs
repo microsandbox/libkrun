@@ -19,6 +19,7 @@ mod tcp;
 mod timesync;
 mod udp;
 mod unix;
+mod ip_filter;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
