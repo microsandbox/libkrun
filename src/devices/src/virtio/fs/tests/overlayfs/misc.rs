@@ -2,7 +2,7 @@ use std::{ffi::CString, fs, io, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use tempfile::TempDir;
 
-use crate::virtio::{fs::filesystem::{Context, FileSystem}, fuse::FsOptions, macos::overlayfs::{Config, OverlayFs}};
+use crate::virtio::{fs::filesystem::{Context, FileSystem}, fuse::FsOptions, overlayfs::{Config, OverlayFs}, };
 
 use super::helper;
 

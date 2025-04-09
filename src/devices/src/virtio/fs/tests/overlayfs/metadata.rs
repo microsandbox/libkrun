@@ -4,8 +4,7 @@ use crate::virtio::{
     bindings::{self, LINUX_ENODATA, LINUX_ENOSYS},
     fs::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply},
     fuse::{FsOptions, SetattrValid},
-    linux_errno::LINUX_ERANGE,
-    macos::overlayfs::{Config, OverlayFs},
+    linux_errno::LINUX_ERANGE, overlayfs::{Config, OverlayFs},
 };
 
 use super::helper;
@@ -707,6 +706,7 @@ fn test_xattrs() -> io::Result<()> {
     // Try to read the xattr directly from the middle layer file (should not exist)
     let middle_layer_path = CString::new(middle_layer_file.to_str().unwrap()).unwrap();
     let mut buf = vec![0; 100];
+    // #[cfg(target_os = "macos")]
     let res = unsafe {
         libc::getxattr(
             middle_layer_path.as_ptr(),
@@ -717,6 +717,7 @@ fn test_xattrs() -> io::Result<()> {
             0,
         )
     };
+    // #[cfg(target_os = "macos")]
     assert!(res < 0, "Xattr should not exist on middle layer file");
     let err = io::Error::last_os_error();
     assert!(

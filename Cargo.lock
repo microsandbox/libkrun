@@ -67,12 +67,27 @@ checksum = "4c95c10ba0b00a02636238b814946408b1322d5ac4760326e6fb8ec956d85775"
 name = "arch"
 version = "0.1.0"
 dependencies = [
- "arch_gen",
+ "arch_gen 0.1.0",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
- "smbios",
- "utils",
+ "smbios 0.1.0",
+ "utils 0.1.0",
+ "vm-fdt",
+ "vm-memory",
+]
+
+[[package]]
+name = "arch"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "arch_gen 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "smbios 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
  "vm-fdt",
  "vm-memory",
 ]
@@ -80,6 +95,11 @@ dependencies = [
 [[package]]
 name = "arch_gen"
 version = "0.1.0"
+
+[[package]]
+name = "arch_gen"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
 
 [[package]]
 name = "async-trait"
@@ -299,6 +319,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpuid"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "kvm-bindings",
+ "kvm-ioctls",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -353,16 +383,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "debug"
+version = "0.1.0"
+dependencies = [
+ "libkrun 1.10.1 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+]
+
+[[package]]
 name = "devices"
 version = "0.1.0"
 dependencies = [
- "arch",
+ "arch 0.1.0",
  "bitflags 1.3.2",
  "caps",
  "crossbeam-channel",
  "env_logger",
- "hvf",
- "imago",
+ "hvf 0.1.0",
+ "imago 0.1.3",
  "intaglio",
  "ipnetwork",
  "libc",
@@ -370,16 +407,41 @@ dependencies = [
  "lru",
  "nix 0.24.3",
  "pipewire",
- "polly",
+ "polly 0.0.1",
  "rand",
  "rutabaga_gfx",
  "tempfile",
  "thiserror",
- "utils",
+ "utils 0.1.0",
  "virtio-bindings",
  "vm-memory",
  "zerocopy 0.6.6",
  "zerocopy-derive 0.6.6",
+]
+
+[[package]]
+name = "devices"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "arch 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "bitflags 1.3.2",
+ "caps",
+ "crossbeam-channel",
+ "env_logger",
+ "hvf 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "imago 0.1.3 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "intaglio",
+ "ipnetwork",
+ "libc",
+ "log",
+ "lru",
+ "nix 0.24.3",
+ "polly 0.0.1 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "rand",
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "virtio-bindings",
+ "vm-memory",
 ]
 
 [[package]]
@@ -641,7 +703,18 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 name = "hvf"
 version = "0.1.0"
 dependencies = [
- "arch",
+ "arch 0.1.0",
+ "crossbeam-channel",
+ "env_logger",
+ "log",
+]
+
+[[package]]
+name = "hvf"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "arch 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
  "crossbeam-channel",
  "env_logger",
  "log",
@@ -673,6 +746,22 @@ dependencies = [
 [[package]]
 name = "imago"
 version = "0.1.3"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "libc",
+ "miniz_oxide",
+ "rustc_version",
+ "serde",
+ "tokio",
+ "tracing",
+ "vm-memory",
+]
+
+[[package]]
+name = "imago"
+version = "0.1.3"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
 dependencies = [
  "async-trait",
  "bincode",
@@ -752,7 +841,16 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
- "utils",
+ "utils 0.1.0",
+ "vm-memory",
+]
+
+[[package]]
+name = "kernel"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
  "vm-memory",
 ]
 
@@ -800,16 +898,34 @@ name = "libkrun"
 version = "1.10.1"
 dependencies = [
  "crossbeam-channel",
- "devices",
+ "devices 0.1.0",
  "env_logger",
- "hvf",
+ "hvf 0.1.0",
  "ipnetwork",
  "libc",
  "log",
  "once_cell",
- "polly",
- "utils",
- "vmm",
+ "polly 0.0.1",
+ "utils 0.1.0",
+ "vmm 0.1.0",
+]
+
+[[package]]
+name = "libkrun"
+version = "1.10.1"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "crossbeam-channel",
+ "devices 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "env_logger",
+ "hvf 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "ipnetwork",
+ "libc",
+ "log",
+ "once_cell",
+ "polly 0.0.1 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "vmm 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
 ]
 
 [[package]]
@@ -1103,7 +1219,16 @@ name = "polly"
 version = "0.0.1"
 dependencies = [
  "libc",
- "utils",
+ "utils 0.1.0",
+]
+
+[[package]]
+name = "polly"
+version = "0.0.1"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "libc",
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
 ]
 
 [[package]]
@@ -1423,6 +1548,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "smbios"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "vm-memory",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1616,6 +1749,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "utils"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "bitflags 1.3.2",
+ "env_logger",
+ "libc",
+ "log",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "uuid"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1663,31 +1808,54 @@ dependencies = [
 name = "vmm"
 version = "0.1.0"
 dependencies = [
- "arch",
+ "arch 0.1.0",
  "codicon",
- "cpuid",
+ "cpuid 0.1.0",
  "crossbeam-channel",
  "curl",
- "devices",
+ "devices 0.1.0",
  "env_logger",
- "hvf",
+ "hvf 0.1.0",
  "ipnetwork",
  "kbs-types",
- "kernel",
+ "kernel 0.1.0",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "log",
  "nix 0.24.3",
- "polly",
+ "polly 0.0.1",
  "procfs",
  "rdrand",
  "serde",
  "serde_json",
  "sev",
- "utils",
+ "utils 0.1.0",
  "vm-memory",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "vmm"
+version = "0.1.0"
+source = "git+https://github.com/appcypher/libkrun.git?branch=develop#0d8bff41cac66ae0fee39cd698572cbe4ca93bd7"
+dependencies = [
+ "arch 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "cpuid 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "crossbeam-channel",
+ "devices 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "env_logger",
+ "hvf 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "ipnetwork",
+ "kernel 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "log",
+ "nix 0.24.3",
+ "polly 0.0.1 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "utils 0.1.0 (git+https://github.com/appcypher/libkrun.git?branch=develop)",
+ "vm-memory",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/libkrun"]
+members = [ "ignore/debug","src/libkrun"]
 resolver = "2"
 
 [profile.dev]

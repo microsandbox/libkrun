@@ -1,7 +1,7 @@
 use std::{ffi::CString, fs, io};
 
 use crate::virtio::{
-    fs::filesystem::{Context, FileSystem}, fuse::FsOptions, macos::overlayfs::tests::helper::TestContainer,
+    fs::filesystem::{Context, FileSystem}, fuse::FsOptions, overlayfs::tests::helper::TestContainer,
 };
 
 use super::helper;

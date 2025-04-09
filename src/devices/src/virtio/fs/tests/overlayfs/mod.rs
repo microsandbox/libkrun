@@ -23,6 +23,20 @@ mod remove;
 mod write;
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for crate::virtio::fs::filesystem::Context {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Modules: Helper
 //--------------------------------------------------------------------------------------------------
 
@@ -36,7 +50,7 @@ mod helper {
 
     use crate::virtio::{
         fs::filesystem::{ZeroCopyReader, ZeroCopyWriter},
-        macos::overlayfs::{Config, OverlayFs},
+        fs::overlayfs::{Config, OverlayFs},
     };
 
     use tempfile::TempDir;
@@ -158,7 +172,7 @@ mod helper {
             layers: layer_paths,
             ..Default::default()
         };
-        
+
         let overlayfs = OverlayFs::new(cfg)?;
         Ok((overlayfs, temp_dirs))
     }

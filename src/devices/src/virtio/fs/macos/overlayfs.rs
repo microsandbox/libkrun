@@ -26,6 +26,14 @@ use crate::virtio::fs::fuse;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
 use crate::virtio::linux_errno::{linux_error, LINUX_ERANGE};
 
+
+//--------------------------------------------------------------------------------------------------
+// Modules
+//--------------------------------------------------------------------------------------------------
+
+#[path = "../tests/overlayfs/mod.rs"]
+mod tests;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -46,7 +54,7 @@ const OWNER_PERMS_XATTR_KEY: &[u8] = b"user.vm.owner_perms\0";
 const MAX_LAYERS: usize = 128;
 
 #[cfg(not(feature = "efi"))]
-static INIT_BINARY: &[u8] = include_bytes!("../../../../../../../init/init");
+static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
 
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
@@ -237,6 +245,9 @@ pub struct OverlayFs {
     /// Whether writeback caching is enabled
     writeback: AtomicBool,
 
+    /// Whether submounts are supported
+    announce_submounts: AtomicBool,
+
     /// Configuration options
     config: Config,
 
@@ -293,6 +304,7 @@ impl OverlayFs {
             init_handle: 0,
             map_windows: Mutex::new(HashMap::new()),
             writeback: AtomicBool::new(false),
+            announce_submounts: AtomicBool::new(false),
             config,
             filenames: Arc::new(RwLock::new(SymbolTable::new())),
             layer_roots: Arc::new(RwLock::new(layer_roots)),
@@ -875,7 +887,7 @@ impl OverlayFs {
         &'a self,
         start_layer_idx: usize,
         path_segments: &[Symbol],
-    ) -> io::Result<(Entry, Vec<Arc<InodeData>>)> {
+    ) -> io::Result<(Entry, Arc<InodeData>, Vec<Arc<InodeData>>)> {
         let mut path_inodes = vec![];
 
         // Start from the start_layer_idx and try each layer down to layer 0
@@ -894,7 +906,7 @@ impl OverlayFs {
                     // Check if we already have this inode
                     let inodes = self.inodes.read().unwrap();
                     if let Some(data) = inodes.get_alt(&alt_key) {
-                        return Ok((self.create_entry(data.inode, st), path_inodes));
+                        return Ok((self.create_entry(data.inode, st), data.clone(), path_inodes));
                     }
 
                     drop(inodes);
@@ -907,7 +919,8 @@ impl OverlayFs {
                         layer_idx,
                     );
                     path_inodes.push(data.clone());
-                    return Ok((self.create_entry(inode, st), path_inodes));
+
+                    return Ok((self.create_entry(inode, st), data, path_inodes));
                 }
                 Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                     // Continue to check lower layers
@@ -941,7 +954,20 @@ impl OverlayFs {
         let symbol = self.intern_name(name)?;
         path_segments.push(symbol);
 
-        self.lookup_layer_by_layer(parent_data.layer_idx, &path_segments)
+        let (mut entry, child_data, path_inodes) = self.lookup_layer_by_layer(parent_data.layer_idx, &path_segments)?;
+
+        // Set the submount flag if the entry is a directory and the submounts are announced
+        let mut attr_flags = 0;
+        if (entry.attr.st_mode & libc::S_IFMT) == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && child_data.dev != parent_data.dev
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+
+        entry.attr_flags = attr_flags;
+
+        Ok((entry, path_inodes))
     }
 
     /// Performs a raw stat syscall without any modifications to the returned stat structure.
@@ -1354,7 +1380,7 @@ impl OverlayFs {
         let path_segments = inode_data.path.clone();
 
         // Lookup the file to get all path inodes
-        let (_, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
+        let (_, _, path_inodes) = self.lookup_layer_by_layer(top_layer_idx, &path_segments)?;
 
         // Copy up the file
         self.copy_up(&path_inodes)?;
@@ -1774,6 +1800,7 @@ impl OverlayFs {
         self.do_getattr(inode)
     }
 
+    /// Performs a mkdir operation
     fn do_mkdir(
         &self,
         ctx: Context,
@@ -2086,11 +2113,6 @@ impl OverlayFs {
 
     /// Decrements the reference count for an inode and removes it if the count reaches zero
     fn do_forget(&self, inode: Inode, count: u64) {
-        // Skip forgetting the root inode
-        if inode == self.init_inode {
-            return;
-        }
-
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.get(&inode) {
             // Acquiring the write lock on the inode map prevents new lookups from incrementing the
@@ -2204,7 +2226,7 @@ impl OverlayFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
 
-        // Don't allow getting attributes for the root inode
+        // Don't allow getting attributes for init
         if inode == self.init_inode {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
         }
@@ -2779,7 +2801,8 @@ impl FileSystem for OverlayFs {
         // Set the umask to 0 to ensure that all file permissions are set correctly
         unsafe { libc::umask(0o000) };
 
-        let mut opts = FsOptions::empty();
+        // Enable readdirplus if supported
+        let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
 
         // Enable writeback caching if requested and supported
         if self.config.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
@@ -2787,9 +2810,10 @@ impl FileSystem for OverlayFs {
             self.writeback.store(true, Ordering::SeqCst);
         }
 
-        // Enable posix ACLs if supported
-        if capable.contains(FsOptions::POSIX_ACL) {
-            opts |= FsOptions::POSIX_ACL;
+        // Enable submounts if supported
+        if capable.contains(FsOptions::SUBMOUNTS) {
+            opts |= FsOptions::SUBMOUNTS;
+            self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
         Ok(opts)
@@ -3208,7 +3232,9 @@ impl FileSystem for OverlayFs {
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
         Self::validate_name(name)?;
-        self.do_create(ctx, parent, name, mode, flags, umask, extensions)
+        let (entry, handle, opts) = self.do_create(ctx, parent, name, mode, flags, umask, extensions)?;
+        self.bump_refcount(entry.inode);
+        Ok((entry, handle, opts))
     }
 
     fn mknod(
@@ -3222,7 +3248,9 @@ impl FileSystem for OverlayFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         Self::validate_name(name)?;
-        self.do_mknod(ctx, parent, name, mode, umask, extensions)
+        let entry = self.do_mknod(ctx, parent, name, mode, umask, extensions)?;
+        self.bump_refcount(entry.inode);
+        Ok(entry)
     }
 
     fn fallocate(
@@ -3297,17 +3325,6 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             layers: vec![],
-        }
-    }
-}
-
-// Add Default implementation for Context
-impl Default for Context {
-    fn default() -> Self {
-        Context {
-            uid: 0,
-            gid: 0,
-            pid: 0,
         }
     }
 }

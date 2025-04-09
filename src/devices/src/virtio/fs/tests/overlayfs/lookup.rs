@@ -1,6 +1,9 @@
 use std::{ffi::CString, io};
 
-use crate::virtio::{fs::filesystem::{Context, FileSystem}, fuse::FsOptions};
+use crate::virtio::{
+    fs::filesystem::{Context, FileSystem},
+    fuse::FsOptions,
+};
 
 use super::helper;
 
