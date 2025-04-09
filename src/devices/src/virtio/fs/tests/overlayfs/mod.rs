@@ -40,6 +40,7 @@ impl Default for crate::virtio::fs::filesystem::Context {
 // Modules: Helper
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(test)]
 mod helper {
     use std::{
         fs::{self, File},
