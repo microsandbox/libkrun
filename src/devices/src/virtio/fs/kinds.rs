@@ -1,6 +1,10 @@
+
+
 use std::{ffi::CStr, io, path::PathBuf, time::Duration};
 
+#[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+#[cfg(target_os = "macos")]
 use hvf::MemoryMapping;
 
 use crate::virtio::bindings;
@@ -546,7 +550,7 @@ impl FileSystem for FsImpl {
                 moffset,
                 host_shm_base,
                 shm_size,
-                map_sender,
+                #[cfg(target_os = "macos")] map_sender,
             ),
             FsImpl::Overlayfs(fs) => fs.setupmapping(
                 ctx,
@@ -558,7 +562,7 @@ impl FileSystem for FsImpl {
                 moffset,
                 host_shm_base,
                 shm_size,
-                map_sender,
+                #[cfg(target_os = "macos")] map_sender,
             ),
         }
     }
@@ -573,10 +577,10 @@ impl FileSystem for FsImpl {
     ) -> io::Result<()> {
         match self {
             FsImpl::Passthrough(fs) => {
-                fs.removemapping(ctx, requests, host_shm_base, shm_size, map_sender)
+                fs.removemapping(ctx, requests, host_shm_base, shm_size, #[cfg(target_os = "macos")] map_sender)
             }
             FsImpl::Overlayfs(fs) => {
-                fs.removemapping(ctx, requests, host_shm_base, shm_size, map_sender)
+                fs.removemapping(ctx, requests, host_shm_base, shm_size, #[cfg(target_os = "macos")] map_sender)
             }
         }
     }

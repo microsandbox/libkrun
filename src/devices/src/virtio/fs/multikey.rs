@@ -18,8 +18,8 @@ where
     // We need to keep a copy of the second key in the main map so that we can remove entries using
     // just the main key. Otherwise we would require the caller to provide both keys when calling
     // `remove`.
-    main: BTreeMap<K1, (K2, V)>,
-    alt: BTreeMap<K2, K1>,
+    pub main: BTreeMap<K1, (K2, V)>,
+    pub alt: BTreeMap<K2, K1>,
 }
 
 impl<K1, K2, V> MultikeyBTreeMap<K1, K2, V>
