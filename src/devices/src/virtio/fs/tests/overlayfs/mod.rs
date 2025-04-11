@@ -180,6 +180,10 @@ mod helper {
 
     // Debug utility to print the directory structure of each layer using tree command
     pub(super) fn debug_print_layers(temp_dirs: &[TempDir], show_perms: bool) -> io::Result<()> {
+        if Command::new("tree").arg("--version").output().is_err() {
+            println!("tree command is not accessible. please install it to see the layer directory structures.");
+            return Ok(());
+        }
         println!("\n=== Layer Directory Structures ===");
 
         for (i, dir) in temp_dirs.iter().enumerate() {

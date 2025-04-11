@@ -2,7 +2,11 @@ use std::{ffi::CString, fs, io, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use tempfile::TempDir;
 
-use crate::virtio::{fs::filesystem::{Context, FileSystem}, fuse::FsOptions, overlayfs::{Config, OverlayFs}, };
+use crate::virtio::{
+    fs::filesystem::{Context, FileSystem},
+    fuse::FsOptions,
+    overlayfs::{Config, OverlayFs},
+};
 
 use super::helper;
 
@@ -396,7 +400,7 @@ fn test_link_errors() -> io::Result<()> {
     //   - dir1/
     let layers = vec![vec![("file1", false, 0o644), ("dir1", true, 0o755)]];
 
-    let (fs, _temp_dirs) = helper::create_overlayfs(layers)?;
+    let (fs, temp_dirs) = helper::create_overlayfs(layers)?;
     let ctx = Context::default();
 
     let file1_name = CString::new("file1").unwrap();
@@ -420,6 +424,24 @@ fn test_link_errors() -> io::Result<()> {
     let invalid_name = CString::new("../link1").unwrap();
     assert!(fs
         .link(ctx, file1_entry.inode, dir1_entry.inode, &invalid_name)
+        .is_err());
+
+    // Test linking a symlink (should error)
+    // Create a symlink in the bottom layer
+    let symlink_path = temp_dirs[0].path().join("symlink");
+    std::os::unix::fs::symlink("file1", &symlink_path)?;
+
+    // Initialize filesystem to detect the new symlink
+    fs.init(FsOptions::empty())?;
+
+    // Get the symlink's inode
+    let symlink_name = CString::new("symlink").unwrap();
+    let symlink_entry = fs.lookup(ctx, 1, &symlink_name)?;
+
+    // Try to create a hard link to the symlink (should fail)
+    let link_name = CString::new("link_to_symlink").unwrap();
+    assert!(fs
+        .link(ctx, symlink_entry.inode, dir1_entry.inode, &link_name)
         .is_err());
 
     Ok(())

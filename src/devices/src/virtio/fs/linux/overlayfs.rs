@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
     },
     time::Duration,
 };
@@ -61,10 +61,12 @@ static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
 /// The name of the empty directory
-const EMPTY_CSTR: &[u8] = b"\0";
+const EMPTY_CSTR: LazyLock<&CStr> =
+    LazyLock::new(|| unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") });
 
 /// The name of the `/proc/self/fd` directory
-const PROC_SELF_FD_CSTR: &[u8] = b"/proc/self/fd\0";
+const PROC_SELF_FD_CSTR: LazyLock<&CStr> =
+    LazyLock::new(|| unsafe { CStr::from_bytes_with_nul_unchecked(b"/proc/self/fd\0") });
 
 /// FICLONE ioctl for copy-on-write file cloning
 /// Defined in Linux's fs.h as _IOW(0x94, 9, int)
@@ -312,8 +314,16 @@ pub struct OverlayFs {
     layer_roots: Arc<RwLock<Vec<Inode>>>,
 }
 
+/// Represents either a file or a path
+enum FileOrPath {
+    /// A file
+    File(File),
+
+    /// A path
+    Path(CString),
+}
+
 /// Represents either a file descriptor or a path
-#[derive(Clone)]
 enum FileId {
     /// A file descriptor
     Fd(RawFd),
@@ -385,14 +395,11 @@ impl OverlayFs {
         let proc_self_fd = if let Some(fd) = config.proc_sfd_rawfd {
             fd
         } else {
-            // Safe because this is a constant value and a valid C string.
-            let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
-
             // Safe because this doesn't modify any memory and we check the return value.
             let fd = unsafe {
                 libc::openat(
                     libc::AT_FDCWD,
-                    proc_cstr.as_ptr(),
+                    PROC_SELF_FD_CSTR.as_ptr(),
                     libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
@@ -474,10 +481,10 @@ impl OverlayFs {
             let c_path = CString::new(layer_path.to_string_lossy().as_bytes())?;
 
             // Open the directory
-            let fd = Self::open_path_fd(&c_path)?;
+            let file = Self::open_path_file(&c_path)?;
 
             // Get statx information
-            let (st, mnt_id) = Self::statx(fd)?;
+            let (st, mnt_id) = Self::statx(file.as_raw_fd(), None)?;
 
             // Create the alt key for this inode
             let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
@@ -485,9 +492,6 @@ impl OverlayFs {
             // Create the inode data
             let inode_id = *next_inode;
             *next_inode += 1;
-
-            // Safe because we just opened this fd
-            let file = unsafe { File::from_raw_fd(fd) };
 
             let inode_data = Arc::new(InodeData {
                 inode: inode_id,
@@ -509,36 +513,49 @@ impl OverlayFs {
         Ok(layer_roots)
     }
 
-    /// Opens a path and returns a file descriptor
-    fn open_path_fd(path: &CStr) -> io::Result<RawFd> {
-        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::open(path.as_ptr(), flags, 0) };
+    /// Opens a file without following symlinks.
+    fn open_file(path: &CStr, flags: i32) -> io::Result<File> {
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_NOFOLLOW, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(fd)
+        // Safe because we just opened this fd.
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    /// Opens a path relative to a parent file descriptor
-    fn open_path_fd_at(parent: RawFd, name: &CStr) -> io::Result<RawFd> {
-        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, 0) };
+    /// Opens a file relative to a parent without following symlinks.
+    fn open_file_at(parent: RawFd, name: &CStr, flags: i32) -> io::Result<File> {
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags | libc::O_NOFOLLOW, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(fd)
+        // Safe because we just opened this fd.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Opens a path as an O_PATH file.
+    fn open_path_file(path: &CStr) -> io::Result<File> {
+        Self::open_file(path, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    }
+
+    /// Opens a path relative to a parent as an O_PATH file.
+    fn open_path_file_at(parent: RawFd, name: &CStr) -> io::Result<File> {
+        Self::open_file_at(
+            parent,
+            name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     }
 
     /// Performs a statx syscall without any modifications to the returned stat structure.
-    fn statx(fd: RawFd) -> io::Result<(libc::stat64, u64)> {
+    fn statx(fd: RawFd, name: Option<&CStr>) -> io::Result<(libc::stat64, u64)> {
         let mut stx = MaybeUninit::<libc::statx>::zeroed();
-        let empty_path = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
         let res = unsafe {
             libc::statx(
                 fd,
-                empty_path.as_ptr(),
+                name.unwrap_or(&*EMPTY_CSTR).as_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
                 libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
                 stx.as_mut_ptr(),
@@ -614,17 +631,24 @@ impl OverlayFs {
             flags &= !libc::O_APPEND;
         }
 
+        // If the file is a symlink, just clone existing file.
+        if data.file.metadata()?.is_symlink() {
+            return Ok(data.file.try_clone()?);
+        }
+
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
-        // have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since we need
-        // to follow the `/proc/self/fd` symlink to get the file.
+        // have much bigger problems.
+        //
+        // It is safe to follow here since symlinks are returned early as O_PATH files.
         let fd = unsafe {
             libc::openat(
                 self.proc_self_fd.as_raw_fd(),
                 fd_str.as_ptr(),
-                (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+                flags | libc::O_CLOEXEC & (!libc::O_NOFOLLOW),
             )
         };
+
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -634,13 +658,13 @@ impl OverlayFs {
     }
 
     /// Turns an inode into an opened file or a path.
-    fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileId> {
+    fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileOrPath> {
         match self.open_inode(inode, flags) {
-            Ok(file) => Ok(FileId::Fd(file.as_raw_fd())),
+            Ok(file) => Ok(FileOrPath::File(file)),
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
                 let data = self.get_inode_data(inode)?;
                 let path = Self::data_to_path(&data)?;
-                Ok(FileId::Path(path))
+                Ok(FileOrPath::Path(path))
             }
             Err(e) => Err(e),
         }
@@ -718,18 +742,26 @@ impl OverlayFs {
         }
     }
 
+    fn create_whiteout_path(&self, name: &CStr) -> io::Result<CString> {
+        let name_str = name.to_str().map_err(|_| einval())?;
+        let whiteout_path = format!("{WHITEOUT_PREFIX}{name_str}");
+        CString::new(whiteout_path).map_err(|_| einval())
+    }
+
     /// Checks for whiteout file in top layer
     fn check_whiteout(&self, parent: RawFd, name: &CStr) -> io::Result<bool> {
-        let name_str = name.to_str().map_err(|_| einval())?;
+        let whiteout_cpath = self.create_whiteout_path(name)?;
 
-        let whiteout_path = format!("{WHITEOUT_PREFIX}{name_str}");
-        let whiteout_cpath = CString::new(whiteout_path).map_err(|_| einval())?;
-
-        let fd = Self::open_path_fd_at(parent, &whiteout_cpath)?;
-        match Self::statx(fd) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
+        match Self::statx(parent, Some(&whiteout_cpath)) {
+            Ok(_) => {
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(e) => {
+                Err(e)
+            }
         }
     }
 
@@ -737,11 +769,16 @@ impl OverlayFs {
     fn check_opaque_marker(&self, parent: RawFd) -> io::Result<bool> {
         let opaque_cpath = CString::new(OPAQUE_MARKER).map_err(|_| einval())?;
 
-        let fd = Self::open_path_fd_at(parent, &opaque_cpath)?;
-        match Self::statx(fd) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
+        match Self::statx(parent, Some(&opaque_cpath)) {
+            Ok(_) => {
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(e) => {
+                Err(e)
+            }
         }
     }
 
@@ -907,14 +944,20 @@ impl OverlayFs {
         layer_root: &Arc<InodeData>,
         path_segments: &[Symbol],
         path_inodes: &mut Vec<Arc<InodeData>>,
-    ) -> Option<io::Result<(RawFd, libc::stat64, u64)>> {
-        let mut current_stat: (RawFd, libc::stat64, u64);
-        let mut parent = layer_root.file.as_raw_fd();
+    ) -> Option<io::Result<(File, libc::stat64, u64)>> {
         let mut opaque_marker_found = false;
 
         // Start from layer root
-        current_stat = match Self::statx(parent) {
-            Ok((stat, mnt_id)) => (parent, stat, mnt_id),
+        let root_file = match layer_root.file.try_clone() {
+            Ok(file) => file,
+            Err(e) => {
+                return Some(Err(e));
+            }
+        };
+
+        // Set current.
+        let mut current = match Self::statx(root_file.as_raw_fd(), None) {
+            Ok((stat, mnt_id)) => (root_file, stat, mnt_id),
             Err(e) => return Some(Err(e)),
         };
 
@@ -925,34 +968,51 @@ impl OverlayFs {
             let segment_name = filenames.get(*segment).unwrap();
 
             // Check for whiteout at current level
-            match self.check_whiteout(parent.as_raw_fd(), segment_name) {
-                Ok(true) => return None, // Found whiteout, stop searching
-                Ok(false) => (),         // No whiteout, continue
-                Err(e) => return Some(Err(e)),
+            match self.check_whiteout(current.0.as_raw_fd(), segment_name) {
+                Ok(true) => {
+                    return None; // Found whiteout, stop searching
+                }
+                Ok(false) => (), // No whiteout, continue
+                Err(e) => {
+                    return Some(Err(e));
+                }
             }
 
             // Check for opaque marker at current level
-            match self.check_opaque_marker(parent.as_raw_fd()) {
+            match self.check_opaque_marker(current.0.as_raw_fd()) {
                 Ok(true) => {
                     opaque_marker_found = true;
                 }
                 Ok(false) => (),
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    return Some(Err(e));
+                }
             }
 
-            // Open the current segment
-            let current_fd = match Self::open_path_fd_at(parent.as_raw_fd(), segment_name) {
-                Ok(fd) => fd,
-                Err(e) => return Some(Err(e)),
-            };
+            let segment_name = segment_name.to_owned();
 
             drop(filenames); // Now safe to drop filenames lock
 
-            match Self::statx(current_fd) {
+            match Self::statx(current.0.as_raw_fd(), Some(&segment_name)) {
                 Ok((st, mnt_id)) => {
+                    // Open the current segment
+                    let new_file =
+                        match Self::open_path_file_at(current.0.as_raw_fd(), &segment_name) {
+                            Ok(file) => {
+                                file
+                            }
+                            Err(e) => {
+                                return Some(Err(e));
+                            }
+                        };
+
                     // Update parent for next iteration
-                    parent = current_fd;
-                    current_stat = (current_fd, st, mnt_id);
+                    current = match new_file.try_clone() {
+                        Ok(file) => (file, st, mnt_id),
+                        Err(e) => {
+                            return Some(Err(e));
+                        }
+                    };
 
                     // Create or get inode for this path segment
                     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
@@ -967,9 +1027,8 @@ impl OverlayFs {
                             path.push(*segment);
 
                             // Safe because we just opened this fd.
-                            let file = unsafe { File::from_raw_fd(current_fd) };
                             let (_, data) = self.create_inode(
-                                file,
+                                new_file,
                                 st.st_ino,
                                 st.st_dev,
                                 mnt_id,
@@ -993,11 +1052,13 @@ impl OverlayFs {
                     // in any other layer as /foo/bar is masked.
                     return None;
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    return Some(Err(e));
+                }
             }
         }
 
-        Some(Ok(current_stat))
+        Some(Ok(current))
     }
 
     /// Looks up a file or directory entry across multiple filesystem layers.
@@ -1041,7 +1102,7 @@ impl OverlayFs {
             }
 
             match self.lookup_segment_by_segment(&layer_root, &path_segments, &mut path_inodes) {
-                Some(Ok((fd, st, mnt_id))) => {
+                Some(Ok((file, st, mnt_id))) => {
                     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
 
                     // Check if we already have this inode
@@ -1054,9 +1115,6 @@ impl OverlayFs {
 
                     // Open the path
                     let path = path_segments.to_vec();
-
-                    // Safe because this fd was opened by lookup_segment_by_segment
-                    let file = unsafe { File::from_raw_fd(fd) };
 
                     // Create new inode
                     let (inode, data) =
@@ -1121,13 +1179,13 @@ impl OverlayFs {
         let top_layer_root = self.get_layer_root(top_layer_idx)?;
 
         // Start from root and copy up each segment that's not in the top layer
-        let mut parent_fd = top_layer_root.file.as_raw_fd();
+        let mut parent = top_layer_root.file.try_clone()?;
 
         // Skip the root inode
         for inode_data in path_inodes.iter().skip(1) {
             // Skip if this segment is already in the top layer
             if inode_data.layer_idx == top_layer_idx {
-                parent_fd = inode_data.file.as_raw_fd();
+                parent = inode_data.file.try_clone()?;
                 continue;
             }
 
@@ -1138,21 +1196,29 @@ impl OverlayFs {
                 filenames.get(*name).unwrap().to_owned()
             };
 
-            // Get source and destination paths
-            let src_fd = inode_data.file.as_raw_fd();
-            let dst_fd = parent_fd;
-
-            // Get source file/directory stats
-            let (src_stat, _) = Self::statx(src_fd)?;
+            let (src_stat, _) = Self::statx(inode_data.file.as_raw_fd(), None)?;
             let file_type = src_stat.st_mode & libc::S_IFMT;
 
-            // Copy up the file/directory
+            // Copy up the file
             match file_type {
                 libc::S_IFREG => {
+                    // Open source file with O_RDONLY
+                    let src_file = self.open_inode(inode_data.inode, libc::O_RDONLY)?;
+
+                    // Open destination file with O_WRONLY | O_CREAT
+                    let dst_file = Self::open_file_at(
+                        parent.as_raw_fd(),
+                        &segment_name,
+                        libc::O_WRONLY | libc::O_CREAT,
+                    )?;
+
                     // Try to use FICLONE ioctl for CoW copying first (works on modern Linux filesystems like Btrfs, XFS, etc.)
-                    let result = unsafe { libc::ioctl(dst_fd, FICLONE as _, src_fd) };
+                    let result = unsafe {
+                        libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd())
+                    };
 
                     if result < 0 {
+                        debug!("FICLONE failed, falling back to regular copy");
                         let err = io::Error::last_os_error();
                         // If FICLONE fails (e.g., across filesystems), fall back to regular copy
                         if err.raw_os_error() == Some(libc::EXDEV)
@@ -1162,8 +1228,8 @@ impl OverlayFs {
                         {
                             // Fall back to regular copy
                             self.copy_file_contents(
-                                src_fd,
-                                dst_fd,
+                                src_file.as_raw_fd(),
+                                dst_file.as_raw_fd(),
                                 (src_stat.st_mode & 0o777) as u32,
                             )?;
                         } else {
@@ -1174,8 +1240,11 @@ impl OverlayFs {
                 libc::S_IFDIR => {
                     // Directory: just create it with the same permissions
                     unsafe {
-                        if libc::mkdirat(dst_fd, segment_name.as_ptr(), src_stat.st_mode & 0o777)
-                            < 0
+                        if libc::mkdirat(
+                            parent.as_raw_fd(),
+                            segment_name.as_ptr(),
+                            src_stat.st_mode & 0o777,
+                        ) < 0
                         {
                             return Err(io::Error::last_os_error());
                         }
@@ -1186,26 +1255,31 @@ impl OverlayFs {
                     let mut buf = vec![0u8; libc::PATH_MAX as usize];
                     let len = unsafe {
                         libc::readlinkat(
-                            src_fd,
-                            segment_name.as_ptr(),
+                            inode_data.file.as_raw_fd(),
+                            EMPTY_CSTR.as_ptr(),
                             buf.as_mut_ptr() as *mut _,
                             buf.len(),
                         )
                     };
+
                     if len < 0 {
                         return Err(io::Error::last_os_error());
                     }
+
                     buf.truncate(len as usize);
 
                     unsafe {
-                        if libc::symlinkat(buf.as_ptr() as *const _, dst_fd, segment_name.as_ptr())
-                            < 0
+                        if libc::symlinkat(
+                            buf.as_ptr() as *const _,
+                            parent.as_raw_fd(),
+                            segment_name.as_ptr(),
+                        ) < 0
                         {
                             return Err(io::Error::last_os_error());
                         }
 
                         if libc::fchmodat(
-                            dst_fd,
+                            parent.as_raw_fd(),
                             segment_name.as_ptr(),
                             src_stat.st_mode & 0o777,
                             0,
@@ -1216,7 +1290,7 @@ impl OverlayFs {
                     }
                 }
                 _ => {
-                    // Other types (devices, sockets, etc.) are not supported
+                    // Other types (devices, sockets, etc.) are not supported yet.
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "unsupported file type for copy up",
@@ -1225,17 +1299,18 @@ impl OverlayFs {
             }
 
             // Update parent for next iteration
-            let (new_stat, new_mnt_id) = Self::statx(dst_fd)?;
-            parent_fd = dst_fd;
+            let child = Self::open_path_file_at(parent.as_raw_fd(), &segment_name)?;
+            let (new_stat, new_mnt_id) = Self::statx(child.as_raw_fd(), None)?;
+            parent = child.try_clone()?;
 
             // Update the inode entry to point to the new copy in the top layer
             let alt_key = InodeAltKey::new(new_stat.st_ino, new_stat.st_dev, new_mnt_id);
             let mut inodes = self.inodes.write().unwrap();
 
-            // Create new inode data with updated dev/ino/layer_idx but same path and refcount
+            // Create new inode data with updated dev/ino/layer_idx but same refcount
             let new_data = Arc::new(InodeData {
                 inode: inode_data.inode,
-                file: inode_data.file.try_clone().unwrap(),
+                file: child,
                 dev: new_stat.st_dev,
                 mnt_id: new_mnt_id,
                 refcount: AtomicU64::new(inode_data.refcount.load(Ordering::SeqCst)),
@@ -1336,11 +1411,12 @@ impl OverlayFs {
             self.copy_up(&path_inodes)?;
             let parent_fd = self.get_inode_data(parent)?.file.as_raw_fd();
 
+            let whiteout_cpath = self.create_whiteout_path(name)?;
             let fd = unsafe {
                 libc::openat(
                     parent_fd,
-                    name.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL,
+                    whiteout_cpath.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL | libc::O_NOFOLLOW,
                     0o000, // Whiteout files have no permissions
                 )
             };
@@ -1571,15 +1647,15 @@ impl OverlayFs {
         // Create the directory
         let res = unsafe { libc::mkdirat(parent_fd, name.as_ptr(), mode & !umask) };
         if res == 0 {
-            let fd = Self::open_path_fd_at(parent_fd, name)?;
-            let (stat, mnt_id) = Self::statx(fd)?;
+            let file = Self::open_path_file_at(parent_fd, name)?;
+            let (stat, mnt_id) = Self::statx(file.as_raw_fd(), None)?;
 
             let mut path = parent_data.path.clone();
             path.push(self.intern_name(name)?);
 
             // Create the inode for the newly created directory
             let (inode, _) = self.create_inode(
-                unsafe { File::from_raw_fd(fd) },
+                file,
                 stat.st_ino,
                 stat.st_dev,
                 mnt_id,
@@ -1602,15 +1678,13 @@ impl OverlayFs {
         let top_layer_idx = self.get_top_layer_idx();
         let (entry, _) = self.do_lookup(parent, name)?;
 
-        // If the inode is in the top layer, we need to unlink it.
+        // If the inode is in the top layer. the parent will also be in the top layer, we need to unlink it.
         let entry_data = self.get_inode_data(entry.inode)?;
         if entry_data.layer_idx == top_layer_idx {
-            let entry_fd_str = Self::data_to_fd_str(&entry_data)?;
+            let parent_fd = self.get_inode_data(parent)?.file.as_raw_fd();
 
             // Remove the inode from the overlayfs
-            let res = unsafe {
-                libc::unlinkat(self.proc_self_fd.as_raw_fd(), entry_fd_str.as_ptr(), flags)
-            };
+            let res = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) };
             if res < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1858,15 +1932,15 @@ impl OverlayFs {
             return Err(io::Error::last_os_error());
         }
 
-        let fd = Self::open_path_fd_at(parent_fd, name)?;
-        let (stat, mnt_id) = Self::statx(fd)?;
+        let (stat, mnt_id) = Self::statx(fd, None)?;
 
         let mut path = parent_data.path.clone();
         path.push(self.intern_name(name)?);
 
         // Create the inode for the newly created file
+        let file = unsafe { File::from_raw_fd(fd) };
         let (inode, _) = self.create_inode(
-            unsafe { File::from_raw_fd(fd) },
+            file.try_clone()?,
             stat.st_ino,
             stat.st_dev,
             mnt_id,
@@ -1881,7 +1955,7 @@ impl OverlayFs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode: entry.inode,
-            file: RwLock::new(unsafe { File::from_raw_fd(fd) }),
+            file: RwLock::new(file),
             exported: Default::default(),
         };
 
@@ -1899,7 +1973,7 @@ impl OverlayFs {
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
         let fd = self.get_inode_data(inode)?.file.as_raw_fd();
-        let (st, _) = Self::statx(fd)?;
+        let (st, _) = Self::statx(fd, None)?;
 
         Ok((st, self.config.attr_timeout))
     }
@@ -1990,15 +2064,15 @@ impl OverlayFs {
         };
 
         if res == 0 {
-            let fd = Self::open_path_fd_at(parent_fd, name)?;
-            let (stat, mnt_id) = Self::statx(fd)?;
+            let file = Self::open_path_file_at(parent_fd, name)?;
+            let (stat, mnt_id) = Self::statx(file.as_raw_fd(), None)?;
 
             let mut path = parent_data.path.clone();
             path.push(self.intern_name(name)?);
 
             // Create the inode for the newly created directory
             let (inode, _) = self.create_inode(
-                unsafe { File::from_raw_fd(fd) },
+                file,
                 stat.st_ino,
                 stat.st_dev,
                 mnt_id,
@@ -2024,31 +2098,40 @@ impl OverlayFs {
         let inode_data = self.ensure_top_layer(inode_data)?;
         let old_fd_str = Self::data_to_fd_str(&inode_data)?;
 
+        // Extraneous check to ensure the source file is not a symlink
+        let stat = Self::statx(inode_data.file.as_raw_fd(), None)?.0;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot link to a symlink",
+            ));
+        }
+
         // Get and ensure new parent is in top layer
         let new_parent_data = self.ensure_top_layer(self.get_inode_data(newparent)?)?;
         let new_parent_fd = new_parent_data.file.as_raw_fd();
 
-        // Create the hard link
+        // Safety: It is expected that old_fd_str has been checked by the kernel to not be a symlink.
         let res = unsafe {
             libc::linkat(
                 self.proc_self_fd.as_raw_fd(),
                 old_fd_str.as_ptr(),
                 new_parent_fd,
                 newname.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
+                libc::AT_SYMLINK_FOLLOW, // Follow is needed to handle /proc/self/fd/ symlink
             )
         };
 
         if res == 0 {
-            let fd = Self::open_path_fd_at(new_parent_fd, newname)?;
-            let (stat, mnt_id) = Self::statx(fd)?;
+            let file = Self::open_path_file_at(new_parent_fd, newname)?;
+            let (stat, mnt_id) = Self::statx(file.as_raw_fd(), None)?;
 
             let mut path = new_parent_data.path.clone();
             path.push(self.intern_name(newname)?);
 
             // Create the inode for the newly created directory
             let (inode, _) = self.create_inode(
-                unsafe { File::from_raw_fd(fd) },
+                file,
                 stat.st_ino,
                 stat.st_dev,
                 mnt_id,
@@ -2106,15 +2189,15 @@ impl OverlayFs {
         let res = unsafe { libc::symlinkat(linkname.as_ptr(), parent_fd, name.as_ptr()) };
 
         if res == 0 {
-            let fd = Self::open_path_fd_at(parent_fd, name)?;
-            let (stat, mnt_id) = Self::statx(fd)?;
+            let file = Self::open_path_file_at(parent_fd, name)?;
+            let (stat, mnt_id) = Self::statx(file.as_raw_fd(), None)?;
 
             let mut path = parent_data.path.clone();
             path.push(self.intern_name(name)?);
 
             // Create the inode for the newly created directory
             let (inode, _) = self.create_inode(
-                unsafe { File::from_raw_fd(fd) },
+                file,
                 stat.st_ino,
                 stat.st_dev,
                 mnt_id,
@@ -2139,14 +2222,11 @@ impl OverlayFs {
         // Allocate a buffer for the link target
         let mut buf = vec![0; libc::PATH_MAX as usize];
 
-        // Safe because this is a constant value and a valid C string.
-        let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-
         // Safe because this will only modify the contents of `buf` and we check the return value.
         let res = unsafe {
             libc::readlinkat(
                 inode_data.file.as_raw_fd(),
-                empty.as_ptr(),
+                EMPTY_CSTR.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
             )
@@ -2178,11 +2258,11 @@ impl OverlayFs {
         // functions in that case.
         let res =
             match self.open_inode_or_path(inode_data.inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
-                FileId::Fd(fd) => {
+                FileOrPath::File(file) => {
                     // Safe because this doesn't modify any memory and we check the return value.
                     unsafe {
                         libc::fsetxattr(
-                            fd,
+                            file.as_raw_fd(),
                             name.as_ptr(),
                             value.as_ptr() as *const libc::c_void,
                             value.len(),
@@ -2190,7 +2270,7 @@ impl OverlayFs {
                         )
                     }
                 }
-                FileId::Path(path) => {
+                FileOrPath::Path(path) => {
                     // Safe because this doesn't modify any memory and we check the return value.
                     unsafe {
                         libc::lsetxattr(
@@ -2203,7 +2283,7 @@ impl OverlayFs {
                     }
                 }
             };
-
+            
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -2229,18 +2309,18 @@ impl OverlayFs {
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
         // functions in that case.
         let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
-            FileId::Fd(fd) => {
+            FileOrPath::File(file) => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
                     libc::fgetxattr(
-                        fd,
+                        file.as_raw_fd(),
                         name.as_ptr(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         size as libc::size_t,
                     )
                 }
             }
-            FileId::Path(path) => {
+            FileOrPath::Path(path) => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
                     libc::lgetxattr(
@@ -2284,17 +2364,17 @@ impl OverlayFs {
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
         // functions in that case.
         let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
-            FileId::Fd(fd) => {
+            FileOrPath::File(file) => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
                     libc::flistxattr(
-                        fd,
+                        file.as_raw_fd(),
                         buf.as_mut_ptr() as *mut libc::c_char,
                         size as libc::size_t,
                     )
                 }
             }
-            FileId::Path(path) => {
+            FileOrPath::Path(path) => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
                     libc::llistxattr(
@@ -2336,11 +2416,11 @@ impl OverlayFs {
         // functions in that case.
         let res =
             match self.open_inode_or_path(inode_data.inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
-                FileId::Fd(fd) => {
+                FileOrPath::File(file) => {
                     // Safe because this doesn't modify any memory and we check the return value.
-                    unsafe { libc::fremovexattr(fd, name.as_ptr()) }
+                    unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) }
                 }
-                FileId::Path(path) => {
+                FileOrPath::Path(path) => {
                     // Safe because this doesn't modify any memory and we check the return value.
                     unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) }
                 }
@@ -2930,14 +3010,11 @@ impl FileSystem for OverlayFs {
                 u32::MAX
             };
 
-            // Safe because this is a constant value and a valid C string.
-            let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 libc::fchownat(
                     inode_data.file.as_raw_fd(),
-                    empty.as_ptr(),
+                    EMPTY_CSTR.as_ptr(),
                     uid,
                     gid,
                     libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -3131,7 +3208,7 @@ impl FileSystem for OverlayFs {
         let inode_data = self.get_inode_data(inode)?;
         let fd = inode_data.file.as_raw_fd();
 
-        let (st, _) = Self::statx(fd)?;
+        let (st, _) = Self::statx(fd, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {

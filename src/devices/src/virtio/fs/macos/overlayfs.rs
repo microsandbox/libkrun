@@ -2077,11 +2077,21 @@ impl OverlayFs {
         // Copy up the source file to the top layer if needed
         let inode_data = self.ensure_top_layer(inode_data)?;
 
+        // Get source and destination paths
+        let src_path = self.dev_ino_to_vol_path(inode_data.dev, inode_data.ino)?;
+
+        // Extraneous check to ensure the source file is not a symlink
+        let stat = Self::unpatched_stat(&FileId::Path(src_path.clone()))?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot link to a symlink",
+            ));
+        }
+
         // Get and ensure new parent is in top layer
         let new_parent_data = self.ensure_top_layer(self.get_inode_data(new_parent)?)?;
 
-        // Get source and destination paths
-        let src_path = self.dev_ino_to_vol_path(inode_data.dev, inode_data.ino)?;
 
         let dst_path =
             self.dev_ino_and_name_to_vol_path(new_parent_data.dev, new_parent_data.ino, new_name)?;
