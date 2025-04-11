@@ -16,7 +16,7 @@ use super::super::{
     ActivateResult, DeviceState, FsError, Queue as VirtQueue, VirtioDevice, VirtioShmRegion,
 };
 use super::kinds::{FsImplConfig, FsImplShare};
-use super::macos::overlayfs;
+use super::overlayfs;
 use super::passthrough;
 use super::worker::FsWorker;
 use super::ExportTable;

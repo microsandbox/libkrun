@@ -14,6 +14,8 @@ pub mod linux;
 pub use linux::fs_utils;
 #[cfg(target_os = "linux")]
 pub use linux::passthrough;
+#[cfg(target_os = "linux")]
+pub use linux::overlayfs;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub use kinds::*;

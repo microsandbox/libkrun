@@ -23,9 +23,24 @@ mod remove;
 mod write;
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for crate::virtio::fs::filesystem::Context {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Modules: Helper
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(test)]
 mod helper {
     use std::{
         fs::{self, File},
@@ -36,7 +51,7 @@ mod helper {
 
     use crate::virtio::{
         fs::filesystem::{ZeroCopyReader, ZeroCopyWriter},
-        macos::overlayfs::{Config, OverlayFs},
+        fs::overlayfs::{Config, OverlayFs},
     };
 
     use tempfile::TempDir;
@@ -158,13 +173,17 @@ mod helper {
             layers: layer_paths,
             ..Default::default()
         };
-        
+
         let overlayfs = OverlayFs::new(cfg)?;
         Ok((overlayfs, temp_dirs))
     }
 
     // Debug utility to print the directory structure of each layer using tree command
     pub(super) fn debug_print_layers(temp_dirs: &[TempDir], show_perms: bool) -> io::Result<()> {
+        if Command::new("tree").arg("--version").output().is_err() {
+            println!("tree command is not accessible. please install it to see the layer directory structures.");
+            return Ok(());
+        }
         println!("\n=== Layer Directory Structures ===");
 
         for (i, dir) in temp_dirs.iter().enumerate() {

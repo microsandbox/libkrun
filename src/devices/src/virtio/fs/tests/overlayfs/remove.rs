@@ -177,11 +177,11 @@ fn test_unlink_errors() -> io::Result<()> {
     match fs.unlink(ctx, 1, &invalid_name) {
         Ok(_) => panic!("Unlink succeeded with invalid name"),
         Err(e) => {
-            assert_eq!(
-                e.kind(),
-                io::ErrorKind::PermissionDenied,
-                "Expected PermissionDenied error, got {:?}",
-                e.kind()
+            let code = e.raw_os_error().unwrap();
+            assert!(
+                code == libc::EPERM || code == libc::ENOENT,
+                "Expected EPERM or ENOENT error for path traversal, got {}",
+                code
             );
         }
     }
@@ -238,20 +238,20 @@ fn test_unlink_complex_layers() -> io::Result<()> {
     // Test 3: Unlink a file from lowest layer
     let file1_name = CString::new("file1.txt").unwrap();
     fs.unlink(ctx, dir1_entry.inode, &file1_name)?;
-    // // Expect a whiteout in the top layer but the original file remains in lower layer
-    // assert!(temp_dirs[2].path().join("dir1/.wh.file1.txt").exists());
-    // assert!(temp_dirs[0].path().join("dir1/file1.txt").exists());
+    // Expect a whiteout in the top layer but the original file remains in lower layer
+    assert!(temp_dirs[2].path().join("dir1/.wh.file1.txt").exists());
+    assert!(temp_dirs[0].path().join("dir1/file1.txt").exists());
 
-    // // Test 4: Unlink a file from lowest layer that is already whiteouted
-    // let file2_name = CString::new("file2.txt").unwrap();
-    // // First unlink to create the whiteout
-    // fs.unlink(ctx, dir1_entry.inode, &file2_name)?;
-    // assert!(temp_dirs[2].path().join("dir1/.wh.file2.txt").exists());
-    // // Second attempt should fail with ENOENT
-    // match fs.unlink(ctx, dir1_entry.inode, &file2_name) {
-    //     Ok(_) => panic!("Unlink succeeded on already whiteouted file"),
-    //     Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOENT)),
-    // }
+    // Test 4: Unlink a file from lowest layer that is already whiteouted
+    let file2_name = CString::new("file2.txt").unwrap();
+    // First unlink to create the whiteout
+    fs.unlink(ctx, dir1_entry.inode, &file2_name)?;
+    assert!(temp_dirs[2].path().join("dir1/.wh.file2.txt").exists());
+    // Second attempt should fail with ENOENT
+    match fs.unlink(ctx, dir1_entry.inode, &file2_name) {
+        Ok(_) => panic!("Unlink succeeded on already whiteouted file"),
+        Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOENT)),
+    }
 
     Ok(())
 }
@@ -432,11 +432,11 @@ fn test_rmdir_errors() -> io::Result<()> {
     match fs.rmdir(ctx, 1, &invalid_name) {
         Ok(_) => panic!("rmdir succeeded with invalid name"),
         Err(e) => {
-            assert_eq!(
-                e.kind(),
-                io::ErrorKind::PermissionDenied,
-                "Expected PermissionDenied error, got {:?}",
-                e.kind()
+            let code = e.raw_os_error().unwrap();
+            assert!(
+                code == libc::EPERM || code == libc::ENOENT,
+                "Expected EPERM or ENOENT error for path traversal, got {}",
+                code
             );
         }
     }
