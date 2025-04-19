@@ -450,7 +450,7 @@ static int mount_filesystems()
     symlink("/proc/self/fd", "/dev/fd");
 
 	/* Process /etc/fstab to mount additional filesystems, including virtiofs shares */
-	system("/bin/mount -a")
+	system("/bin/mount -a");
 
     return 0;
 }
