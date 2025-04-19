@@ -448,6 +448,9 @@ static int mount_filesystems()
 	/* May fail if already exists and that's fine. */
 	symlink("/proc/self/fd", "/dev/fd");
 
+	/* Process /etc/fstab to mount additional filesystems, including virtiofs shares */
+	system("/bin/mount -a")
+
 	return 0;
 }
 
