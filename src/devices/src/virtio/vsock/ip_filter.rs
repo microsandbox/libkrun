@@ -85,10 +85,8 @@ impl IpFilterConfig {
             // Scope 1: Group - Allow binding within the subnet if no specific IP given
             // If no subnet is specified, behaves like scope 0 (deny all)
             1 => self.subnet.map_or(false, |subnet| subnet.contains(bind_ip)),
-            // Scope 2: Public - Allow binding to public IPs if no specific IP given
-            2 => !Self::is_private(bind_ip),
-            // Scope 3: Any - Allow binding to any IP if no specific IP given
-            3 => true,
+            // Scope 2 & 3: Any & Public - Allow binding to any IP if no specific IP given
+            2 | 3 => true,
             _ => false, // Invalid scope (scope 0 already handled)
         }
     }
