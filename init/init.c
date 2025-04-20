@@ -21,6 +21,7 @@
 #include <sys/wait.h>
 
 #include <linux/vm_sockets.h>
+#include <mntent.h>
 
 #include "jsmn.h"
 
@@ -390,6 +391,167 @@ static int chroot_luks()
 }
 #endif
 
+/* mkdir -p  (recursively create all parents)  */
+static int mkdir_p(const char *path, mode_t mode)
+{
+    char tmp[256];
+    char *p = NULL;
+    size_t len;
+
+    if (!path || !*path) return -1;
+    len = strnlen(path, sizeof(tmp) - 1);
+    memcpy(tmp, path, len);
+    tmp[len] = '\0';
+
+    if (tmp[len - 1] == '/')
+        tmp[len - 1] = '\0';
+
+    for (p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+                return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+/* Return:  1 = same fs already mounted
+ *         -1 = dir busy with different type/tag
+ *          0 = not mounted yet
+ */
+static int is_mounted(const char *dir, const char *src, const char *type)
+{
+    FILE *fp = setmntent("/proc/self/mounts", "r");
+    if (!fp) return 0;                 /* silent best-effort */
+
+    struct mntent *m;
+    int found = 0;
+
+    while ((m = getmntent(fp)) != NULL) {
+        if (strcmp(m->mnt_dir, dir) == 0) {
+            if (strcmp(m->mnt_type, type) != 0)
+                found = -1;            /* same dir, other fstype */
+            else
+                found = (strcmp(m->mnt_fsname, src) == 0) ? 1 : -1;
+            break;
+        }
+    }
+    endmntent(fp);
+    return found;
+}
+
+/* Strip the single word "defaults" (and empty commas) from opt string.
+ * Returns pointer inside `buf`. buf must persist until mount(2) call.
+ */
+static const char *clean_opts(const char *orig, char *buf, size_t buflen)
+{
+    if (!orig || !*orig) return NULL;
+    if (strcmp(orig, "defaults") == 0) return NULL;
+
+    /* quick path: if the substring "defaults" not present, pass as-is */
+    if (!strstr(orig, "defaults")) return orig;
+
+    /* otherwise build a filtered copy */
+    char *dst = buf;
+    const char *tok;
+    char tmp[256];
+    strncpy(tmp, orig, sizeof(tmp)-1);
+    tmp[sizeof(tmp)-1] = '\0';
+
+    for (tok = strtok(tmp, ","); tok; tok = strtok(NULL, ",")) {
+        if (strcmp(tok, "defaults") == 0 || *tok == '\0')
+            continue;
+        size_t n = snprintf(dst, buflen - (dst - buf), "%s,", tok);
+        dst += n;
+    }
+    if (dst != buf) *(dst - 1) = '\0'; /* remove trailing comma */
+    return (dst == buf) ? NULL : buf;  /* all stripped? -> NULL */
+}
+
+/* Mount every virtiofs entry found in /etc/fstab.
+ * Idempotent, silent on success, logs only actionable errors.            */
+static int mount_fstab_virtiofs(void)
+{
+    FILE *fp = setmntent("/etc/fstab", "r");
+    if (!fp)        /* no fstab → nothing to do, not an error */
+        return 0;
+
+    struct mntent *e;
+    int rc = 0;
+
+    while ((e = getmntent(fp)) != NULL) {
+        /* ─────────── 1. we only care about virtiofs rows ─────────── */
+        if (strcmp(e->mnt_type, "virtiofs") != 0)
+            continue;
+
+        if (!e->mnt_fsname[0] || !e->mnt_dir[0]) {
+            fprintf(stderr,
+                "virtiofs-init: malformed fstab line – skipped\n");
+            rc = -1;
+            continue;
+        }
+
+        /* ─────────── 2. make local copies BEFORE is_mounted() ─────── */
+        char fsname[256], dir[256], opts[256];
+        strncpy(fsname, e->mnt_fsname, sizeof(fsname) - 1);
+        strncpy(dir,    e->mnt_dir,    sizeof(dir)    - 1);
+        strncpy(opts,   e->mnt_opts,   sizeof(opts)   - 1);
+        fsname[sizeof(fsname) - 1] =
+        dir[sizeof(dir) - 1]   =
+        opts[sizeof(opts) - 1] = '\0';
+
+        /* ─────────── 3. ensure mount‑point exists (mkdir -p) ───────── */
+        if (mkdir_p(dir, 0755) < 0) {
+            fprintf(stderr,
+                "virtiofs-init: cannot create %s: %s\n",
+                dir, strerror(errno));
+            rc = -1;
+            continue;
+        }
+
+        /* ─────────── 4. skip if already mounted / busy ─────────────── */
+        switch (is_mounted(dir, fsname, "virtiofs")) {
+        case  1:  continue;            /* identical mount already there */
+        case -1:  fprintf(stderr,
+                     "virtiofs-init: %s busy – skipped\n", dir);
+                  rc = -1;
+                  continue;
+        }
+
+        /* ─────────── 5. translate common flags BEFORE they vanish ──── */
+        unsigned long flags = 0;
+        struct mntent fake = { .mnt_opts = opts };
+        if (hasmntopt(&fake, "ro"))      flags |= MS_RDONLY;
+        if (hasmntopt(&fake, "nosuid"))  flags |= MS_NOSUID;
+        if (hasmntopt(&fake, "nodev"))   flags |= MS_NODEV;
+        if (hasmntopt(&fake, "noexec"))  flags |= MS_NOEXEC;
+
+        /* Clean "defaults" out of the option list */
+        char optbuf[256];
+        const char *data = clean_opts(opts, optbuf, sizeof(optbuf));
+
+        /* ─────────── 6. actual mount attempt ───────────────────────── */
+        if (mount(fsname, dir, "virtiofs", flags, data) < 0) {
+            if (errno == ENODEV || errno == ENOENT) {
+                fprintf(stderr,
+                    "virtiofs-init: tag %s absent – skipped\n", fsname);
+            } else if (errno != EBUSY) {
+                fprintf(stderr,
+                    "virtiofs-init: mount %s→%s failed: %s\n",
+                    fsname, dir, strerror(errno));
+                rc = -1;
+            }
+        }
+    }
+
+    endmntent(fp);
+    return rc;
+}
+
 static int mount_filesystems()
 {
     char *const DIRS_LEVEL1[] = {"/dev", "/proc", "/sys"};
@@ -449,8 +611,8 @@ static int mount_filesystems()
     /* May fail if already exists and that's fine. */
     symlink("/proc/self/fd", "/dev/fd");
 
-	/* Process /etc/fstab to mount additional filesystems, including virtiofs shares */
-	system("/bin/mount -a");
+	/* Mount virtiofs shares from /etc/fstab (if any) */
+	mount_fstab_virtiofs();
 
     return 0;
 }
