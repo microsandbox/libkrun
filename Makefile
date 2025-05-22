@@ -97,7 +97,9 @@ ifeq ($(SEV),1)
 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(OS),Linux)
-	patchelf --set-soname $(KRUN_SONAME_$(OS)) --output $(LIBRARY_RELEASE_$(OS)) target/release/$(KRUN_BASE_$(OS))
+	mkdir -p $(dir $(LIBRARY_RELEASE_$(OS)))
+	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
+	patchelf --set-soname $(KRUN_SONAME_$(OS)) $(LIBRARY_RELEASE_$(OS))
 else
 ifeq ($(EFI),1)
 ifeq ($(OS),Darwin)
@@ -114,7 +116,9 @@ ifeq ($(SEV),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(OS),Linux)
-	patchelf --set-soname $(KRUN_SONAME_$(OS)) --output $(LIBRARY_DEBUG_$(OS)) target/debug/$(KRUN_BASE_$(OS))
+	mkdir -p $(dir $(LIBRARY_DEBUG_$(OS)))
+	cp target/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
+	patchelf --set-soname $(KRUN_SONAME_$(OS)) $(LIBRARY_DEBUG_$(OS))
 else
 	cp target/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
 endif
