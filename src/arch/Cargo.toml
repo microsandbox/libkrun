@@ -10,16 +10,16 @@ amd-sev = [ "tee" ]
 efi = []
 
 [dependencies]
-libc = ">=0.2.39"
-vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
+libc.workspace = true
+vm-memory.workspace = true
 
 arch_gen = { path = "../arch_gen" }
 smbios = { path = "../smbios" }
 utils = { path = "../utils" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-kvm-bindings = { version = ">=0.8", features = ["fam-wrappers"] }
-kvm-ioctls = ">=0.17"
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 vm-fdt = ">= 0.2.0"

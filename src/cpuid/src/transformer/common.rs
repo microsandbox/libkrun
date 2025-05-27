@@ -123,7 +123,7 @@ pub fn use_host_cpuid_function(
                 edx: entry.edx,
                 padding: [0, 0, 0],
             })
-            .map_err(FamError)?;
+            .map_err(|e| FamError(e))?;
 
         count += 1;
     }

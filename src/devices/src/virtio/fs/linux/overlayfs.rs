@@ -1996,6 +1996,8 @@ impl OverlayFs {
 
         // Perform the rename
         let res = unsafe {
+            #[cfg(target_env = "gnu")]
+            {
             libc::renameat2(
                 old_parent_data.file.as_raw_fd(),
                 old_name.as_ptr(),
@@ -2003,6 +2005,16 @@ impl OverlayFs {
                 new_name.as_ptr(),
                 flags,
             )
+            }
+            #[cfg(target_env = "musl")]
+            {
+            libc::renameat(
+                old_parent_data.file.as_raw_fd(),
+                old_name.as_ptr(),
+                new_parent_data.file.as_raw_fd(),
+                new_name.as_ptr(),
+            )
+            }
         };
 
         if res < 0 {
