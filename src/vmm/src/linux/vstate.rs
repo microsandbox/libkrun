@@ -864,7 +864,7 @@ impl Vcpu {
     /// Registers a signal handler which makes use of TLS and kvm immediate exit to
     /// kick the vcpu running on the current thread, if there is one.
     pub fn register_kick_signal_handler() {
-        extern "C" fn handle_signal(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
+        extern "C" fn handle_signal(_: c_int, _: *mut nix::libc::siginfo_t, _: *mut nix::libc::c_void) {
             // This is safe because it's temporarily aliasing the `Vcpu` object, but we are
             // only reading `vcpu.fd` which does not change for the lifetime of the `Vcpu`.
             unsafe {
@@ -1175,9 +1175,11 @@ impl Vcpu {
         self.fd
             .set_sregs(&state.sregs)
             .map_err(Error::VcpuSetSregs)?;
-        self.fd
-            .set_xsave(&state.xsave)
-            .map_err(Error::VcpuSetXsave)?;
+        unsafe {
+            self.fd
+                .set_xsave(&state.xsave)
+                .map_err(Error::VcpuSetXsave)?;
+        }
         self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
         self.fd
             .set_debug_regs(&state.debug_regs)

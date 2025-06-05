@@ -23,7 +23,7 @@ static CONSOLE_SIGINT_FD: AtomicI32 = AtomicI32::new(-1);
 ///
 /// Increments the `seccomp.num_faults` metric, logs an error message and terminates the process
 /// with a specific exit code.
-extern "C" fn sigsys_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
+extern "C" fn sigsys_handler(num: c_int, info: *mut nix::libc::siginfo_t, _unused: *mut nix::libc::c_void) {
     // Safe because we're just reading some fields from a supposedly valid argument.
     let si_signo = unsafe { (*info).si_signo };
     let si_code = unsafe { (*info).si_code };
@@ -52,7 +52,7 @@ extern "C" fn sigsys_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_v
 /// Signal handler for `SIGBUS` and `SIGSEGV`.
 ///
 /// Logs an error message and terminates the process with a specific exit code.
-extern "C" fn sigbus_sigsegv_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
+extern "C" fn sigbus_sigsegv_handler(num: c_int, info: *mut nix::libc::siginfo_t, _unused: *mut nix::libc::c_void) {
     // Safe because we're just reading some fields from a supposedly valid argument.
     let si_signo = unsafe { (*info).si_signo };
     let si_code = unsafe { (*info).si_code };
@@ -80,7 +80,7 @@ extern "C" fn sigbus_sigsegv_handler(num: c_int, info: *mut siginfo_t, _unused: 
     };
 }
 
-extern "C" fn sigwinch_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
+extern "C" fn sigwinch_handler(num: c_int, info: *mut nix::libc::siginfo_t, _unused: *mut nix::libc::c_void) {
     // Safe because we're just reading some fields from a supposedly valid argument.
     let si_signo = unsafe { (*info).si_signo };
 
@@ -95,7 +95,7 @@ extern "C" fn sigwinch_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c
     let _ = unsafe { libc::write(console_fd, &val as *const _ as *const c_void, 8) };
 }
 
-extern "C" fn sigint_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) {
+extern "C" fn sigint_handler(num: c_int, info: *mut nix::libc::siginfo_t, _unused: *mut nix::libc::c_void) {
     // Safe because we're just reading some fields from a supposedly valid argument.
     let si_signo = unsafe { (*info).si_signo };
 
