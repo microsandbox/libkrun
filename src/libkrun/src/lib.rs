@@ -9,6 +9,7 @@ use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::File;
+use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, RawFd};

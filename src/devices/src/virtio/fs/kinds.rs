@@ -1,6 +1,6 @@
 
 
-use std::{ffi::CStr, io, path::PathBuf, time::Duration};
+use std::{ffi::CStr, io, path::PathBuf, sync::{atomic::AtomicI32, Arc}, time::Duration};
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -596,13 +596,14 @@ impl FileSystem for FsImpl {
         arg: u64,
         in_size: u32,
         out_size: u32,
+        exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         match self {
             FsImpl::Passthrough(fs) => {
-                fs.ioctl(ctx, inode, handle, flags, cmd, arg, in_size, out_size)
+                fs.ioctl(ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code)
             }
             FsImpl::Overlayfs(fs) => {
-                fs.ioctl(ctx, inode, handle, flags, cmd, arg, in_size, out_size)
+                fs.ioctl(ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code)
             }
         }
     }

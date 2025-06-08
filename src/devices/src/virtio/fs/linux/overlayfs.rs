@@ -10,7 +10,7 @@ use std::{
     },
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         Arc, LazyLock, RwLock,
     },
     time::Duration,
@@ -18,7 +18,7 @@ use std::{
 
 use caps::{has_cap, CapSet, Capability};
 use intaglio::{cstr::SymbolTable, Symbol};
-use nix::request_code_read;
+use nix::{request_code_none, request_code_read};
 
 use crate::virtio::{
     bindings,
@@ -2283,7 +2283,7 @@ impl OverlayFs {
                     }
                 }
             };
-            
+
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -2631,9 +2631,12 @@ impl OverlayFs {
         inode: Inode,
         handle: Handle,
         cmd: u32,
+        arg: u64,
         out_size: u32,
+        exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         const VIRTIO_IOC_MAGIC: u8 = b'v';
+
         const VIRTIO_IOC_TYPE_EXPORT_FD: u8 = 1;
         const VIRTIO_IOC_EXPORT_FD_SIZE: usize = 2 * mem::size_of::<u64>();
         const VIRTIO_IOC_EXPORT_FD_REQ: u32 = request_code_read!(
@@ -2641,6 +2644,10 @@ impl OverlayFs {
             VIRTIO_IOC_TYPE_EXPORT_FD,
             VIRTIO_IOC_EXPORT_FD_SIZE
         ) as u32;
+
+        const VIRTIO_IOC_TYPE_EXIT_CODE: u8 = 2;
+        const VIRTIO_IOC_EXIT_CODE_REQ: u32 =
+            request_code_none!(VIRTIO_IOC_MAGIC, VIRTIO_IOC_TYPE_EXIT_CODE) as u32;
 
         match cmd {
             VIRTIO_IOC_EXPORT_FD_REQ => {
@@ -2671,6 +2678,10 @@ impl OverlayFs {
                 let mut ret: Vec<_> = self.config.export_fsid.to_ne_bytes().into();
                 ret.extend_from_slice(&handle.to_ne_bytes());
                 Ok(ret)
+            }
+            VIRTIO_IOC_EXIT_CODE_REQ => {
+                exit_code.store(arg as i32, Ordering::SeqCst);
+                Ok(Vec::new())
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
         }
@@ -3349,11 +3360,12 @@ impl FileSystem for OverlayFs {
         handle: Self::Handle,
         _flags: u32,
         cmd: u32,
-        _arg: u64,
+        arg: u64,
         _in_size: u32,
         out_size: u32,
+        exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
-        self.do_ioctl(inode, handle, cmd, out_size)
+        self.do_ioctl(inode, handle, cmd, arg, out_size, exit_code)
     }
 }
 
