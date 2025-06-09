@@ -51,6 +51,9 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// The marker for opaque directories
 const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
+/// The owner and permissions attribute
+const OVERRIDE_STAT_XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+
 /// Maximum allowed number of layers for the overlay filesystem.
 const MAX_LAYERS: usize = 128;
 
@@ -753,15 +756,9 @@ impl OverlayFs {
         let whiteout_cpath = self.create_whiteout_path(name)?;
 
         match Self::statx(parent, Some(&whiteout_cpath)) {
-            Ok(_) => {
-                Ok(true)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Ok(false)
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -770,15 +767,9 @@ impl OverlayFs {
         let opaque_cpath = CString::new(OPAQUE_MARKER).map_err(|_| einval())?;
 
         match Self::statx(parent, Some(&opaque_cpath)) {
-            Ok(_) => {
-                Ok(true)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Ok(false)
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -848,53 +839,35 @@ impl OverlayFs {
 
         // Check for empty name
         if name_bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty name is not allowed",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         // Check for path traversal sequences
         if name_bytes == b".." || name_bytes.contains(&b'/') || name_bytes.contains(&b'\\') {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "path traversal attempt detected",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
 
         // Check for null bytes
         if name_bytes.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "name contains null bytes",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         // Convert to str for string pattern matching
         let name_str = match std::str::from_utf8(name_bytes) {
             Ok(s) => s,
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "name contains invalid UTF-8",
-                ))
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
         };
 
         // Check for whiteout prefix
         if name_str.starts_with(".wh.") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "name cannot start with whiteout prefix",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         // Check for opaque marker
         if name_str == ".wh..wh..opq" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "name cannot be an opaque directory marker",
-            ));
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         Ok(())
@@ -998,9 +971,7 @@ impl OverlayFs {
                     // Open the current segment
                     let new_file =
                         match Self::open_path_file_at(current.0.as_raw_fd(), &segment_name) {
-                            Ok(file) => {
-                                file
-                            }
+                            Ok(file) => file,
                             Err(e) => {
                                 return Some(Err(e));
                             }
@@ -2823,6 +2794,7 @@ impl FileSystem for OverlayFs {
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        Self::validate_name(name)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -2904,6 +2876,7 @@ impl FileSystem for OverlayFs {
     }
 
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        Self::validate_name(name)?;
         self.do_unlink(parent, name, 0)
     }
 

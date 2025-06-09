@@ -32,6 +32,7 @@ const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
+const OVERRIDE_STAT_XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 
 static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
 
@@ -808,6 +809,36 @@ impl PassthroughFs {
 
         Ok((scoped_uid, scoped_gid))
     }
+
+    /// Validates a name to prevent path traversal attacks
+    ///
+    /// This function checks if a name contains:
+    /// - Path traversal sequences like ".."
+    /// - Other potentially dangerous patterns like slashes
+    ///
+    /// Returns:
+    /// - Ok(()) if the name is safe
+    /// - Err(io::Error) if the name contains invalid patterns
+    fn validate_name(name: &CStr) -> io::Result<()> {
+        let name_bytes = name.to_bytes();
+
+        // Check for empty name
+        if name_bytes.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        // Check for path traversal sequences
+        if name_bytes == b".." || name_bytes.contains(&b'/') || name_bytes.contains(&b'\\') {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+
+        // Check for null bytes
+        if name_bytes.contains(&0) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        Ok(())
+    }
 }
 
 fn forget_one(
@@ -939,6 +970,8 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        Self::validate_name(name)?;
+
         debug!("do_lookup: {:?}", name);
         let init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
 
@@ -1003,6 +1036,8 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        Self::validate_name(name)?;
+
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1026,6 +1061,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        Self::validate_name(name)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -1106,6 +1142,8 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        Self::validate_name(name)?;
+
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1159,6 +1197,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        Self::validate_name(name)?;
         self.do_unlink(parent, name, 0)
     }
 
@@ -1396,6 +1435,9 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        Self::validate_name(oldname)?;
+        Self::validate_name(newname)?;
+
         let old_inode = self
             .inodes
             .read()
@@ -1441,6 +1483,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        Self::validate_name(name)?;
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1478,6 +1521,8 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
+        Self::validate_name(newname)?;
+
         let data = self
             .inodes
             .read()
@@ -1521,6 +1566,8 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        Self::validate_name(name)?;
+
         // Set security context on symlink.
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");

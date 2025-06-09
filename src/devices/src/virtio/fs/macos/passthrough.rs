@@ -818,6 +818,45 @@ impl PassthroughFs {
 
         mflags
     }
+
+    /// Validates a name to prevent path traversal attacks
+    ///
+    /// This function checks if a name contains:
+    /// - Path traversal sequences like ".."
+    /// - Other potentially dangerous patterns like slashes
+    ///
+    /// Returns:
+    /// - Ok(()) if the name is safe
+    /// - Err(io::Error) if the name contains invalid patterns
+    fn validate_name(name: &CStr) -> io::Result<()> {
+        let name_bytes = name.to_bytes();
+
+        // Check for empty name
+        if name_bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty name is not allowed",
+            ));
+        }
+
+        // Check for path traversal sequences
+        if name_bytes == b".." || name_bytes.contains(&b'/') || name_bytes.contains(&b'\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "path traversal attempt detected",
+            ));
+        }
+
+        // Check for null bytes
+        if name_bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name contains null bytes",
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 fn set_secctx(file: StatFile, secctx: SecContext, symlink: bool) -> io::Result<()> {
