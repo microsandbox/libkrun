@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         .fs(|f| f.root(&root))
         .console(|c| c.output(root.join("console.log")))
         .exec(|e| e.path("/bin/busybox").args(["sh", "-c",
-            "set -eu; /bin/busybox mkdir -p /ram; /bin/busybox mount -t tmpfs tmpfs /ram; echo ready > /ready; while [ ! -e /go ]; do /bin/busybox sleep 0.01; done; if [ -f /hostdata ]; then /bin/busybox dd if=/hostdata of=/dev/null bs=4096 count=65536; else /bin/busybox dd if=/dev/zero of=/ram/data bs=1M count=32; test $(/bin/busybox wc -c < /ram/data) -eq 33554432; fi; echo done > /done; while :; do :; done"]))
+            "set -eu; /bin/busybox mkdir -p /ram; /bin/busybox mount -t tmpfs tmpfs /ram; if [ -f /hostdata ]; then echo pretracking-read-check; /bin/busybox ls -ln /hostdata; /bin/busybox dd if=/hostdata of=/dev/null bs=4096 count=1; fi; echo ready > /ready; while [ ! -e /go ]; do /bin/busybox sleep 0.01; done; if [ -f /hostdata ]; then /bin/busybox dd if=/hostdata of=/dev/null bs=4096 count=65536; else /bin/busybox dd if=/dev/zero of=/ram/data bs=1M count=32; test $(/bin/busybox wc -c < /ram/data) -eq 33554432; fi; echo done > /done; while :; do :; done"]))
         .build()?;
     let control = vm.control_handle();
     let exit = vm.exit_handle();
@@ -153,6 +153,29 @@ fn main() -> Result<()> {
             let begin = Instant::now();
             let full = control.plan_full_memory_capture()?;
             control.capture_memory(&full, options, &mut memory)?;
+            if std::env::var_os("PR121_FAULT_ARM").is_some() {
+                let path = std::env::var("PR121_FAULT_FILE")?;
+                fs::write(&path, b"armed")?;
+                assert!(
+                    control.publish_memory_capture(&full).is_err(),
+                    "arm fault did not fire"
+                );
+                assert!(!std::path::Path::new(&path).exists());
+                control.abandon_memory_capture(&full)?;
+                control.resume(pause)?;
+                thread::sleep(Duration::from_millis(25));
+                let pause = control.pause()?;
+                let full = control.plan_full_memory_capture()?;
+                memory.0.clear();
+                control.capture_memory(&full, options, &mut memory)?;
+                control.publish_memory_capture(&full)?;
+                control.release_memory_baseline()?;
+                control.resume(pause)?;
+                println!(
+                    "arm_fault_recovery=pass candidate_abandoned=pass resume=pass full_rebase=pass"
+                );
+                return Ok(());
+            }
             let baseline = control.publish_memory_capture(&full)?;
             let full_ms = begin.elapsed().as_secs_f64() * 1000.;
             control.resume(pause)?;
@@ -167,11 +190,18 @@ fn main() -> Result<()> {
             let pause_ms = begin.elapsed().as_secs_f64() * 1000.;
             if let Ok(path) = std::env::var("PR121_FAULT_FILE") {
                 fs::write(&path, b"armed")?;
-                assert!(
+                let recovery_started = Instant::now();
+                let failed = if std::env::var("PR121_FAULT_KIND").as_deref() == Ok("disable") {
+                    control.release_memory_baseline().is_err()
+                } else {
                     control
                         .plan_incremental_memory_capture_with_threshold(baseline, 100)
-                        .is_err(),
-                    "fault did not fire"
+                        .is_err()
+                };
+                assert!(failed, "fault did not fire");
+                assert!(
+                    !std::path::Path::new(&path).exists(),
+                    "injection was not consumed"
                 );
                 assert!(
                     matches!(
@@ -191,6 +221,10 @@ fn main() -> Result<()> {
                 let mut recovered = Memory::default();
                 control.capture_memory(&full, options, &mut recovered)?;
                 let fresh = control.publish_memory_capture(&full)?;
+                // Exercise real writes after rearming, not just an empty paused delta.
+                control.resume(pause)?;
+                thread::sleep(Duration::from_millis(25));
+                let pause = control.pause()?;
                 let delta =
                     match control.plan_incremental_memory_capture_with_threshold(fresh, 100)? {
                         IncrementalCaptureDecision::Incremental(plan) => plan,
@@ -198,9 +232,20 @@ fn main() -> Result<()> {
                     };
                 control.capture_memory(&delta, options, &mut recovered)?;
                 control.abandon_memory_capture(&delta)?;
+                let complete = control.plan_full_memory_capture()?;
+                let mut check = Memory::default();
+                control.capture_memory(&complete, options, &mut check)?;
+                let mismatches = check
+                    .0
+                    .iter()
+                    .filter(|(address, bytes)| recovered.0.get(address) != Some(bytes))
+                    .count();
+                assert_eq!(recovered.0.len(), check.0.len());
+                assert_eq!(mismatches, 0, "recovered delta differs from full RAM");
+                control.abandon_memory_capture(&complete)?;
                 control.release_memory_baseline()?;
                 control.resume(pause)?;
-                println!("fault_recovery=pass old_baseline=rejected full_rebase=pass tracking_rearmed=pass");
+                println!("fault_recovery=pass old_baseline=rejected full_rebase=pass tracking_rearmed=pass compared_pages={} mismatches=0 recovery_ms={:.3}", check.0.len(), recovery_started.elapsed().as_secs_f64() * 1000.);
                 return Ok(());
             }
             let begin = Instant::now();
