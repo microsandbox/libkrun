@@ -500,6 +500,7 @@ pub struct Vm {
     partition: Partition,
     memory_regions: Vec<MappedMemoryRegion>,
     dirty_tracking: bool,
+    dirty_tracking_transition_incomplete: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -877,6 +878,7 @@ impl Vm {
             partition,
             memory_regions: Vec::new(),
             dirty_tracking: false,
+            dirty_tracking_transition_incomplete: false,
         })
     }
 
@@ -1037,10 +1039,12 @@ impl Vm {
     }
 
     fn set_dirty_tracking(&mut self, enabled: bool) -> Result<()> {
-        if self.dirty_tracking == enabled {
+        if self.dirty_tracking == enabled && !self.dirty_tracking_transition_incomplete {
             return Ok(());
         }
 
+        // A failed mapping transition must be reconciled even when the remembered mode matches.
+        self.dirty_tracking_transition_incomplete = true;
         for region in &self.memory_regions {
             unmap_gpa_range(self.partition.handle, region.guest_addr, region.size)?;
             let mut flags =
@@ -1057,6 +1061,7 @@ impl Vm {
             )?;
         }
         self.dirty_tracking = enabled;
+        self.dirty_tracking_transition_incomplete = false;
         Ok(())
     }
 

@@ -289,10 +289,7 @@ impl HvfDirtyTracker {
     }
 
     fn stop(&self) -> Result<()> {
-        if !self.active.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
+        // An unsuccessful initial arm may have protected only a prefix of the regions.
         let regions = self
             .regions
             .lock()

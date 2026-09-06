@@ -4,9 +4,11 @@
 //! Request-scoped host access epochs for guest memory.
 
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
+
+use super::dirty_bitmap::DirtyBitmap;
 
 const MODE_MASK: u64 = 0b11;
 const MODE_RESIDENT: u64 = 0;
@@ -41,6 +43,8 @@ pub enum Error {
     DrainTimeout,
     /// The access generation counter is exhausted.
     GenerationExhausted,
+    /// Tracking requires a valid, non-overlapping RAM topology at a frozen boundary.
+    InvalidTopology,
 }
 
 impl Display for Error {
@@ -48,6 +52,10 @@ impl Display for Error {
         match self {
             Self::DrainTimeout => write!(f, "guest-memory access requests did not drain"),
             Self::GenerationExhausted => write!(f, "guest-memory access generation is exhausted"),
+            Self::InvalidTopology => write!(
+                f,
+                "guest-memory tracking topology is unavailable or invalid"
+            ),
         }
     }
 }
@@ -62,7 +70,9 @@ pub struct MemoryAccessDomain {
 
 struct MemoryAccessDomainInner {
     state: AtomicU64,
-    dirty: Mutex<Vec<HostMemoryRange>>,
+    // Frozen admission preserves whether the draining requests were actually tracked.
+    tracking_enabled: AtomicBool,
+    dirty: Mutex<Option<DirtyBitmap>>,
     participants: Mutex<Vec<Weak<MemoryAccessParticipantInner>>>,
     mode_lock: Mutex<()>,
     mode_changed: Condvar,
@@ -103,7 +113,8 @@ impl MemoryAccessDomain {
         Self {
             inner: Arc::new(MemoryAccessDomainInner {
                 state: AtomicU64::new(encode_state(MODE_RESIDENT, 0)),
-                dirty: Mutex::new(Vec::new()),
+                tracking_enabled: AtomicBool::new(false),
+                dirty: Mutex::new(None),
                 participants: Mutex::new(Vec::new()),
                 mode_lock: Mutex::new(()),
                 mode_changed: Condvar::new(),
@@ -193,7 +204,10 @@ impl MemoryAccessDomain {
             .dirty
             .lock()
             .expect("host dirty mutex poisoned")
+            .as_mut()
+            .ok_or(Error::InvalidTopology)?
             .clear();
+        self.inner.tracking_enabled.store(true, Ordering::Release);
         self.inner
             .state
             .store(encode_state(MODE_TRACKING, generation), Ordering::Release);
@@ -209,11 +223,8 @@ impl MemoryAccessDomain {
             .mode_lock
             .lock()
             .expect("memory-access mode mutex poisoned");
-        self.inner
-            .dirty
-            .lock()
-            .expect("host dirty mutex poisoned")
-            .clear();
+        *self.inner.dirty.lock().expect("host dirty mutex poisoned") = None;
+        self.inner.tracking_enabled.store(false, Ordering::Release);
         self.inner
             .state
             .store(encode_state(MODE_RESIDENT, generation), Ordering::Release);
@@ -242,7 +253,34 @@ impl MemoryAccessDomain {
 
     /// Drains the coalescible host-dirty inventory at a frozen boundary.
     pub fn take_dirty_ranges(&self) -> Vec<HostMemoryRange> {
-        std::mem::take(&mut *self.inner.dirty.lock().expect("host dirty mutex poisoned"))
+        self.inner
+            .dirty
+            .lock()
+            .expect("host dirty mutex poisoned")
+            .as_mut()
+            .map(DirtyBitmap::take)
+            .unwrap_or_default()
+    }
+
+    /// Installs bounded tracking over the registered RAM ranges while writers are frozen.
+    /// Call after full capture; replacing a bitmap discards the preceding host generation.
+    pub fn configure_tracking(&self, ranges: Vec<HostMemoryRange>) -> Result<(), Error> {
+        if !matches!(self.mode(), MemoryAccessMode::Frozen { .. }) {
+            return Err(Error::InvalidTopology);
+        }
+        let bitmap = DirtyBitmap::new(ranges).ok_or(Error::InvalidTopology)?;
+        *self.inner.dirty.lock().expect("host dirty mutex poisoned") = Some(bitmap);
+        Ok(())
+    }
+
+    /// Checks whether all writes belonged to registered RAM. Inspect at a frozen boundary.
+    pub fn dirty_coverage_valid(&self) -> bool {
+        self.inner
+            .dirty
+            .lock()
+            .expect("host dirty mutex poisoned")
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.valid)
     }
 }
 
@@ -271,12 +309,16 @@ impl MemoryAccessParticipant {
             return false;
         }
         if state & MODE_MASK == MODE_TRACKING {
-            self.domain
+            let mut dirty = self
+                .domain
                 .inner
                 .dirty
                 .lock()
-                .expect("host dirty mutex poisoned")
-                .extend(writable_ranges());
+                .expect("host dirty mutex poisoned");
+            let bitmap = dirty.as_mut().expect("tracking mode has a bitmap");
+            for range in writable_ranges() {
+                bitmap.mark(range);
+            }
         }
         true
     }
@@ -301,13 +343,15 @@ impl MemoryAccessParticipant {
         if range.length == 0 || self.inner.active.load(Ordering::Acquire) == 0 {
             return false;
         }
-        if !matches!(self.domain.mode(), MemoryAccessMode::Resident) {
+        if self.domain.inner.tracking_enabled.load(Ordering::Acquire) {
             self.domain
                 .inner
                 .dirty
                 .lock()
                 .expect("host dirty mutex poisoned")
-                .push(range);
+                .as_mut()
+                .expect("tracked request has a bitmap")
+                .mark(range);
         }
         true
     }
@@ -365,11 +409,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn semantic_writes_during_freeze_preserve_admitted_mode() {
+        for tracked in [false, true] {
+            let domain = MemoryAccessDomain::new();
+            if tracked {
+                domain.freeze(Duration::from_secs(1)).unwrap();
+                domain
+                    .configure_tracking(vec![HostMemoryRange {
+                        start: 0,
+                        length: 8192,
+                    }])
+                    .unwrap();
+                domain.begin_tracking().unwrap();
+            }
+            let participant = domain.register_participant();
+            assert!(participant.begin_request(Vec::new));
+            let worker = std::thread::spawn(move || {
+                while !participant.is_frozen() {
+                    std::thread::yield_now();
+                }
+                assert!(participant.mark_write(HostMemoryRange {
+                    start: 4096,
+                    length: 1
+                }));
+                participant.end_request();
+            });
+            domain.freeze(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(domain.take_dirty_ranges().len(), usize::from(tracked));
+        }
+    }
+
+    #[test]
     fn tracking_marks_once_per_admitted_request() {
         let domain = MemoryAccessDomain::new();
         let participant = domain.register_participant();
         let previous = domain.freeze(Duration::from_millis(10)).unwrap();
         assert_eq!(previous, MemoryAccessMode::Resident);
+        domain
+            .configure_tracking(vec![HostMemoryRange {
+                start: 0,
+                length: 0x10000,
+            }])
+            .unwrap();
         domain.begin_tracking().unwrap();
 
         assert!(participant.begin_request(|| {
@@ -421,6 +503,12 @@ mod tests {
         });
         ready_receiver.recv().unwrap();
 
+        domain
+            .configure_tracking(vec![HostMemoryRange {
+                start: 0,
+                length: 0x10000,
+            }])
+            .unwrap();
         domain.begin_tracking().unwrap();
         worker.join().unwrap();
     }
@@ -439,6 +527,12 @@ mod tests {
         let domain = MemoryAccessDomain::new();
         let participant = domain.register_participant();
         domain.freeze(Duration::from_millis(10)).unwrap();
+        domain
+            .configure_tracking(vec![HostMemoryRange {
+                start: 0,
+                length: 0x10000,
+            }])
+            .unwrap();
         domain.begin_tracking().unwrap();
 
         assert!(participant.begin_request(Vec::new));

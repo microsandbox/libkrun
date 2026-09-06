@@ -679,6 +679,7 @@ pub struct Vmm {
     memory_ledger: MemoryGenerationLedger,
     memory_access: MemoryAccessDomain,
     memory_tracking_active: bool,
+    memory_tracking_needs_rearm: bool,
     pending_dirty_ranges: Vec<GuestMemoryRange>,
     carried_dirty_ranges: Vec<GuestMemoryRange>,
     pending_access_mode: Option<MemoryAccessMode>,
@@ -811,6 +812,11 @@ impl Vmm {
             VmmExecutionState::Indeterminate => return Err(Error::VcpuControlIndeterminate),
         }
 
+        if self.memory_tracking_needs_rearm {
+            // A partial remap/protection failure may leave CPU mappings unusable. Reconcile
+            // them before running again; failure here leaves execution at the paused boundary.
+            self.release_memory_baseline()?;
+        }
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;
 
@@ -975,9 +981,19 @@ impl Vmm {
             .memory_access
             .freeze(VCPU_CONTROL_TIMEOUT)
             .map_err(Error::MemoryAccessDomain)?;
+        if !self.memory_access.dirty_coverage_valid() {
+            self.memory_ledger.invalidate_baseline();
+            self.memory_access.resume_mode(previous);
+            return Ok(IncrementalCaptureDecision::FullRequired(
+                memory_state::FullCaptureReason::DirtyCoverageInvalidated,
+            ));
+        }
         let mut changed_ranges = match self.vm.take_dirty_ranges().map_err(Error::Vm) {
             Ok(ranges) => ranges,
             Err(error) => {
+                // Harvest may have cleared earlier slots before failing. Never reuse that base.
+                self.memory_ledger.invalidate_baseline();
+                self.memory_tracking_needs_rearm = true;
                 self.memory_access.resume_mode(previous);
                 return Err(error);
             }
@@ -1167,21 +1183,49 @@ impl Vmm {
         self.memory_ledger
             .validate_pending(capture)
             .map_err(Error::MemoryState)?;
-        if self.memory_tracking_active {
+        if capture.kind() == MemoryCaptureKind::Full {
+            self.memory_access
+                .configure_tracking(
+                    self.guest_memory
+                        .iter()
+                        .map(|region| devices::virtio::HostMemoryRange {
+                            start: region.start_addr().raw_value(),
+                            length: region.len(),
+                        })
+                        .collect(),
+                )
+                .map_err(Error::MemoryAccessDomain)?;
+        }
+        if self.memory_tracking_needs_rearm {
+            // Reconcile every mapping before trusting a new baseline. Keep this flag on error.
+            self.vm.stop_dirty_tracking().map_err(Error::Vm)?;
+            self.memory_tracking_active = false;
+        }
+        let tracking_result = if self.memory_tracking_active {
             if capture.kind() == MemoryCaptureKind::Full {
                 // Discard the preceding generation only after the complete replacement has been
                 // produced. The backend starts its next generation atomically with this harvest.
-                let _ = self.vm.take_dirty_ranges().map_err(Error::Vm)?;
+                self.vm.take_dirty_ranges().map(|_| ())
+            } else {
+                Ok(())
             }
         } else {
-            self.vm.begin_dirty_tracking().map_err(Error::Vm)?;
-            self.memory_tracking_active = true;
+            self.vm.begin_dirty_tracking()
+        };
+        if let Err(error) = tracking_result {
+            self.memory_ledger.invalidate_baseline();
+            self.memory_tracking_needs_rearm = true;
+            return Err(Error::Vm(error));
         }
+        self.memory_tracking_active = true;
+        self.memory_tracking_needs_rearm = false;
 
         // Open host writers only after the backend CPU tracker covers the next generation.
-        self.memory_access
-            .begin_tracking()
-            .map_err(Error::MemoryAccessDomain)?;
+        if let Err(error) = self.memory_access.begin_tracking() {
+            self.memory_ledger.invalidate_baseline();
+            self.memory_tracking_needs_rearm = true;
+            return Err(Error::MemoryAccessDomain(error));
+        }
 
         let baseline = self
             .memory_ledger
@@ -1220,12 +1264,15 @@ impl Vmm {
             .memory_access
             .freeze(VCPU_CONTROL_TIMEOUT)
             .map_err(Error::MemoryAccessDomain)?;
-        if self.memory_tracking_active {
+        if self.memory_tracking_active || self.memory_tracking_needs_rearm {
             if let Err(error) = self.vm.stop_dirty_tracking().map_err(Error::Vm) {
+                self.memory_ledger.invalidate_baseline();
+                self.memory_tracking_needs_rearm = true;
                 self.memory_access.resume_mode(previous);
                 return Err(error);
             }
             self.memory_tracking_active = false;
+            self.memory_tracking_needs_rearm = false;
         }
         self.memory_access
             .resume_resident()
