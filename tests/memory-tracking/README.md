@@ -83,3 +83,21 @@ All 40 corrected Linux VM runs and 20 corrected Windows tmpfs runs passed baseli
 Windows host-read qualification is incomplete: all ten fixed host-read attempts stopped when the guest reported `dd: /hostdata: Permission denied`. This has not been attributed to the tracking patch and must not be counted as a passing workload. Windows mapping-transition failure injection, KVM disable-failure injection, Linux ARM64 configuration checks, and the original CI two-vCPU integration test remain outstanding. The isolated two-vCPU KVM runs above pass, but are not a rerun of that CI test. Do not treat these results as complete merge qualification.
 
 Linux `cargo clippy -p msb_krun -- -D warnings`, and the same command with `--features amd-sev` and `--features tdx`, pass. The TEE checks uncovered missing guards on the `VmPauseGeneration` implementation and `std::io` import; these were corrected without changing non-TEE execution. The harness partial-page merge regression test and formatting checks also pass.
+
+## Follow-up: partial-disable and initial-arm faults
+
+The previously outstanding Linux disable and Windows mapping-transition tests have now been run live. Production source remains unchanged by this follow-up; Windows fault instrumentation is supplied as an inert patch to apply only to an isolated test copy.
+
+| Live case | Runs | Result |
+|---|---:|---|
+| KVM fails second slot while disabling dirty tracking | 12 | Pass; old baseline rejected, full rebase and resumed delta equal fresh full RAM |
+| WHP fails replacement mapping after successful unmap while disabling tracking | 12 | Pass; old baseline rejected, mappings recovered, resumed delta equal fresh full RAM |
+| WHP fails initial tracking-enable replacement mapping | 6 | Pass; failed candidate abandoned, resume succeeds, new full capture/publication succeeds |
+
+Each disable matrix covers one/two vCPUs, rebase-before-resume and resume-before-rebase, with three repetitions per combination. Initial-arm tests cover one/two vCPUs with three repetitions each. Disable recovery compares 74,896 pages on Linux and 65,536 on Windows, with zero mismatches. The recovery timing includes a full diagnostic capture, deliberate guest run time, delta capture, a second full verification capture, and comparisons; it is not a production pause-latency measurement.
+
+End-to-end diagnostic recovery medians were 214.09 ms on Linux (204.55–243.70 ms) and 286.06 ms on Windows (260.54–375.02 ms). These are failure-path test timings, not a change in ordinary snapshot latency.
+
+For Linux, build `fault_kvm.c` as above and set `PR121_FAULT_KIND=disable` alongside `PR121_FAULT_FILE` and `LD_PRELOAD`. The second `KVM_SET_USER_MEMORY_REGION` without dirty logging fails after the first has already succeeded. For Windows, apply `fault_whp.patch` to an isolated source copy, build the native ARM64 harness, and set `PR121_FAULT_KIND=disable` and `PR121_FAULT_FILE`. It adds an invalid flag to the actual WHP map call only after the harness arms the marker; WHP rejects the call after the real preceding unmap. `PR121_FAULT_ARM=1` instead arms the marker just before the first full publication. Never apply this patch to production sources.
+
+The separate Windows host-read precondition still fails: a 4 KiB read before the ready marker (before any pause, capture, or tracking enablement) returns `Permission denied`, despite guest stat reporting mode 0777 and uid/gid 0. Diagnostic-only logging did not identify an error in the Windows host-open/read helpers. This is unresolved filesystem coverage, not a failed memory-tracking transition test. No filesystem permissions were relaxed to obtain a pass.
