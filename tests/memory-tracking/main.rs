@@ -19,9 +19,18 @@ struct Memory(BTreeMap<u64, Vec<u8>>);
 
 impl MemoryCaptureSink for Memory {
     fn write_bytes(&mut self, range: GuestMemoryRange, bytes: &[u8]) -> io::Result<()> {
-        for (index, page) in bytes.chunks(4096).enumerate() {
-            self.0
-                .insert(range.start() + index as u64 * 4096, page.to_vec());
+        // The original tracker emits byte ranges, whereas the bitmap emits pages.
+        // Merge partial writes rather than replacing or mis-keying an entire page.
+        let mut address = range.start();
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let page_start = address & !4095;
+            let offset = (address - page_start) as usize;
+            let count = remaining.len().min(4096 - offset);
+            let page = self.0.entry(page_start).or_insert_with(|| vec![0; 4096]);
+            page[offset..offset + count].copy_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            address += count as u64;
         }
         Ok(())
     }
@@ -81,6 +90,13 @@ fn bookkeeping(mode: &str) -> Result<()> {
     )?;
     std::hint::black_box(&plan);
     let harvest_ms = begin.elapsed().as_secs_f64() * 1000.;
+    let rss_bytes = peak_rss();
+    println!("mode={mode} iterations={iterations} request_ms={request_ms:.3} harvest_ms={harvest_ms:.3} ranges={raw_ranges} peak_rss_bytes={rss_bytes}");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn peak_rss() -> String {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
     let rss_bytes = if cfg!(target_os = "macos") {
@@ -88,8 +104,13 @@ fn bookkeeping(mode: &str) -> Result<()> {
     } else {
         usage.ru_maxrss as u64 * 1024
     };
-    println!("mode={mode} iterations={iterations} request_ms={request_ms:.3} harvest_ms={harvest_ms:.3} ranges={raw_ranges} peak_rss_bytes={rss_bytes}");
-    Ok(())
+    rss_bytes.to_string()
+}
+
+#[cfg(not(unix))]
+fn peak_rss() -> String {
+    // getrusage is Unix-only; do not report a misleading zero on other hosts.
+    "unavailable".into()
 }
 
 fn main() -> Result<()> {
@@ -225,4 +246,28 @@ fn wait_file(path: &std::path::Path) -> Result<()> {
         thread::sleep(Duration::from_millis(2));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_delta_preserves_neighbors_and_crosses_pages() {
+        let mut memory = Memory::default();
+        memory
+            .write_bytes(GuestMemoryRange::new(0, 8192).unwrap(), &[7; 8192])
+            .unwrap();
+        memory
+            .write_bytes(GuestMemoryRange::new(4094, 4).unwrap(), &[1, 2, 3, 4])
+            .unwrap();
+        assert_eq!(&memory.0[&0][4093..], &[7, 1, 2]);
+        assert_eq!(&memory.0[&4096][..3], &[3, 4, 7]);
+        memory
+            .write_zero(GuestMemoryRange::new(4095, 2).unwrap())
+            .unwrap();
+        assert_eq!(&memory.0[&0][4094..], &[1, 0]);
+        assert_eq!(&memory.0[&4096][..3], &[0, 4, 7]);
+        assert_eq!(memory.0.len(), 2);
+    }
 }

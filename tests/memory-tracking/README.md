@@ -59,4 +59,27 @@ The request-only tracking microbenchmarks increase by roughly 6–8%, while tota
 
 Validation completed: 72 device tests, 7 memory-ledger tests, formatting, Rust API Clippy with warnings denied, 32 normal live before/after VM runs across tmpfs and host-read workloads (all page comparisons passed), one original-build expected fault assertion, and four fixed-build fault recoveries including three resume-before-rebase cases. The initial harness attempt omitted BusyBox command prefixes and did not execute its workload; it was corrected and excluded. One baseline fault assertion initially stranded a paused test VM; that exact process was terminated and the harness now exits the entire process on panic.
 
-Remaining: Linux KVM live comparison and multi-slot harvest/disable failure injection; Windows WHP live comparison and mapping-transition failure injection; Linux x86_64/aarch64 and TEE CI configurations; the original two-vCPU Linux integration failure. Source transfer to the designated remote test machines needs approval. Do not treat this local result as merge qualification.
+## Remote results — 2026-09-06
+
+Source transfer was explicitly authorized. Tests used isolated source copies on the OVH x86_64/KVM host and Surface ARM64/WHP host without modifying existing checkouts. Both used identical harness code for original and fixed builds. Windows RSS is explicitly unavailable rather than reported as zero.
+
+The corrected harness merges byte-granular deltas into pages. The earlier sink assumed page alignment and falsely reported one/two-page baseline mismatches on these hosts; those failures are excluded. The original macOS timing table above predates this sink correction and must not be pooled with the following measurements. Linux also required rebuilding the embedded init for x86_64: the copied ARM64 init caused guest boot failures with exit status zero. Only explicit page-comparison result records count as passes.
+
+Five samples per variant and case; medians in milliseconds:
+
+| Host / workload | Full original → fixed | Delta original → fixed | Workload original → fixed | Pause entry original → fixed |
+|---|---:|---:|---:|---:|
+| Linux, 1 CPU, tmpfs | 93.571 → 93.153 | 3.876 → 3.835 | 184.789 → 174.663 | 0.026 → 0.024 |
+| Linux, 2 CPUs, tmpfs | 94.600 → 93.837 | 3.949 → 3.961 | 188.859 → 186.860 | 0.028 → 0.027 |
+| Linux, 1 CPU, host reads | 95.311 → 94.428 | 28.183 → 26.923 | 486.817 → 486.458 | 0.028 → 0.026 |
+| Linux, 2 CPUs, host reads | 94.509 → 94.212 | 28.408 → 26.836 | 452.945 → 447.700 | 0.029 → 0.026 |
+| Windows, 1 CPU, tmpfs | 138.360 → 139.709 | 10.829 → 9.836 | 475.327 → 470.243 | 0.062 → 0.065 |
+| Windows, 2 CPUs, tmpfs | 134.146 → 134.742 | 10.030 → 9.245 | 354.409 → 346.324 | 0.124 → 0.124 |
+
+All 40 corrected Linux VM runs and 20 corrected Windows tmpfs runs passed baseline-plus-delta equality against a fresh full capture. Linux compared 74,896 pages including additional mapped firmware RAM; Windows compared 65,536 pages. Four short Linux fault-injection processes overlapped part of the live benchmark batch, so these measurements are diagnostic rather than controlled latency guarantees.
+
+`fault_kvm.c` is an LD_PRELOAD test interposer: compile with `cc -shared -fPIC fault_kvm.c -ldl -o fault_kvm.so`. With `PR121_FAULT_FILE` set, it fails the second `KVM_GET_DIRTY_LOG` after the first has already succeeded. Both original-build tests reproduce the invalid-baseline bug. Both fixed tests reject the old baseline, complete a full rebase, and accept a fresh incremental capture; one additionally resumes before rebasing (`PR121_FAULT_RESUME=1`). This exercises actual multi-slot KVM harvesting, not a simulated ledger-only failure.
+
+Windows host-read qualification is incomplete: all ten fixed host-read attempts stopped when the guest reported `dd: /hostdata: Permission denied`. This has not been attributed to the tracking patch and must not be counted as a passing workload. Windows mapping-transition failure injection, KVM disable-failure injection, Linux ARM64 configuration checks, and the original CI two-vCPU integration test remain outstanding. The isolated two-vCPU KVM runs above pass, but are not a rerun of that CI test. Do not treat these results as complete merge qualification.
+
+Linux `cargo clippy -p msb_krun -- -D warnings`, and the same command with `--features amd-sev` and `--features tdx`, pass. The TEE checks uncovered missing guards on the `VmPauseGeneration` implementation and `std::io` import; these were corrected without changing non-TEE execution. The harness partial-page merge regression test and formatting checks also pass.
