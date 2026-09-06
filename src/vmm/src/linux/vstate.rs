@@ -767,10 +767,7 @@ impl Vm {
     /// Stops KVM dirty logging and restores ordinary writable memory slots.
     #[cfg(not(feature = "tee"))]
     pub fn stop_dirty_tracking(&mut self) -> Result<()> {
-        if !self.dirty_tracking {
-            return Ok(());
-        }
-
+        // Reconcile all slots even after an initial arm failed partway through.
         for region in &self.memory_regions {
             self.set_memory_region_flags(region, 0)?;
         }

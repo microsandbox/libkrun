@@ -1771,6 +1771,7 @@ pub fn build_microvm_paused(
         memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
         memory_access: devices::virtio::MemoryAccessDomain::new(),
         memory_tracking_active: false,
+        memory_tracking_needs_rearm: false,
         pending_dirty_ranges: Vec::new(),
         carried_dirty_ranges: Vec::new(),
         pending_access_mode: None,

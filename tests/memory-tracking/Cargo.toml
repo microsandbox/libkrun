@@ -1,0 +1,21 @@
+[package]
+name = "memory-tracking-live"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+bitmap = []
+devices = ["msb_krun/blk", "devices/blk", "vmm/blk"]
+
+[dependencies]
+msb_krun = { path = "../../src/krun" }
+devices = { package = "msb_krun_devices", path = "../../src/devices" }
+libc = "0.2"
+vmm = { package = "msb_krun_vmm", path = "../../src/vmm" }
+
+[[bin]]
+name = "memory-tracking-live"
+path = "main.rs"

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-#[cfg(not(feature = "tee"))]
+#[cfg(any(not(feature = "tee"), test))]
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
