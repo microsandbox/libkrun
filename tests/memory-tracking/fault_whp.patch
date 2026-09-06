@@ -1,0 +1,20 @@
+diff --git a/src/vmm/src/windows/vstate.rs b/src/vmm/src/windows/vstate.rs
+--- a/src/vmm/src/windows/vstate.rs
++++ b/src/vmm/src/windows/vstate.rs
+@@ -1940,6 +1940,16 @@ fn map_gpa_range_with_flags(
+     size: u64,
+     flags: WHV_MAP_GPA_RANGE_FLAGS,
+ ) -> Result<()> {
++    // Test-only: force a real WHP map error after the previous mapping was removed.
++    let flags = if let Ok(path) = std::env::var("PR121_FAULT_FILE") {
++        if std::path::Path::new(&path).exists() {
++            std::fs::remove_file(&path).unwrap();
++            flags | (0x8000_0000u32 as i32)
++        } else {
++            flags
++        }
++    } else { flags };
++
+     let hresult = unsafe { WHvMapGpaRange(partition, host_addr.cast(), guest_addr, size, flags) };
+ 
+     if hresult < 0 {
