@@ -8,13 +8,17 @@ use std::fmt::{Display, Formatter};
 
 #[cfg(feature = "blk")]
 use devices::virtio::{
-    fs::TYPE_FS, BlockState, CacheType, QueueState, VirtioMmioState, BLOCK_STATE_VERSION,
-    QUEUE_STATE_VERSION, VIRTIO_MMIO_STATE_VERSION,
+    BlockState, CacheType, QueueState, VirtioMmioState, BLOCK_STATE_VERSION, QUEUE_STATE_VERSION,
+    VIRTIO_MMIO_STATE_VERSION,
 };
 
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
+
+// The framing decoder recognizes device IDs even when their backend is not compiled (TEE).
+#[cfg(feature = "blk")]
+const TYPE_FS: u32 = 26;
 
 #[cfg(feature = "blk")]
 const BLOCK_DEVICE_STATE_MAGIC: &[u8; 9] = b"MSBKBLK\0\0";
