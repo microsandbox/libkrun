@@ -1059,6 +1059,45 @@ impl Vmm {
         }
     }
 
+    /// Grows an exclusively owned writable block image while execution is paused.
+    /// A failed call can leave larger image metadata; callers must recover forward.
+    #[cfg(feature = "blk")]
+    pub fn grow_block_capacity(&mut self, device_id: &str, size_bytes: u64) -> Result<()> {
+        self.require_paused_device_boundary()?;
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".into()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".into()))?;
+        self.quiesced_virtio_devices
+            .insert((TYPE_BLOCK, device_id.to_owned()));
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        {
+            let device = transport.device();
+            let mut device = device
+                .lock()
+                .map_err(|_| Error::DeviceState("block device mutex is poisoned".into()))?;
+            let block = device
+                .as_mut_any()
+                .downcast_mut::<Block>()
+                .ok_or_else(|| Error::DeviceState("device is not block".into()))?;
+            block
+                .grow_capacity(size_bytes)
+                .map_err(|error| Error::DeviceState(error.to_string()))?;
+        }
+        transport
+            .notify_config_change()
+            .map_err(|error| Error::DeviceState(format!("config interrupt: {error:?}")))
+    }
+
     #[cfg(feature = "blk")]
     fn require_paused_device_boundary(&self) -> Result<()> {
         if !matches!(self.execution_state, VmmExecutionState::Paused(_)) {
