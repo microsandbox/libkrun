@@ -39,6 +39,7 @@ pub mod linux_errno;
 // instantiate the device (extra capacity is rejected at config time), but the
 // vCPU run loops still reference its enforcement types unconditionally.
 pub mod cpu;
+mod dirty_bitmap;
 #[cfg(not(feature = "tee"))]
 pub mod mem;
 pub mod memory_access;

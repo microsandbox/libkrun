@@ -1456,6 +1456,12 @@ pub(crate) mod tests {
         vq.avail.idx.set(1);
 
         domain.freeze(Duration::from_millis(10)).unwrap();
+        domain
+            .configure_tracking(vec![HostMemoryRange {
+                start: 0,
+                length: 0x10000,
+            }])
+            .unwrap();
         domain.begin_tracking().unwrap();
         assert!(q.pop(m).is_some());
 
@@ -1470,11 +1476,11 @@ pub(crate) mod tests {
         let ranges = domain.take_dirty_ranges();
         assert!(ranges.contains(&HostMemoryRange {
             start: 0x4000,
-            length: 0x800,
+            length: 0x1000,
         }));
-        assert!(ranges.contains(&HostMemoryRange {
-            start: vq.used_start().raw_value(),
-            length: 6 + 8 * 16,
-        }));
+        assert!(ranges
+            .iter()
+            .any(|range| range.start <= vq.used_start().raw_value()
+                && range.start + range.length >= vq.used_start().raw_value() + 6 + 8 * 16));
     }
 }

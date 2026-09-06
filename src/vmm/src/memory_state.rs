@@ -413,8 +413,13 @@ impl MemoryGenerationLedger {
 
     /// Invalidates incremental capture after any uncertainty about dirty coverage.
     pub fn invalidate_dirty_coverage(&mut self) {
-        self.dirty_coverage_valid = false;
+        self.invalidate_baseline();
         self.pending = None;
+    }
+
+    /// Loses the old baseline without discarding a candidate that may still be abandoned.
+    pub fn invalidate_baseline(&mut self) {
+        self.dirty_coverage_valid = false;
     }
 
     /// Replaces the memory topology and requires the next capture to be complete.
@@ -485,6 +490,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_backend_coverage_requires_full_rebase_even_after_abandon() {
+        let mut ledger = MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1));
+        let full = ledger.plan_full_capture().unwrap();
+        let old = ledger.publish(&full).unwrap();
+        ledger.retain_dirty_coverage(old).unwrap();
+        let candidate = ledger.plan_full_capture().unwrap();
+        // A publication-time harvest or tracking transition can fail after mutating earlier slots.
+        ledger.invalidate_baseline();
+        assert!(ledger.retained_baseline().is_none());
+        ledger.abandon(&candidate).unwrap();
+        assert_eq!(
+            ledger.incremental_full_reason(old),
+            Some(FullCaptureReason::DirtyCoverageInvalidated)
+        );
+        let full = ledger.plan_full_capture().unwrap();
+        let new = ledger.publish(&full).unwrap();
+        assert!(ledger.retained_baseline().is_none());
+        ledger.retain_dirty_coverage(new).unwrap();
+        assert_eq!(ledger.incremental_full_reason(new), None);
+        assert_eq!(
+            ledger.incremental_full_reason(old),
+            Some(FullCaptureReason::StaleBaseline)
+        );
+    }
 
     fn range(start: u64, length: u64) -> GuestMemoryRange {
         GuestMemoryRange::new(start, length).unwrap()
