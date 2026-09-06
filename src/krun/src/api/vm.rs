@@ -5,7 +5,9 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(not(feature = "tee"))]
+use std::time::Duration;
+use std::time::{Instant, SystemTime};
 
 #[cfg(target_os = "linux")]
 use std::env;
