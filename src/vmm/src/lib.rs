@@ -65,7 +65,13 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_arch = "x86_64")
+))]
 use serde::{Deserialize, Serialize};
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -210,6 +216,14 @@ fn wait_for_vcpu_response(
             })
             | Ok(VcpuResponse::Resumed {
                 request_id: response_id,
+            })
+            | Ok(VcpuResponse::StateCaptured {
+                request_id: response_id,
+                ..
+            })
+            | Ok(VcpuResponse::StateRestored {
+                request_id: response_id,
+                ..
             }) if response_id < request_id => {
                 debug!(
                     "ignoring stale vCPU {vcpu_index} response {} while waiting for {}",
@@ -408,7 +422,17 @@ fn current_execution_backend_state_abi() -> u32 {
     2
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn current_execution_backend_state_abi() -> u32 {
+    // ARM64 activity state is mandatory: old artifacts cannot distinguish
+    // online CPUs from processors intentionally left startup-suspended.
+    2
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "windows", target_arch = "aarch64")
+)))]
 fn current_execution_backend_state_abi() -> u32 {
     1
 }
@@ -730,7 +754,13 @@ pub struct Vmm {
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     irqchip: IrqChip,
     #[cfg(feature = "blk")]
     quiesced_virtio_devices: BTreeSet<(u32, String)>,
@@ -743,6 +773,20 @@ pub struct Vmm {
 struct LinuxX86VmExecutionState {
     vm: Vec<u8>,
     userspace_irqchip: Option<Vec<u8>>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[derive(Serialize, Deserialize)]
+struct LinuxArmVmExecutionState {
+    vm: Vec<u8>,
+    gic: Vec<u8>,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[derive(Serialize, Deserialize)]
+struct WindowsX86VmExecutionState {
+    vm: Vec<u8>,
+    ioapic: Vec<u8>,
 }
 
 impl Vmm {
@@ -1206,6 +1250,14 @@ impl Vmm {
         }
 
         self.wait_for_vcpu_barrier(request_id, VcpuControlTarget::Paused)?;
+        #[cfg(target_os = "windows")]
+        self.vm
+            .pause_execution_time(self.vcpus_handles.len())
+            .map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        self.vm
+            .pause_execution_time(&self.vcpus_handles)
+            .map_err(Error::Vm)?;
         let generation = PauseGeneration(request_id);
         self.execution_state = VmmExecutionState::Paused(generation);
         Ok(generation)
@@ -1260,6 +1312,15 @@ impl Vmm {
 
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;
+
+        // Finish time-sensitive backend state before releasing even the first
+        // vCPU worker. A failure leaves execution indeterminate, never Running.
+        #[cfg(target_os = "windows")]
+        self.vm.resume_execution_time().map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        self.vm
+            .resume_execution_time(&self.vcpus_handles)
+            .map_err(Error::Vm)?;
 
         for handle in &self.vcpus_handles {
             handle
@@ -1331,7 +1392,52 @@ impl Vmm {
             )
             .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
         };
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        let vm_state = {
+            let mpidrs = self
+                .vcpus_handles
+                .iter()
+                .map(|handle| handle.mpidr())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Vm)?;
+            let gic = self
+                .irqchip
+                .lock()
+                .map_err(|_| {
+                    Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
+                })?
+                .capture_arm_state(&mpidrs)
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
+            let vm = self.vm.capture_execution_state().map_err(Error::Vm)?;
+            bincode::serde::encode_to_vec(
+                LinuxArmVmExecutionState { vm, gic },
+                bincode::config::standard(),
+            )
+            .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
+        };
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        let vm_state = {
+            let ioapic = self
+                .irqchip
+                .lock()
+                .map_err(|_| Error::ExecutionStateBackend("IOAPIC mutex poisoned".into()))?
+                .capture_state()
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?
+                .ok_or_else(|| Error::ExecutionStateBackend("missing WHP IOAPIC state".into()))?;
+            let vm = self.vm.capture_execution_state().map_err(Error::Vm)?;
+            bincode::serde::encode_to_vec(
+                WindowsX86VmExecutionState { vm, ioapic },
+                bincode::config::standard(),
+            )
+            .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
+        };
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_arch = "x86_64")
+        )))]
         let vm_state = self.vm.capture_execution_state().map_err(Error::Vm)?;
         ExecutionState::new(
             current_execution_architecture(),
@@ -1385,7 +1491,63 @@ impl Vmm {
                 .restore_state_before_activation(backend.userspace_irqchip.as_deref(), self.vm.fd())
                 .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            let (backend, used): (LinuxArmVmExecutionState, usize) =
+                bincode::serde::decode_from_slice(
+                    state.vm_state(),
+                    bincode::config::standard().with_limit::<{ 2 * 1024 * 1024 }>(),
+                )
+                .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?;
+            if used != state.vm_state().len() {
+                return Err(Error::ExecutionStateBackend(
+                    "trailing Linux ARM VM state".into(),
+                ));
+            }
+            self.vm
+                .restore_execution_state(&backend.vm)
+                .map_err(Error::Vm)?;
+            let mpidrs = self
+                .vcpus_handles
+                .iter()
+                .map(|handle| handle.mpidr())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Vm)?;
+            self.irqchip
+                .lock()
+                .map_err(|_| {
+                    Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
+                })?
+                .restore_arm_state(&mpidrs, &backend.gic)
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
+        }
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            let (backend, used): (WindowsX86VmExecutionState, usize) =
+                bincode::serde::decode_from_slice(
+                    state.vm_state(),
+                    bincode::config::standard().with_limit::<{ 1024 * 1024 }>(),
+                )
+                .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?;
+            if used != state.vm_state().len() {
+                return Err(Error::ExecutionStateBackend("trailing WHP VM state".into()));
+            }
+            self.vm
+                .restore_execution_state(&backend.vm)
+                .map_err(Error::Vm)?;
+            self.irqchip
+                .lock()
+                .map_err(|_| Error::ExecutionStateBackend("IOAPIC mutex poisoned".into()))?
+                .restore_state(Some(&backend.ioapic))
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_arch = "x86_64")
+        )))]
         self.vm
             .restore_execution_state(state.vm_state())
             .map_err(Error::Vm)?;
@@ -2104,6 +2266,31 @@ mod tests {
             VcpuControlTarget::Paused,
             "pause",
             0,
+            Instant::now() + Duration::from_millis(10),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resume_barrier_ignores_earlier_capture_failure() {
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        sender
+            .send(VcpuResponse::StateCaptured {
+                request_id: request_id(4),
+                result: Err("capture failed on another CPU first".into()),
+            })
+            .unwrap();
+        sender
+            .send(VcpuResponse::Resumed {
+                request_id: request_id(5),
+            })
+            .unwrap();
+        assert!(wait_for_vcpu_response(
+            &receiver,
+            request_id(5),
+            VcpuControlTarget::Resumed,
+            "resume",
+            1,
             Instant::now() + Duration::from_millis(10),
         )
         .is_ok());

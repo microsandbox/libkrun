@@ -6,6 +6,8 @@
 // found in the THIRD-PARTY file.
 
 #[cfg(target_arch = "aarch64")]
+use super::arm64_state;
+#[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use libc::{c_int, c_void, siginfo_t};
@@ -539,6 +541,8 @@ pub struct Vm {
     next_mem_slot: u32,
     memory_regions: Vec<MappedMemoryRegion>,
     dirty_tracking: bool,
+    #[cfg(target_arch = "aarch64")]
+    paused_arm_state: Option<arm64_state::PausedState>,
 
     // X86 specific fields.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -578,6 +582,8 @@ impl Vm {
             next_mem_slot: 0,
             memory_regions: Vec::new(),
             dirty_tracking: false,
+            #[cfg(target_arch = "aarch64")]
+            paused_arm_state: None,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
@@ -1080,14 +1086,47 @@ impl Vm {
         self.restore_state(&state, split_irqchip)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        let state = self
+            .paused_arm_state
+            .as_ref()
+            .ok_or_else(|| Error::StateCodec("ARM64 clock is not paused".into()))?;
+        arm64_state::encode(&state.clock)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
+        self.paused_arm_state = Some(arm64_state::PausedState {
+            clock: arm64_state::decode(bytes)?,
+            timers: Vec::new(),
+        });
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn pause_execution_time(&mut self, handles: &[VcpuHandle]) -> Result<()> {
+        self.paused_arm_state = Some(arm64_state::PausedState::capture(handles)?);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn resume_execution_time(&mut self, handles: &[VcpuHandle]) -> Result<()> {
+        if let Some(state) = &self.paused_arm_state {
+            state.resume(handles)?;
+            self.paused_arm_state = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "riscv64")]
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
         Err(Error::StateCodec(
             "execution-state capture is not qualified for this KVM architecture".to_string(),
         ))
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "riscv64")]
     pub fn restore_execution_state(&self, _bytes: &[u8]) -> Result<()> {
         Err(Error::StateCodec(
             "execution-state restore is not qualified for this KVM architecture".to_string(),
@@ -1095,12 +1134,39 @@ impl Vm {
     }
 
     /// Completes a vCPU artifact on the VMM controller thread.
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn complete_vcpu_execution_capture(&self, _id: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
         Ok(bytes)
     }
 
     /// Prepares a vCPU artifact for restoration on its owning thread.
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn prepare_vcpu_execution_restore(&self, _id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn complete_vcpu_execution_capture(&self, id: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        arm64_state::complete_capture(
+            &bytes,
+            self.paused_arm_state
+                .as_ref()
+                .ok_or_else(|| Error::StateCodec("ARM64 clock is not paused".into()))?,
+            id as usize,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn prepare_vcpu_execution_restore(&mut self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        let timer = arm64_state::stage_timer(bytes)?;
+        let paused = self
+            .paused_arm_state
+            .as_mut()
+            .ok_or_else(|| Error::StateCodec("ARM64 VM state was not restored".into()))?;
+        if id as usize != paused.timers.len() {
+            return Err(Error::StateCodec("ARM64 timer topology mismatch".into()));
+        }
+        paused.timers.push(timer);
         Ok(bytes.to_vec())
     }
 }
@@ -1585,6 +1651,8 @@ impl Vcpu {
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<(VcpuHandle, VcpuPlacementResult)> {
+        #[cfg(target_arch = "aarch64")]
+        let control = arm64_state::VcpuControl::duplicate(&self.fd)?;
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
@@ -1610,10 +1678,14 @@ impl Vcpu {
             .recv()
             .expect("Error waiting for vcpu initialization.")?;
 
-        Ok((
-            VcpuHandle::new(event_sender, response_receiver, vcpu_thread),
-            placement,
-        ))
+        let handle = VcpuHandle::new(event_sender, response_receiver, vcpu_thread);
+        #[cfg(target_arch = "aarch64")]
+        let handle = {
+            let mut handle = handle;
+            handle.arm_control = Some(control);
+            handle
+        };
+        Ok((handle, placement))
     }
 
     /// Applies the resolved affinity from within the vCPU thread itself.
@@ -1718,14 +1790,24 @@ impl Vcpu {
         self.restore_state(state)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        arm64_state::capture_cpu(&self.fd)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        arm64_state::restore_cpu(&self.fd, bytes)
+    }
+
+    #[cfg(target_arch = "riscv64")]
     fn capture_execution_state(&self) -> Result<Vec<u8>> {
         Err(Error::StateCodec(
             "execution-state capture is not qualified for this KVM architecture".to_string(),
         ))
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "riscv64")]
     fn restore_execution_state(&self, _bytes: &[u8]) -> Result<()> {
         Err(Error::StateCodec(
             "execution-state restore is not qualified for this KVM architecture".to_string(),
@@ -2434,6 +2516,8 @@ pub enum VcpuResponse {
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    #[cfg(target_arch = "aarch64")]
+    arm_control: Option<arm64_state::VcpuControl>,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
@@ -2442,6 +2526,18 @@ pub struct VcpuHandle {
 }
 
 impl VcpuHandle {
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn arm_control(&self) -> Result<&arm64_state::VcpuControl> {
+        self.arm_control
+            .as_ref()
+            .ok_or_else(|| Error::StateCodec("missing ARM64 controller descriptor".into()))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn mpidr(&self) -> Result<u64> {
+        self.arm_control()?.read(arm64_state::MPIDR)
+    }
+
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
@@ -2451,6 +2547,8 @@ impl VcpuHandle {
             event_sender,
             response_receiver,
             vcpu_thread: Some(vcpu_thread),
+            #[cfg(target_arch = "aarch64")]
+            arm_control: None,
         }
     }
 

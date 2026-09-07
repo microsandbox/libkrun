@@ -69,13 +69,7 @@ impl KvmGicV3 {
         };
         device_fd.set_device_attr(&attr)?;
 
-        let attr = kvm_bindings::kvm_device_attr {
-            group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
-            attr: u64::from(kvm_bindings::KVM_DEV_ARM_VGIC_CTRL_INIT),
-            addr: 0,
-            flags: 0,
-        };
-        device_fd.set_device_attr(&attr)?;
+        super::kvmgic_state::initialize(&device_fd)?;
 
         Ok(Self {
             _device_fd: device_fd,
@@ -86,6 +80,14 @@ impl KvmGicV3 {
 }
 
 impl IrqChipT for KvmGicV3 {
+    fn capture_arm_state(&self, mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
+        super::kvmgic_state::capture(&self._device_fd, 3, mpidrs)
+    }
+
+    fn restore_arm_state(&mut self, mpidrs: &[u64], bytes: &[u8]) -> Result<(), DeviceError> {
+        super::kvmgic_state::restore(&self._device_fd, 3, mpidrs, bytes)
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         0
     }

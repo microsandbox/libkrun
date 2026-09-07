@@ -1025,6 +1025,53 @@ impl devices::legacy::gic::GICDevice for WhpIrqChip {
 
 #[cfg(target_os = "windows")]
 impl IrqChipT for WhpIrqChip {
+    #[cfg(target_arch = "x86_64")]
+    fn capture_state(&self) -> std::result::Result<Option<Vec<u8>>, devices::Error> {
+        let state = self
+            .ioapic
+            .lock()
+            .map_err(|_| devices::Error::IoError(io::Error::other("IOAPIC mutex poisoned")))?;
+        let bytes = bincode::serde::encode_to_vec(
+            (
+                state.id,
+                state.ioregsel,
+                state.ioredtbl.to_vec(),
+                state.version,
+            ),
+            bincode::config::standard(),
+        )
+        .map_err(|error| devices::Error::IoError(io::Error::other(error.to_string())))?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn restore_state(&mut self, bytes: Option<&[u8]>) -> std::result::Result<(), devices::Error> {
+        let invalid = |message: String| {
+            devices::Error::IoError(io::Error::new(io::ErrorKind::InvalidData, message))
+        };
+        let bytes = bytes.ok_or_else(|| invalid("missing WHP IOAPIC state".into()))?;
+        let ((id, ioregsel, entries, version), used): ((u8, u8, Vec<u64>, u8), usize) =
+            bincode::serde::decode_from_slice(
+                bytes,
+                bincode::config::standard().with_limit::<4096>(),
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        if used != bytes.len()
+            || entries.len() != X86_IOAPIC_NUM_PINS
+            || version != X86_IOAPIC_VERSION
+        {
+            return Err(invalid("WHP IOAPIC state layout mismatch".into()));
+        }
+        let mut state = self
+            .ioapic
+            .lock()
+            .map_err(|_| invalid("IOAPIC mutex poisoned".into()))?;
+        state.id = id;
+        state.ioregsel = ioregsel;
+        state.ioredtbl.copy_from_slice(&entries);
+        Ok(())
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1679,8 +1726,8 @@ pub fn build_microvm_paused(
             let vcpu_count = vcpu_config.max_vcpu_count as u64;
             let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
                 Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
-                Err(_) => {
-                    warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
+                Err(error) => {
+                    warn!("KVM GICv3 creation failed ({error}), falling back to KVM GICv2");
                     IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), vcpu_count)))
                 }
             };
@@ -1789,7 +1836,13 @@ pub fn build_microvm_paused(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
         irqchip: intc.clone(),
         #[cfg(feature = "blk")]
         quiesced_virtio_devices: Default::default(),
@@ -4028,8 +4081,7 @@ fn create_vcpus_windows(
     // One router shared by all vCPU threads: INIT/SIPI writes trap on the
     // sending vCPU and are applied to the parked target APs through it.
     #[cfg(target_arch = "x86_64")]
-    let sipi_router =
-        std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(create_count));
+    let sipi_router = vm.sipi_router();
     for cpu_index in 0..create_count {
         let mut vcpu = vm
             .create_vcpu(
@@ -5137,6 +5189,28 @@ pub mod tests {
 
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_ioapic_state_round_trip_and_reject_trailing_bytes() {
+        // This only accesses userspace routing state; no WHP call uses the
+        // null partition. It can run on Windows ARM's x86 emulation as well.
+        let source = WhpIrqChip::new(0, 2);
+        {
+            let mut state = source.ioapic.lock().unwrap();
+            state.id = 3;
+            state.ioregsel = 0x8f;
+            state.ioredtbl[63] = (1_u64 << 56) | 0x45;
+        }
+        let bytes = source.capture_state().unwrap().unwrap();
+        let mut destination = WhpIrqChip::new(0, 2);
+        destination.restore_state(Some(&bytes)).unwrap();
+        assert_eq!(destination.capture_state().unwrap().unwrap(), bytes);
+        let mut invalid = bytes;
+        invalid.push(0);
+        assert!(destination.restore_state(Some(&invalid)).is_err());
+        assert!(destination.restore_state(None).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     fn windows_ioapic_programs_its_last_pin() {
         let mut ioapic = WhpIoApicState::new();
 
@@ -5256,8 +5330,8 @@ pub mod tests {
     fn test_create_vcpus_aarch64() {
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false, vcpu_config.vcpu_count).unwrap();
         let vcpu_count = 2;
+        let vm = setup_vm(&guest_memory, false, vcpu_count).unwrap();
 
         let vcpu_config = VcpuConfig {
             vcpu_count,
