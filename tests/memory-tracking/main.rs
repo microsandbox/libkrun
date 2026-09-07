@@ -189,6 +189,26 @@ fn main() -> Result<()> {
             let pause = control.pause()?;
             let pause_ms = begin.elapsed().as_secs_f64() * 1000.;
             if let Ok(path) = std::env::var("PR121_FAULT_FILE") {
+                #[cfg(feature = "devices")]
+                for (kind, id) in control.virtio_device_inventory()? {
+                    if control.virtio_device_supports_quiesce(kind, &id)? {
+                        match control.capture_virtio_device_state(kind, &id) {
+                            Ok(_) => {}
+                            // The minimal built-in rootfs can quiesce but cannot serialize handles.
+                            // Its failed capture still registers it for resume; exercise that path.
+                            Err(error)
+                                if kind == 26
+                                    && error.to_string().contains(
+                                        "filesystem backend does not support durable state",
+                                    ) =>
+                            {
+                                println!("filesystem_capture=unsupported_after_quiesce");
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        println!("quiesced_device={id} type={kind}");
+                    }
+                }
                 fs::write(&path, b"armed")?;
                 let recovery_started = Instant::now();
                 let failed = if std::env::var("PR121_FAULT_KIND").as_deref() == Ok("disable") {

@@ -86,6 +86,10 @@ Linux `cargo clippy -p msb_krun -- -D warnings`, and the same command with `--fe
 
 ## Follow-up: partial-disable and initial-arm faults
 
+For integrated device/memory recovery, build with `--features bitmap,devices`. The harness quiesces supported devices before injecting the memory error, so resume must reconcile mappings before reopening console, filesystem, VM-generation, and metrics workers. The minimal filesystem's known durable-state serialization error is accepted only after it has been quiesced; all other capture errors fail the test. This validates recovery from that failed capture, not durable filesystem serialization.
+
+The integrated ordering passed seven local macOS/HVF live runs (one initial two-vCPU run, then three repetitions each with one/two vCPUs), comparing 65,536 pages with zero mismatches after fault recovery. `cargo clippy -p msb_krun --features blk --offline -- -D warnings` passed. Integrated Linux/Windows runs remain pending source-transfer approval; earlier #121-only tests are not substitutes for this combined device-worker path.
+
 The previously outstanding Linux disable and Windows mapping-transition tests have now been run live. Production source remains unchanged by this follow-up; Windows fault instrumentation is supplied as an inert patch to apply only to an isolated test copy.
 
 | Live case | Runs | Result |

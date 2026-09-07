@@ -652,6 +652,7 @@ impl ApStartupRouter {
                 }
             }
             match event_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(VcpuEvent::Terminate) => return Err(()),
                 Ok(VcpuEvent::Pause { request_id }) => {
                     let _ = response_sender.send(VcpuResponse::Paused { request_id });
                     if wait_until_resumed(partition_handle, id, event_receiver, response_sender)
@@ -685,6 +686,7 @@ impl ApStartupRouter {
 #[allow(unused)]
 #[derive(Debug)]
 pub enum VcpuEvent {
+    Terminate,
     Pause {
         request_id: VcpuControlRequestId,
     },
@@ -1493,7 +1495,7 @@ impl VcpuHandle {
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        let should_cancel = matches!(event, VcpuEvent::Pause { .. });
+        let should_cancel = matches!(event, VcpuEvent::Pause { .. } | VcpuEvent::Terminate);
         self.event_sender
             .as_ref()
             .expect("vCPU event sender missing before handle drop")
@@ -1517,13 +1519,15 @@ impl VcpuHandle {
 impl Drop for VcpuHandle {
     fn drop(&mut self) {
         if self.partition_handle != 0 {
+            // Failed construction or restore can leave this thread either waiting at the initial
+            // pause boundary or executing WHvRunVirtualProcessor. Terminate is not a guest exit;
+            // cancellation only wakes the running case so it can consume the command.
+            if let Some(sender) = self.event_sender.as_ref() {
+                let _ = sender.send(VcpuEvent::Terminate);
+            }
             if let Err(err) = cancel_run_virtual_processor(self.partition_handle, self.id) {
                 error!("{err}");
             }
-            // Disconnect the control channel and wait for the vCPU loop to observe cancellation
-            // before deleting its WHP processor. This is required when a later vCPU fails the
-            // startup placement barrier and already-created processors unwind.
-            self.event_sender.take();
             if let Some(thread) = self.vcpu_thread.take() {
                 let _ = thread.join();
             }
@@ -2524,6 +2528,7 @@ fn run_vcpu(
     let mut exit_context = WHV_RUN_VP_EXIT_CONTEXT::default();
     loop {
         match event_receiver.try_recv() {
+            Ok(VcpuEvent::Terminate) => return,
             Ok(VcpuEvent::Pause { request_id }) => {
                 let _ = response_sender.send(VcpuResponse::Paused { request_id });
                 if wait_until_resumed(partition_handle, id, &event_receiver, &response_sender)
@@ -3164,6 +3169,7 @@ fn wait_until_resumed(
 ) -> result::Result<(), ()> {
     loop {
         match event_receiver.recv() {
+            Ok(VcpuEvent::Terminate) => return Err(()),
             Ok(VcpuEvent::Resume { request_id }) => {
                 let _ = response_sender.send(VcpuResponse::Resumed { request_id });
                 return Ok(());
