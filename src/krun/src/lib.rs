@@ -66,8 +66,16 @@ pub use api::metrics::{
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use api::vm::{
-    VmControl, VmCpuState, VmGenerationId, VmGenerationRequest, VmGenerationState,
-    VmGenerationWaitOutcome, VmMemoryState,
+    VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
+    VmMemoryState, VmPauseGeneration,
+};
+#[cfg(not(feature = "tee"))]
+pub use api::{
+    ExecutionArchitecture, ExecutionBackend, ExecutionState, FullCaptureReason, GuestMemoryRange,
+    IncrementalCaptureDecision, MemoryBaselineToken, MemoryCaptureKind, MemoryCaptureOptions,
+    MemoryCapturePlan, MemoryCaptureSink, MemoryCaptureStats, MemoryGeneration,
+    MemoryTopologyGeneration, VcpuExecutionState,
 };
 #[cfg(feature = "net")]
 pub use devices::virtio::net::rate_limit::{

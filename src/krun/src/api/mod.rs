@@ -64,6 +64,17 @@ pub use metrics::{
 pub use vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use vm::{
-    VmControl, VmCpuState, VmGenerationId, VmGenerationRequest, VmGenerationState,
-    VmGenerationWaitOutcome, VmMemoryState,
+    VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
+    VmMemoryState, VmPauseGeneration,
+};
+#[cfg(not(feature = "tee"))]
+pub use vmm::execution_state::{
+    ExecutionArchitecture, ExecutionBackend, ExecutionState, VcpuExecutionState,
+};
+#[cfg(not(feature = "tee"))]
+pub use vmm::memory_state::{
+    FullCaptureReason, GuestMemoryRange, IncrementalCaptureDecision, MemoryBaselineToken,
+    MemoryCaptureKind, MemoryCaptureOptions, MemoryCapturePlan, MemoryCaptureSink,
+    MemoryCaptureStats, MemoryGeneration, MemoryTopologyGeneration,
 };
