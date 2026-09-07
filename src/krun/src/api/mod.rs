@@ -86,3 +86,5 @@ pub use vmm::memory_state::{
     MemoryCaptureKind, MemoryCaptureOptions, MemoryCapturePlan, MemoryCaptureSink,
     MemoryCaptureStats, MemoryGeneration, MemoryTopologyGeneration,
 };
+#[cfg(not(feature = "tee"))]
+pub use vmm::private_memory::{PrivateMemoryBacking, PrivateMemoryRegion};

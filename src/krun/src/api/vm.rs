@@ -375,6 +375,17 @@ impl Vm {
         self.memory_restore = Some(Box::new(source));
     }
 
+    /// Supply an immutable private file mapping instead of streaming memory into anonymous RAM.
+    /// Execution restore must also be supplied. The caller owns file immutability, and unsupported
+    /// placement/discard combinations fail before activation rather than selecting eager memory.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_private_memory_backing(
+        &mut self,
+        backing: vmm::private_memory::PrivateMemoryBacking,
+    ) {
+        self.vmr.private_memory_backing = Some(backing);
+    }
+
     /// Supplies one destination-recreated virtio device state for construction-only restore.
     ///
     /// Device restores run after memory and execution reconstruction but before the first guest
@@ -463,6 +474,14 @@ impl Vm {
     ///
     /// Only returns `Err` if something fails before the VMM takes over.
     pub fn enter(mut self) -> Result<Infallible> {
+        #[cfg(not(feature = "tee"))]
+        if self.vmr.private_memory_backing.is_some()
+            && (self.memory_restore.is_some() || self.execution_restore.is_none())
+        {
+            return Err(Error::Build(BuildError::Start(
+                "private memory backing requires execution restore and excludes an eager memory source".into(),
+            )));
+        }
         let mut trace = BootTrace::new("api");
         trace.mark("enter.start");
 
@@ -1725,6 +1744,28 @@ impl VmControl {
     ) -> Option<VmGenerationRequest> {
         let generation = self.generation.as_ref()?;
         let sequence = generation.lock().unwrap().install_with_clock(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Whether the bound guest kernel supports wall-clock correction without clone semantics.
+    pub fn clock_sync_supported(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_some_and(|generation| generation.lock().unwrap().clock_only_supported())
+    }
+
+    /// Request wall-clock correction for ordinary pause/resume without rotating VM identity.
+    ///
+    /// Resume vCPUs to let the kernel process this request, then wait through
+    /// [`Self::wait_vm_generation_processed`] before thawing user workloads. `None` means the
+    /// guest lacks the capability, an identity activation is pending, or requests are exhausted.
+    pub fn request_clock_sync(&self) -> Option<VmGenerationRequest> {
+        let (sequence, id) = self
+            .generation
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .request_clock_sync()?;
         Some(VmGenerationRequest { sequence, id })
     }
 

@@ -43,6 +43,7 @@ mod macos;
 /// Backend-neutral memory generation and incremental-baseline contracts.
 pub mod memory_state;
 mod metrics;
+pub mod private_memory;
 #[cfg(unix)]
 mod terminal;
 #[cfg(target_os = "windows")]

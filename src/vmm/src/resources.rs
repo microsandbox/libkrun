@@ -290,6 +290,9 @@ pub enum MemoryPlacementResult {
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 pub struct VmResources {
+    /// Complete immutable private memory image installed before guest activation.
+    #[cfg(not(feature = "tee"))]
+    pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// Resolved host logical processor for every possible vCPU thread.
@@ -392,6 +395,8 @@ pub struct VmResources {
 impl Default for VmResources {
     fn default() -> Self {
         Self {
+            #[cfg(not(feature = "tee"))]
+            private_memory_backing: None,
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,

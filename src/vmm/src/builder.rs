@@ -146,6 +146,8 @@ use vm_memory::mmap::MmapRegion;
 use vm_memory::Address;
 use vm_memory::Bytes;
 use vm_memory::GuestMemoryBackend;
+#[cfg(not(feature = "tee"))]
+use vm_memory::GuestMemoryRegion;
 #[cfg(all(
     not(feature = "tee"),
     any(
@@ -166,6 +168,8 @@ static EDK2_BINARY: &[u8] = include_bytes!("../KRUN_EFI.silent.fd");
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// Invalid or unsupported private guest-memory backing.
+    PrivateMemoryBacking(io::Error),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     #[cfg(target_os = "macos")]
@@ -416,6 +420,9 @@ impl Display for StartMicrovmError {
                 let mut err_msg = format!("{err:?}");
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
+            }
+            PrivateMemoryBacking(ref err) => {
+                write!(f, "Cannot install private memory backing: {err}")
             }
             HostMemoryPolicy(ref err) => {
                 write!(f, "Cannot apply host memory policy: {err}")
@@ -1574,6 +1581,8 @@ pub fn build_microvm_paused(
         )?;
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+        #[cfg(not(feature = "tee"))]
+        let kernel_boot = kernel_boot && vm_resources.private_memory_backing.is_none();
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -1987,16 +1996,26 @@ pub fn build_microvm_paused(
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
+    #[cfg(not(feature = "tee"))]
+    let configure_boot_memory = vm_resources.private_memory_backing.is_none();
+    #[cfg(feature = "tee")]
+    let configure_boot_memory = true;
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
+    if configure_boot_memory {
+        load_cmdline(&vmm)?;
+    }
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+    // Restored RAM already includes the captured command line, page tables and FDT. Writing new
+    // boot metadata here both corrupts that state and needlessly privatizes clean backing pages.
+    if configure_boot_memory {
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
     trace.mark("system.configured");
 
     #[cfg(feature = "tee")]
@@ -2677,6 +2696,20 @@ fn create_guest_memory_with_placement(
     // higher-level `msb_krun` builder having validated this placement contract.
     validate_vmm_numa_topology(vm_resources, mem_size)?;
 
+    #[cfg(not(feature = "tee"))]
+    if vm_resources.private_memory_backing.is_some()
+        && (vm_resources.numa_topology.is_some()
+            || vm_resources.enable_balloon
+            || vm_resources.mem_device.is_some())
+    {
+        // These combinations require backing-aware discard/placement before they can be exposed.
+        // Never allow legacy MADV_DONTNEED to resurrect bytes from an immutable RAM image.
+        return Err(StartMicrovmError::PrivateMemoryBacking(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private memory with NUMA placement, balloon or virtio-mem requires backing-aware support",
+        )));
+    }
+
     let mem_size = mem_size << 20;
 
     #[cfg(not(feature = "efi"))]
@@ -2844,6 +2877,21 @@ fn create_guest_memory_with_placement(
                 .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
         }
     }
+
+    // Payload preparation above resolves the exact kernel/firmware topology using bounded boot
+    // writes, not a full memory restore. Replace it before hypervisor registration or device use.
+    #[cfg(not(feature = "tee"))]
+    let guest_mem = if let Some(backing) = &vm_resources.private_memory_backing {
+        let expected = guest_mem
+            .iter()
+            .map(|region| (region.start_addr(), region.len() as usize))
+            .collect::<Vec<_>>();
+        backing
+            .map(&expected)
+            .map_err(StartMicrovmError::PrivateMemoryBacking)?
+    } else {
+        guest_mem
+    };
 
     crate::metrics::install_host_resident_memory_sampler(
         &vm_resources.metrics,
