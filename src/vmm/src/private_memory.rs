@@ -37,6 +37,41 @@ pub struct PrivateMemoryBacking {
 //--------------------------------------------------------------------------------------------------
 
 impl PrivateMemoryBacking {
+    /// Construct an unlinked, immutable sparse zero base for a fresh private-memory VM.
+    /// Boot writes fault into private pages; the zero file itself is never modified afterward.
+    pub(crate) fn zeroed(ranges: &[(GuestAddress, usize)]) -> io::Result<Self> {
+        #[cfg(not(unix))]
+        {
+            let _ = ranges;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "private boot memory is not qualified on this backend",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let mut offset = 0u64;
+            let mut regions = Vec::with_capacity(ranges.len());
+            for &(address, length) in ranges {
+                regions.push(PrivateMemoryRegion {
+                    guest_address: address.0,
+                    length: length as u64,
+                    file_offset: offset,
+                });
+                offset = offset
+                    .checked_add(length as u64)
+                    .ok_or_else(|| invalid("zero memory size overflows"))?;
+            }
+            let (fd, path) = nix::unistd::mkstemp(&std::env::temp_dir().join("krun-zero-XXXXXX"))?;
+            let writer = File::from(fd);
+            let opened = File::open(&path);
+            // Unlink before operations that can fail; descriptor ownership handles all later cleanup.
+            std::fs::remove_file(&path)?;
+            writer.set_len(offset)?;
+            Self::new(opened?, regions)
+        }
+    }
+
     /// Bind a read-only complete memory image to its exact guest RAM topology.
     ///
     /// This represents restored memory, not a mutable file-backed boot allocation. The VMM must
@@ -217,6 +252,22 @@ mod tests {
             file_offset: page as u64,
         }];
         (file, readonly, regions)
+    }
+
+    #[test]
+    fn fresh_zero_backing_is_sparse_unlinked_and_private() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let ranges = [(GuestAddress(0x80000000), page * 8)];
+        let backing = PrivateMemoryBacking::zeroed(&ranges).unwrap();
+        assert_eq!(backing.file.metadata().unwrap().nlink(), 0);
+        assert_eq!(backing.file.metadata().unwrap().blocks(), 0);
+        let memory = backing.map(&ranges).unwrap();
+        memory.write_obj(0x7fu8, ranges[0].0).unwrap();
+        let mut original = [1u8];
+        backing.file.read_exact_at(&mut original, 0).unwrap();
+        assert_eq!(original, [0]);
+        assert_eq!(memory.read_obj::<u8>(ranges[0].0).unwrap(), 0x7f);
     }
 
     #[test]

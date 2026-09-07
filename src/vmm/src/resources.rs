@@ -293,6 +293,9 @@ pub struct VmResources {
     /// Complete immutable private memory image installed before guest activation.
     #[cfg(not(feature = "tee"))]
     pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
+    /// Construct fresh RAM from private immutable zero backing before loading boot payloads.
+    #[cfg(not(feature = "tee"))]
+    pub private_memory_boot: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// Resolved host logical processor for every possible vCPU thread.
@@ -397,6 +400,8 @@ impl Default for VmResources {
         Self {
             #[cfg(not(feature = "tee"))]
             private_memory_backing: None,
+            #[cfg(not(feature = "tee"))]
+            private_memory_boot: false,
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,

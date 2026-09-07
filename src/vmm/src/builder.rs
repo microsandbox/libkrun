@@ -2532,9 +2532,35 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = unsafe {
-                MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                    .map_err(StartMicrovmError::InvalidKernelBundle)?
+            let kernel_region = if _vm_resources.private_memory_boot {
+                let ranges = [(GuestAddress(kernel_guest_addr), kernel_size)];
+                let backing = crate::private_memory::PrivateMemoryBacking::zeroed(&ranges)
+                    .map_err(StartMicrovmError::PrivateMemoryBacking)?;
+                let memory = backing
+                    .map(&ranges)
+                    .map_err(StartMicrovmError::PrivateMemoryBacking)?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(kernel_host_addr as *const u8, kernel_size)
+                };
+                memory
+                    .write_slice(bytes, GuestAddress(kernel_guest_addr))
+                    .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+                let (_, region) = memory
+                    .remove_region(GuestAddress(kernel_guest_addr), kernel_size as u64)
+                    .map_err(StartMicrovmError::GuestMemoryRegionCollection)?;
+                return Ok((
+                    guest_mem
+                        .insert_region(region)
+                        .map_err(StartMicrovmError::GuestMemoryRegionCollection)?,
+                    GuestAddress(kernel_entry_addr),
+                    None,
+                    None,
+                ));
+            } else {
+                unsafe {
+                    MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
+                        .map_err(StartMicrovmError::InvalidKernelBundle)?
+                }
             };
 
             Ok((
@@ -2697,16 +2723,14 @@ fn create_guest_memory_with_placement(
     validate_vmm_numa_topology(vm_resources, mem_size)?;
 
     #[cfg(not(feature = "tee"))]
-    if vm_resources.private_memory_backing.is_some()
-        && (vm_resources.numa_topology.is_some()
-            || vm_resources.enable_balloon
-            || vm_resources.mem_device.is_some())
+    if (vm_resources.private_memory_backing.is_some() || vm_resources.private_memory_boot)
+        && vm_resources.numa_topology.is_some()
     {
         // These combinations require backing-aware discard/placement before they can be exposed.
         // Never allow legacy MADV_DONTNEED to resurrect bytes from an immutable RAM image.
         return Err(StartMicrovmError::PrivateMemoryBacking(io::Error::new(
             io::ErrorKind::Unsupported,
-            "private memory with NUMA placement, balloon or virtio-mem requires backing-aware support",
+            "private memory with NUMA placement requires backing-aware placement support",
         )));
     }
 
@@ -2864,6 +2888,15 @@ fn create_guest_memory_with_placement(
             .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?,
         MemoryPlacementState::inherited(),
     );
+
+    #[cfg(not(feature = "tee"))]
+    let guest_mem = if vm_resources.private_memory_boot {
+        crate::private_memory::PrivateMemoryBacking::zeroed(&arch_mem_regions)
+            .and_then(|backing| backing.map(&arch_mem_regions))
+            .map_err(StartMicrovmError::PrivateMemoryBacking)?
+    } else {
+        guest_mem
+    };
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;

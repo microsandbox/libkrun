@@ -386,6 +386,12 @@ impl Vm {
         self.vmr.private_memory_backing = Some(backing);
     }
 
+    /// Use private sparse zero backing for a fresh boot; this does not create a checkpoint.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_private_memory_boot(&mut self, enabled: bool) {
+        self.vmr.private_memory_boot = enabled;
+    }
+
     /// Supplies one destination-recreated virtio device state for construction-only restore.
     ///
     /// Device restores run after memory and execution reconstruction but before the first guest
@@ -474,6 +480,16 @@ impl Vm {
     ///
     /// Only returns `Err` if something fails before the VMM takes over.
     pub fn enter(mut self) -> Result<Infallible> {
+        #[cfg(not(feature = "tee"))]
+        if self.vmr.private_memory_boot
+            && (self.vmr.private_memory_backing.is_some()
+                || self.memory_restore.is_some()
+                || self.execution_restore.is_some())
+        {
+            return Err(Error::Build(BuildError::Start(
+                "private zero boot excludes restored memory and execution state".into(),
+            )));
+        }
         #[cfg(not(feature = "tee"))]
         if self.vmr.private_memory_backing.is_some()
             && (self.memory_restore.is_some() || self.execution_restore.is_none())
