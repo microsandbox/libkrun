@@ -1626,6 +1626,14 @@ impl VmControl {
         self.with_running_vmm(|vmm| vmm.replace_block_backend(device_id, backend))
     }
 
+    /// Grows an exclusively owned writable block device at a paused queue boundary.
+    /// The image and virtio capacity change; guest filesystem expansion remains the caller's job.
+    /// Persist recovery intent first and recover forward if this returns an I/O error.
+    #[cfg(feature = "blk")]
+    pub fn grow_block_capacity(&self, device_id: &str, size_bytes: u64) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.grow_block_capacity(device_id, size_bytes))
+    }
+
     /// Plans a complete memory generation while the VM is paused.
     pub fn plan_full_memory_capture(&self) -> Result<vmm::memory_state::MemoryCapturePlan> {
         self.with_running_vmm(vmm::Vmm::plan_full_memory_capture)

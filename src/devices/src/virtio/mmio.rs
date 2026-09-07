@@ -280,6 +280,12 @@ impl MmioTransport {
         self.interrupt.event()
     }
 
+    /// Publishes a device-configuration change, including updates made while quiesced.
+    pub fn notify_config_change(&mut self) -> Result<(), crate::Error> {
+        self.config_generation = self.config_generation.wrapping_add(1);
+        self.interrupt.try_signal_config_change()
+    }
+
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
         self.device.lock().expect("Poisoned device lock")
     }

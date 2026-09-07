@@ -1125,6 +1125,38 @@ impl Block {
         Ok(())
     }
 
+    /// Grows the active image at a drained queue boundary, preserving its backing chain.
+    /// The caller must publish its recovery intent before calling: an I/O failure may occur
+    /// after image metadata has grown, so rollback by truncation is never safe.
+    pub fn grow_capacity(&mut self, size_bytes: u64) -> Result<(), VirtioStateError> {
+        if self.worker_thread.is_some() || self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "block growth requires quiescence",
+            ));
+        }
+        if self.is_read_only()
+            || !size_bytes.is_multiple_of(SECTOR_SIZE)
+            || size_bytes / SECTOR_SIZE < self.config.capacity
+        {
+            return Err(VirtioStateError::Incompatible(
+                "block growth requires a writable device and an aligned nondecreasing size".into(),
+            ));
+        }
+        {
+            let image = self.disk_image.lock().unwrap();
+            image.resize_grow(size_bytes, imago::format::PreallocateMode::None)?;
+            image.flush()?;
+            image.sync()?;
+        }
+        // Keep the drained DiskProperties (including writeback state and Windows handles).
+        // Only the bounds change; rebuilding it would discard policy/accounting state.
+        if let Some(disk) = self.disk.as_mut() {
+            disk.nsectors = size_bytes / SECTOR_SIZE;
+        }
+        self.config.capacity = size_bytes / SECTOR_SIZE;
+        Ok(())
+    }
+
     fn padded_disk_image_id(id: &str) -> Vec<u8> {
         let mut padded = vec![0u8; VIRTIO_BLK_ID_BYTES as usize];
         let bytes = id.as_bytes();
@@ -1531,6 +1563,56 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("VMDK write support"));
+    }
+
+    #[test]
+    fn drained_raw_growth_preserves_data_and_updates_request_bounds() {
+        let image = temp_image_path("capacity-growth");
+        let mut file = File::create(&image).unwrap();
+        file.write_all(&[0x5a; 512]).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "grow".into(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("grow".into()),
+        )
+        .unwrap();
+        assert!(block.grow_capacity(1000).is_err());
+        assert!(block.grow_capacity(512).is_err());
+        block.grow_capacity(2 * 1024 * 1024).unwrap();
+        block.grow_capacity(2 * 1024 * 1024).unwrap();
+        let capacity = block.config.capacity;
+        assert_eq!(capacity, 4096);
+        assert_eq!(block.disk.as_ref().unwrap().nsectors, 4096);
+        let mut data = [0u8; 512];
+        let disk = block.disk_image.lock().unwrap();
+        disk.read(&mut data[..], 0).unwrap();
+        assert_eq!(data, [0x5a; 512]);
+        disk.read(&mut data[..], 2 * 1024 * 1024 - 512).unwrap();
+        assert_eq!(data, [0; 512]);
+        drop(disk);
+        drop(block);
+        let mut readonly = Block::new(
+            "readonly".into(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            true,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("readonly".into()),
+        )
+        .unwrap();
+        assert!(readonly.grow_capacity(3 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 2 * 1024 * 1024);
     }
 
     #[test]
