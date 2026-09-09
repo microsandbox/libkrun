@@ -23,7 +23,9 @@ const CONFIG_WORD_SIZE: usize = 4;
 const DRIVER_STATUS_READY: u32 = 1;
 const DRIVER_STATUS_ERROR: u32 = 2;
 const DRIVER_STATUS_CLOCK: u32 = 4;
+const DRIVER_STATUS_CLOCK_ONLY: u32 = 8;
 const REQUEST_SYNC_CLOCK: u32 = 1;
+const REQUEST_CLOCK_ONLY: u32 = 2;
 const CONFIG_CLOCK_LOW_OFFSET: u64 = 60;
 const GENERATION_STATE_MAGIC: &[u8; 8] = b"MSBVGID\0";
 const GENERATION_STATE_SCHEMA: u16 = 1;
@@ -192,6 +194,37 @@ impl Generation {
         self.install_request(id, REQUEST_SYNC_CLOCK)
     }
 
+    /// Whether this guest can correct time without generating a clone notification.
+    pub fn clock_only_supported(&self) -> bool {
+        let required = DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK | DRIVER_STATUS_CLOCK_ONLY;
+        self.config.driver_status & required == required
+            && self.config.driver_status & DRIVER_STATUS_ERROR == 0
+    }
+
+    /// Request a same-VM wall-clock correction, retaining the installed identity.
+    ///
+    /// An unfinished clock request is retryable; an unfinished identity activation is not
+    /// superseded. A completed correction gets a fresh sequence on the next pause/resume.
+    pub fn request_clock_sync(&mut self) -> Option<(u64, GenerationId)> {
+        if !self.clock_only_supported() {
+            return None;
+        }
+        let state = self.state_snapshot();
+        let flags = REQUEST_SYNC_CLOCK | REQUEST_CLOCK_ONLY;
+        if state.request_sequence != state.processed_sequence
+            || state.requested_id != state.processed_id
+        {
+            return if self.config.request_flags == flags {
+                self.install_request(state.requested_id, flags)
+                    .map(|sequence| (sequence, state.requested_id))
+            } else {
+                None
+            };
+        }
+        self.publish_request(state.requested_id, flags)
+            .map(|sequence| (sequence, state.requested_id))
+    }
+
     fn install_request(&mut self, id: GenerationId, flags: u32) -> Option<u64> {
         // A retry of one restore attempt reuses both its persisted identifier and its device-local
         // sequence. Re-signal it instead of manufacturing a second logical request or reseeding
@@ -206,6 +239,10 @@ impl Generation {
             return Some(self.request_sequence());
         }
 
+        self.publish_request(id, flags)
+    }
+
+    fn publish_request(&mut self, id: GenerationId, flags: u32) -> Option<u64> {
         let sequence = self.request_sequence().checked_add(1)?;
         let [low, high] = split_sequence(sequence);
         self.config.generation_id = id_to_words(id);
@@ -548,13 +585,22 @@ fn decode_generation_state(state: &[u8]) -> Result<VirtioGenerationConfig, Virti
             words[0]
         )));
     }
-    if words[1] & !(DRIVER_STATUS_READY | DRIVER_STATUS_ERROR | DRIVER_STATUS_CLOCK) != 0 {
+    if words[1]
+        & !(DRIVER_STATUS_READY
+            | DRIVER_STATUS_ERROR
+            | DRIVER_STATUS_CLOCK
+            | DRIVER_STATUS_CLOCK_ONLY)
+        != 0
+    {
         return Err(VirtioStateError::Incompatible(format!(
             "invalid msb-vmgenid driver status {:#x}",
             words[1]
         )));
     }
-    if words[14] & !REQUEST_SYNC_CLOCK != 0 || words[15] != 0 || words[16] != 0 {
+    if words[14] & !(REQUEST_SYNC_CLOCK | REQUEST_CLOCK_ONLY) != 0
+        || words[15] != 0
+        || words[16] != 0
+    {
         return Err(VirtioStateError::Incompatible(
             "invalid msb-vmgenid clock state".into(),
         ));
@@ -607,6 +653,53 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn clock_only_retains_identity_retries_pending_and_advances_after_ack() {
+        let mut device = Generation::new().unwrap();
+        device.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &(DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK).to_le_bytes(),
+        );
+        assert!(device.request_clock_sync().is_none());
+        device.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &(DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK | DRIVER_STATUS_CLOCK_ONLY).to_le_bytes(),
+        );
+        let activation = device.install_with_clock(id(8)).unwrap();
+        assert!(device.request_clock_sync().is_none());
+        acknowledge(&mut device, activation, id(8));
+        let first = device.request_clock_sync().unwrap();
+        assert_eq!(first, (activation + 1, id(8)));
+        assert_eq!(device.request_clock_sync(), Some(first));
+        acknowledge(&mut device, first.0, first.1);
+        let second = device.request_clock_sync().unwrap();
+        assert_eq!(second, (first.0 + 1, first.1));
+        assert_eq!(
+            device.config.request_flags,
+            REQUEST_SYNC_CLOCK | REQUEST_CLOCK_ONLY
+        );
+    }
+
+    #[test]
+    fn clock_only_works_before_any_clone_and_refuses_error_or_sequence_exhaustion() {
+        let mut device = Generation::new().unwrap();
+        device.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &(DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK | DRIVER_STATUS_CLOCK_ONLY).to_le_bytes(),
+        );
+        assert_eq!(
+            device.request_clock_sync(),
+            Some((1, GenerationId::default()))
+        );
+        acknowledge(&mut device, 1, GenerationId::default());
+        device.config.request_sequence_low = u32::MAX;
+        device.config.request_sequence_high = u32::MAX;
+        acknowledge(&mut device, u64::MAX, GenerationId::default());
+        assert!(device.request_clock_sync().is_none());
+        device.config.driver_status |= DRIVER_STATUS_ERROR;
+        assert!(!device.clock_only_supported());
+    }
 
     #[test]
     fn clock_activation_requires_capability_and_waits_for_kernel_completion() {
@@ -830,7 +923,7 @@ mod tests {
         let driver_status_offset =
             GENERATION_STATE_MAGIC.len() + std::mem::size_of::<u16>() + CONFIG_WORD_SIZE;
         unknown_driver_status[driver_status_offset..driver_status_offset + CONFIG_WORD_SIZE]
-            .copy_from_slice(&8_u32.to_le_bytes());
+            .copy_from_slice(&16_u32.to_le_bytes());
         assert!(source
             .validate_device_state(&unknown_driver_status)
             .is_err());

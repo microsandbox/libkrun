@@ -42,9 +42,9 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeExtendedVmExits, WHvCapabilityCodeProcessorClockFrequency,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
+    WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
     WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
@@ -64,6 +64,10 @@ use windows_sys::Win32::System::Threading::GetThreadGroupAffinity;
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, GetThreadTimes, SetThreadGroupAffinity,
 };
+
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_state.rs"]
+mod x86_state;
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -123,6 +127,14 @@ const WHV_ARM64_REGISTER_Q31: WHV_REGISTER_NAME = 0x0003_001f;
 const WHV_ARM64_REGISTER_FPCR: WHV_REGISTER_NAME = 0x0004_0012;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_REGISTER_FPSR: WHV_REGISTER_NAME = 0x0004_0013;
+// windows-sys exposes the x86 identifier under the unqualified name. ARM64
+// uses a different ABI value (WinHvPlatformDefs.h); bit 0 is StartupSuspend.
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_ACTIVITY: WHV_REGISTER_NAME = 0x0000_0004;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_CNTV_CTL: WHV_REGISTER_NAME = 0x0005_800e;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_CNTV_CVAL: WHV_REGISTER_NAME = 0x0005_800f;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_REGISTER_ID_AA64PFR0_EL1: WHV_REGISTER_NAME = 0x0002_2020;
 #[cfg(target_arch = "aarch64")]
@@ -501,6 +513,19 @@ pub struct Vm {
     memory_regions: Vec<MappedMemoryRegion>,
     dirty_tracking: bool,
     dirty_tracking_transition_incomplete: bool,
+    #[cfg(target_arch = "aarch64")]
+    paused_timers: Vec<Arm64TimerState>,
+    #[cfg(target_arch = "x86_64")]
+    sipi_router: Arc<ApStartupRouter>,
+    #[cfg(target_arch = "x86_64")]
+    time_suspended: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct Arm64TimerState {
+    id: u8,
+    deadline: u64,
+    control: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -532,11 +557,19 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
 }
 
+#[cfg(target_arch = "aarch64")]
 #[derive(Deserialize, Serialize)]
 struct WhpVcpuExecutionState {
     registers: Vec<(WHV_REGISTER_NAME, [u8; 16])>,
     interrupt_controller: Vec<u8>,
     optional_sve: Option<Vec<u8>>,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Deserialize, Serialize)]
+struct WhpArmVmExecutionState {
+    counter_frequency: u64,
+    interrupt_controller: Vec<u8>,
 }
 
 /// Boot-time state of an x86 application processor under WHP.
@@ -546,7 +579,7 @@ struct WhpVcpuExecutionState {
 /// VMM must apply the INIT/SIPI to the targets. APs therefore stay parked
 /// (architectural reset state, never entered) until a startup IPI arrives.
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ApParkState {
     /// Waiting for a startup IPI; the vCPU thread has not entered the guest.
     Parked,
@@ -640,15 +673,20 @@ impl ApStartupRouter {
         partition_handle: WHV_PARTITION_HANDLE,
         event_receiver: &Receiver<VcpuEvent>,
         response_sender: &Sender<VcpuResponse>,
-    ) -> result::Result<u8, ()> {
+    ) -> result::Result<Option<u8>, ()> {
         let slot = &self.slots[id as usize];
         loop {
             {
                 let mut state = slot.lock().unwrap();
+                // A restored AP already has its execution registers installed.
+                // Do not apply a synthetic SIPI and overwrite its resumed PC.
+                if *state == ApParkState::Running {
+                    return Ok(None);
+                }
                 if let ApParkState::SipiPending(vector) = *state {
                     *state = ApParkState::Running;
                     debug!("WHP vCPU {id}: unparked by startup IPI (vector {vector:#x})");
-                    return Ok(vector);
+                    return Ok(Some(vector));
                 }
             }
             match event_receiver.recv_timeout(Duration::from_millis(10)) {
@@ -881,6 +919,12 @@ impl Vm {
             memory_regions: Vec::new(),
             dirty_tracking: false,
             dirty_tracking_transition_incomplete: false,
+            #[cfg(target_arch = "aarch64")]
+            paused_timers: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            sipi_router: Arc::new(ApStartupRouter::new(vcpu_count)),
+            #[cfg(target_arch = "x86_64")]
+            time_suspended: false,
         })
     }
 
@@ -981,21 +1025,41 @@ impl Vm {
     /// Captures partition-wide execution state that is not represented by vCPU registers.
     #[cfg(target_arch = "aarch64")]
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        get_virtual_processor_state(
+        let interrupt_controller = get_virtual_processor_state(
             self.partition.handle,
             WHV_ANY_VP,
             WHV_ARM64_VP_STATE_GLOBAL_INTERRUPT,
+        )?;
+        let counter_frequency = host_tsc_frequency_hz()
+            .ok_or_else(|| Error::StateCodec("WHP counter frequency unavailable".into()))?;
+        bincode::serde::encode_to_vec(
+            WhpArmVmExecutionState {
+                counter_frequency,
+                interrupt_controller,
+            },
+            bincode::config::standard(),
         )
+        .map_err(|error| Error::StateCodec(error.to_string()))
     }
 
     /// Restores partition-wide execution state before the partition first runs.
     #[cfg(target_arch = "aarch64")]
     pub fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        let (state, used): (WhpArmVmExecutionState, usize) = bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MAX_WHP_OPAQUE_STATE_SIZE>(),
+        )
+        .map_err(|error| Error::StateCodec(error.to_string()))?;
+        if used != bytes.len() || Some(state.counter_frequency) != host_tsc_frequency_hz() {
+            return Err(Error::StateCodec(
+                "WHP ARM64 counter frequency or VM state mismatch".into(),
+            ));
+        }
         set_virtual_processor_state(
             self.partition.handle,
             WHV_ANY_VP,
             WHV_ARM64_VP_STATE_GLOBAL_INTERRUPT,
-            bytes,
+            &state.interrupt_controller,
         )
     }
 
@@ -1011,33 +1075,115 @@ impl Vm {
 
     /// Restores opaque and register state on the controller before the owning thread is released.
     #[cfg(target_arch = "aarch64")]
-    pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-        restore_whp_vcpu_state_on_controller(self.partition.handle, id, bytes)?;
+    pub fn prepare_vcpu_execution_restore(&mut self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        let timer = restore_whp_vcpu_state_on_controller(self.partition.handle, id, bytes)?;
+        self.paused_timers.push(timer);
         Ok(Vec::new())
+    }
+
+    /// Freezes virtual time only after every vCPU has acknowledged the pause.
+    #[cfg(target_arch = "aarch64")]
+    pub fn pause_execution_time(&mut self, vcpu_count: usize) -> Result<()> {
+        set_partition_time_running(self.partition.handle, false)?;
+        let mut timers = Vec::with_capacity(vcpu_count);
+        for id in 0..vcpu_count {
+            let id =
+                u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".into()))?;
+            timers.push(Arm64TimerState {
+                id,
+                deadline: get_vcpu_register_u64(
+                    self.partition.handle,
+                    id,
+                    WHV_ARM64_REGISTER_CNTV_CVAL,
+                )?,
+                control: get_vcpu_register_u64(
+                    self.partition.handle,
+                    id,
+                    WHV_ARM64_REGISTER_CNTV_CTL,
+                )? & 3,
+            });
+        }
+        self.paused_timers = timers;
+        Ok(())
+    }
+
+    /// Repairs WHP's deadline rebasing before any vCPU is allowed to run.
+    #[cfg(target_arch = "aarch64")]
+    pub fn resume_execution_time(&mut self) -> Result<()> {
+        if self.paused_timers.is_empty() {
+            return Ok(()); // Ordinary first boot has no saved timers.
+        }
+        set_partition_time_running(self.partition.handle, true)?;
+        for timer in &self.paused_timers {
+            // WHP adjusts CVAL when partition time starts. Restore CVAL only
+            // after that adjustment, with enable/mask last. ISTATUS is derived.
+            if let Err(error) = set_vcpu_registers(
+                self.partition.handle,
+                timer.id,
+                &[WHV_ARM64_REGISTER_CNTV_CVAL, WHV_ARM64_REGISTER_CNTV_CTL],
+                &[
+                    register_value_u64(timer.deadline),
+                    register_value_u64(timer.control),
+                ],
+            ) {
+                // The VMM remains indeterminate and releases no CPU on failure.
+                // Keep the saved timers available for explicit recovery.
+                let freeze = set_partition_time_running(self.partition.handle, false);
+                return Err(Error::StateCodec(format!(
+                    "timer activation failed: {error}; time freeze: {freeze:?}"
+                )));
+            }
+        }
+        self.paused_timers.clear();
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        Err(Error::NotImplemented("x86_64 execution-state capture"))
+        x86_state::capture_vm(self.partition.handle, &self.sipi_router)
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub fn restore_execution_state(&self, _bytes: &[u8]) -> Result<()> {
-        Err(Error::NotImplemented("x86_64 execution-state restore"))
+    pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
+        x86_state::restore_vm(self.partition.handle, &self.sipi_router, bytes)?;
+        self.time_suspended = true;
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn complete_vcpu_execution_capture(
         &self,
-        _id: u32,
+        id: u32,
         _worker_bytes: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        Err(Error::NotImplemented("x86_64 execution-state capture"))
+        x86_state::capture_cpu(self.partition.handle, id)
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub fn prepare_vcpu_execution_restore(&self, _id: u32, _bytes: &[u8]) -> Result<Vec<u8>> {
-        Err(Error::NotImplemented("x86_64 execution-state restore"))
+    pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        x86_state::restore_cpu(self.partition.handle, id, bytes)?;
+        Ok(Vec::new())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sipi_router(&self) -> Arc<ApStartupRouter> {
+        self.sipi_router.clone()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn pause_execution_time(&mut self, _vcpu_count: usize) -> Result<()> {
+        set_partition_time_running(self.partition.handle, false)?;
+        self.time_suspended = true;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn resume_execution_time(&mut self) -> Result<()> {
+        if self.time_suspended {
+            set_partition_time_running(self.partition.handle, true)?;
+            self.time_suspended = false;
+        }
+        Ok(())
     }
 
     fn set_dirty_tracking(&mut self, enabled: bool) -> Result<()> {
@@ -2037,6 +2183,7 @@ fn arm64_execution_registers(
     let mut names = (WHV_ARM64_REGISTER_X0..=WHV_ARM64_REGISTER_GENERAL_END).collect::<Vec<_>>();
     names.extend(WHV_ARM64_REGISTER_Q0..=WHV_ARM64_REGISTER_Q31);
     names.extend([WHV_ARM64_REGISTER_FPCR, WHV_ARM64_REGISTER_FPSR]);
+    names.push(WHV_ARM64_REGISTER_ACTIVITY);
     names.extend([
         0x0004_0003, // ACTLR_EL1
         0x0004_0026,
@@ -2156,7 +2303,7 @@ fn restore_whp_vcpu_state_on_controller(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<Arm64TimerState> {
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (state, consumed): (WhpVcpuExecutionState, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
@@ -2181,12 +2328,41 @@ fn restore_whp_vcpu_state_on_controller(
             "ARM64 SVE state does not match destination capabilities".to_string(),
         ));
     }
-    let values = state
+    let timer_register = |name| {
+        let bytes = &state
+            .registers
+            .iter()
+            .find(|(id, _)| *id == name)
+            .expect("validated register contract")
+            .1;
+        u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte register"))
+    };
+    let timer = Arm64TimerState {
+        id,
+        deadline: timer_register(WHV_ARM64_REGISTER_CNTV_CVAL),
+        control: timer_register(WHV_ARM64_REGISTER_CNTV_CTL) & 3,
+    };
+    // Keep counters frozen through construction. Timer compare/control must
+    // wait until partition time starts, otherwise WHP rebases their values.
+    let registers = state
         .registers
+        .iter()
+        .filter(|(name, _)| {
+            *name != WHV_ARM64_REGISTER_CNTV_CVAL && *name != WHV_ARM64_REGISTER_CNTV_CTL
+        })
+        .collect::<Vec<_>>();
+    let names = registers.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let values = registers
         .iter()
         .map(|(_, bytes)| register_value_from_bytes(bytes))
         .collect::<Vec<_>>();
-    set_vcpu_registers(partition_handle, id, &expected, &values)?;
+    set_vcpu_registers(
+        partition_handle,
+        id,
+        &[WHV_ARM64_REGISTER_CNTV_CTL],
+        &[register_value_u64(0)],
+    )?;
+    set_vcpu_registers(partition_handle, id, &names, &values)?;
     set_virtual_processor_state(
         partition_handle,
         u32::from(id),
@@ -2201,24 +2377,45 @@ fn restore_whp_vcpu_state_on_controller(
             &sve,
         )?;
     }
+    Ok(timer)
+}
+
+fn set_partition_time_running(handle: WHV_PARTITION_HANDLE, running: bool) -> Result<()> {
+    // Caller owns the all-vCPU pause barrier; these calls never race a run.
+    let status = unsafe {
+        if running {
+            windows_sys::Win32::System::Hypervisor::WHvResumePartitionTime(handle)
+        } else {
+            windows_sys::Win32::System::Hypervisor::WHvSuspendPartitionTime(handle)
+        }
+    };
+    if status < 0 {
+        return Err(Error::StateCodec(format!(
+            "partition time running={running}: HRESULT {status:#x}"
+        )));
+    }
     Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
 fn capture_whp_vcpu_state(_partition_handle: WHV_PARTITION_HANDLE, _id: u8) -> Result<Vec<u8>> {
-    Err(Error::NotImplemented("x86_64 execution-state capture"))
+    Ok(Vec::new()) // Controller captures after every worker acknowledges.
 }
 
 #[cfg(target_arch = "x86_64")]
 fn restore_whp_vcpu_state(
     _partition_handle: WHV_PARTITION_HANDLE,
     _id: u8,
-    _bytes: &[u8],
+    bytes: &[u8],
 ) -> Result<()> {
-    Err(Error::NotImplemented("x86_64 execution-state restore"))
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    Err(Error::StateCodec(
+        "WHP restore payload was not prepared by the controller".into(),
+    ))
 }
 
-#[cfg(target_arch = "aarch64")]
 fn get_vcpu_register_bytes(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u8,
@@ -2251,7 +2448,6 @@ fn get_vcpu_register_bytes(
         .collect())
 }
 
-#[cfg(target_arch = "aarch64")]
 fn register_value_from_bytes(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
     let mut value = WHV_REGISTER_VALUE::default();
     unsafe {
@@ -2264,7 +2460,6 @@ fn register_value_from_bytes(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
     value
 }
 
-#[cfg(target_arch = "aarch64")]
 fn get_virtual_processor_state(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
@@ -2314,7 +2509,6 @@ fn get_virtual_processor_state(
     Ok(bytes)
 }
 
-#[cfg(target_arch = "aarch64")]
 fn set_virtual_processor_state(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
@@ -2485,7 +2679,7 @@ fn run_vcpu(
     if id != 0 {
         if let Some(router) = &sipi_router {
             match router.wait_for_sipi(id, partition_handle, &event_receiver, &response_sender) {
-                Ok(vector) => {
+                Ok(Some(vector)) => {
                     if let Err(err) = apply_sipi_startup_state(partition_handle, id, vector) {
                         error!("{err}");
                         signal_vcpu_exit(&response_sender, &exit_evt, 1);
@@ -2493,6 +2687,7 @@ fn run_vcpu(
                     }
                     spawn_ap_probe(partition_handle, id);
                 }
+                Ok(None) => {}
                 Err(()) => return,
             }
         }
@@ -2834,9 +3029,8 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
     result
 }
 
-/// Host processor clock (TSC) frequency, queried once. `None` when the
+/// Host processor clock (TSC/ARM counter) frequency, queried once. `None` when the
 /// platform cannot report it; the guest then calibrates as before.
-#[cfg(target_arch = "x86_64")]
 fn host_tsc_frequency_hz() -> Option<u64> {
     static TSC_HZ: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TSC_HZ.get_or_init(|| {
@@ -2844,7 +3038,7 @@ fn host_tsc_frequency_hz() -> Option<u64> {
         let mut written_size = 0;
         let hresult = unsafe {
             WHvGetCapability(
-                WHvCapabilityCodeProcessorClockFrequency,
+                windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeProcessorClockFrequency,
                 &mut capability as *mut WHV_CAPABILITY as *mut _,
                 size_of::<WHV_CAPABILITY>() as u32,
                 &mut written_size,
@@ -3423,6 +3617,31 @@ unsafe extern "system" fn emulator_translate_gva_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_running_ap_skips_sipi_register_reset() {
+        let router = ApStartupRouter::new(2);
+        *router.slots[1].lock().unwrap() = ApParkState::Running;
+        let (_events, receiver) = unbounded();
+        let (responses, _receiver) = unbounded();
+        // No WHP call occurs: the existing captured PC must survive startup.
+        assert_eq!(router.wait_for_sipi(1, 0, &receiver, &responses), Ok(None));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pending_sipi_keeps_its_vector() {
+        let router = ApStartupRouter::new(2);
+        *router.slots[1].lock().unwrap() = ApParkState::SipiPending(0x42);
+        let (_events, receiver) = unbounded();
+        let (responses, _receiver) = unbounded();
+        assert_eq!(
+            router.wait_for_sipi(1, 0, &receiver, &responses),
+            Ok(Some(0x42))
+        );
+        assert!(*router.slots[1].lock().unwrap() == ApParkState::Running);
+    }
 
     #[test]
     fn group_affinity_encodes_processor_group_and_single_cpu_mask() {

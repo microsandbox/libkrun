@@ -85,6 +85,8 @@ pub use api::{
     MemoryCapturePlan, MemoryCaptureSink, MemoryCaptureStats, MemoryGeneration,
     MemoryTopologyGeneration, VcpuExecutionState,
 };
+#[cfg(not(feature = "tee"))]
+pub use api::{PrivateMemoryBacking, PrivateMemoryRegion};
 #[cfg(feature = "net")]
 pub use devices::virtio::net::rate_limit::{
     RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,

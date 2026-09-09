@@ -31,6 +31,18 @@ impl IrqChipDevice {
         self.inner.get_mmio_size()
     }
 
+    /// Capture a stopped ARM interrupt controller, including input line levels.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn capture_arm_state(&self, mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
+        self.inner.capture_arm_state(mpidrs)
+    }
+
+    /// Restore into a fresh ARM controller before any vCPU runs.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_arm_state(&mut self, mpidrs: &[u64], bytes: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_arm_state(mpidrs, bytes)
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub fn num_pins(&self) -> usize {
         self.inner.num_pins()
@@ -185,6 +197,22 @@ pub trait IrqChipT: BusDevice {
 
 #[cfg(target_arch = "aarch64")]
 pub trait IrqChipT: BusDevice + GICDevice {
+    #[cfg(target_os = "linux")]
+    fn capture_arm_state(&self, _mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "ARM execution-state capture requires VGICv3; this controller does not expose complete interrupt state",
+        )))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_arm_state(&mut self, _mpidrs: &[u64], _bytes: &[u8]) -> Result<(), DeviceError> {
+        Err(DeviceError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "ARM execution-state restore requires VGICv3; this controller does not expose complete interrupt state",
+        )))
+    }
+
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
     fn set_irq(

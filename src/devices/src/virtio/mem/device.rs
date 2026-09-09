@@ -2,7 +2,9 @@ use std::cmp;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{
+    ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
+};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, HostMemoryRange, MemError,
@@ -254,6 +256,27 @@ impl Mem {
             error!("virtio-mem: no host mapping for guest addr {guest_addr:#x}");
             return;
         };
+        if mem
+            .find_region(GuestAddress(guest_addr))
+            .is_some_and(|region| region.file_offset().is_some())
+        {
+            // MADV_DONTNEED on MAP_PRIVATE reloads old file bytes. Materialize private zeros
+            // instead, without replacing mappings underneath registered hypervisor slots or
+            // host device pointers. The admitted host-write range above covers these zeros.
+            let zeros = [0u8; 64 * 1024];
+            let mut done = 0;
+            while done < len {
+                let count = (len - done).min(zeros.len() as u64) as usize;
+                if let Err(error) =
+                    mem.write_slice(&zeros[..count], GuestAddress(guest_addr + done))
+                {
+                    error!("virtio-mem: private zero discard failed: {error}");
+                    return;
+                }
+                done += count as u64;
+            }
+            return;
+        }
         if let Err(e) = discard_host_pages(host_addr, len as usize) {
             error!("virtio-mem: failed to discard {len} bytes at {guest_addr:#x}: {e}");
         }

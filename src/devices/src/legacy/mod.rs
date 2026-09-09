@@ -18,6 +18,8 @@ mod irqchip;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 mod kvmaia;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod kvmgic_state;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod kvmgicv2;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod kvmgicv3;
