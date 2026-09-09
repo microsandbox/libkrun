@@ -25,7 +25,7 @@ crossbeam-channel = ">=0.5.15"
 libc = ">=0.2.39"
 libloading = "0.8"
 log = "0.4.0"
-vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.1", default-features = false, features = ["backend-mmap"] }
+vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.2", default-features = false, features = ["backend-mmap"] }
 
 devices = { package = "msb_krun_devices", version = "0.1.34", path = "../devices" }
 polly = { package = "msb_krun_polly", version = "0.1.34", path = "../polly" }
