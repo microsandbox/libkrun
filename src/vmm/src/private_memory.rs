@@ -95,13 +95,13 @@ impl PrivateMemoryBacking {
                 return Err(invalid("private memory backing handle must be read-only"));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "private guest memory is not qualified on this backend",
         ));
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let backing = Self {
                 file: Arc::new(file),
@@ -173,7 +173,37 @@ impl PrivateMemoryBacking {
                 .collect::<io::Result<Vec<_>>>()?;
             GuestMemoryMmap::from_regions(regions).map_err(io::Error::other)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use vm_memory::mmap::MmapRegion;
+            use vm_memory::{FileOffset, GuestRegionMmap};
+
+            // Windows view offsets must be allocation-granularity aligned (typically 64 KiB),
+            // while RAM slots may be only page aligned. Map the packed file once at zero;
+            // checked slices share its private view and preserve the exact guest topology.
+            let length = usize::try_from(self.file.metadata()?.len())
+                .map_err(|_| invalid("RAM image exceeds host address space"))?;
+            let view = MmapRegion::<()>::from_file_private(
+                FileOffset::from_arc(self.file.clone(), 0),
+                length,
+            )?;
+            let regions = mappings
+                .iter()
+                .map(|region| {
+                    let offset = usize::try_from(region.file_offset)
+                        .map_err(|_| invalid("RAM offset exceeds host address space"))?;
+                    let length = usize::try_from(region.length)
+                        .map_err(|_| invalid("RAM region exceeds host address space"))?;
+                    GuestRegionMmap::new(
+                        view.file_slice(offset, length)?,
+                        GuestAddress(region.guest_address),
+                    )
+                    .ok_or_else(|| invalid("private memory guest range overflows"))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            GuestMemoryMmap::from_regions(regions).map_err(io::Error::other)
+        }
+        #[cfg(not(any(unix, windows)))]
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "private guest memory is not qualified on this backend",

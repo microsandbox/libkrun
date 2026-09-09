@@ -135,12 +135,18 @@ pub(super) fn restore(
             "VGIC state does not match destination topology/capabilities",
         ));
     }
+    restore_registers(&state.registers, |reg, value| write(fd, reg, value))
+}
+
+fn restore_registers(
+    registers: &[(Register, u64)],
+    mut write_register: impl FnMut(Register, u64) -> Result<(), Error>,
+) -> Result<(), Error> {
     // Fresh VGICs still have enabled SGIs. Clear every enable bank before
-    // restoring config, pending latches and active state. Activation is last.
-    for (reg, _) in &state.registers {
+    // restoring config, pending latches and active state.
+    for (reg, _) in registers {
         if is_enable(*reg) {
-            write(
-                fd,
+            write_register(
                 Register {
                     attr: reg.attr + 0x80,
                     ..*reg
@@ -149,14 +155,23 @@ pub(super) fn restore(
             )?;
         }
     }
-    for (reg, value) in &state.registers {
-        if !is_activation(*reg) {
-            write(fd, *reg, *value)?;
+    // KVM's userspace GICD_CTLR write only changes the distributor flag; unlike
+    // a guest MMIO write, it does not queue already-pending interrupts. Restore
+    // it before pending/level state and interrupt enables so a high timer line
+    // reaches the vCPU's pending list. All vCPUs remain behind the pause barrier.
+    for (reg, value) in registers {
+        if reg.group == DIST && reg.attr == 0 {
+            write_register(*reg, *value)?;
         }
     }
-    for (reg, value) in &state.registers {
-        if is_activation(*reg) {
-            write(fd, *reg, *value)?;
+    for (reg, value) in registers {
+        if !is_activation(*reg) {
+            write_register(*reg, *value)?;
+        }
+    }
+    for (reg, value) in registers {
+        if is_activation(*reg) && !(reg.group == DIST && reg.attr == 0) {
+            write_register(*reg, *value)?;
         }
     }
     Ok(())
@@ -375,5 +390,44 @@ mod tests {
             group: REDIST,
             attr: 0x100_0001_0200
         }));
+    }
+
+    #[test]
+    fn distributor_is_restored_before_pending_interrupts_are_enabled() {
+        let distributor = Register {
+            group: DIST,
+            attr: 0,
+        };
+        let enable = Register {
+            group: REDIST,
+            attr: 0x10100,
+        };
+        let level = Register {
+            group: LEVEL,
+            attr: 0,
+        };
+        // Match capture layout: distributor control is serialized last.
+        let registers = [(enable, 1 << 27), (level, 1 << 27), (distributor, 0x52)];
+        let mut writes = Vec::new();
+        restore_registers(&registers, |reg, value| {
+            writes.push((reg, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    Register {
+                        attr: 0x10180,
+                        ..enable
+                    },
+                    u32::MAX as u64
+                ),
+                (distributor, 0x52),
+                (level, 1 << 27),
+                (enable, 1 << 27),
+            ]
+        );
     }
 }

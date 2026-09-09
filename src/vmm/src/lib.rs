@@ -185,6 +185,17 @@ enum VcpuControlTarget {
     Resumed,
 }
 
+fn vcpu_barrier_wait_deadline(
+    target: VcpuControlTarget,
+    deadline: Instant,
+    now: Instant,
+) -> Instant {
+    match target {
+        VcpuControlTarget::Paused => deadline.min(now + Duration::from_millis(10)),
+        VcpuControlTarget::Resumed => deadline,
+    }
+}
+
 fn wait_for_vcpu_response(
     receiver: &crossbeam_channel::Receiver<VcpuResponse>,
     request_id: VcpuControlRequestId,
@@ -1983,7 +1994,10 @@ impl Vmm {
 
         for (vcpu_index, handle) in self.vcpus_handles.iter().enumerate() {
             loop {
-                let retry_deadline = deadline.min(Instant::now() + Duration::from_millis(10));
+                // Only pause needs periodic kicks. Resume has no retry path,
+                // so shortening its wait would turn the one-second barrier
+                // into an accidental ten-millisecond scheduling deadline.
+                let retry_deadline = vcpu_barrier_wait_deadline(target, deadline, Instant::now());
                 match wait_for_vcpu_response(
                     handle.response_receiver(),
                     request_id,
@@ -2244,6 +2258,25 @@ mod tests {
 
     fn request_id(value: u64) -> VcpuControlRequestId {
         VcpuControlRequestId(value)
+    }
+
+    #[test]
+    fn resume_wait_keeps_the_full_barrier_deadline() {
+        let now = Instant::now();
+        let deadline = now + VCPU_CONTROL_TIMEOUT;
+        assert_eq!(
+            vcpu_barrier_wait_deadline(VcpuControlTarget::Resumed, deadline, now),
+            deadline
+        );
+        assert_eq!(
+            vcpu_barrier_wait_deadline(VcpuControlTarget::Paused, deadline, now),
+            now + Duration::from_millis(10)
+        );
+        let near_deadline = deadline - Duration::from_millis(1);
+        assert_eq!(
+            vcpu_barrier_wait_deadline(VcpuControlTarget::Paused, deadline, near_deadline),
+            deadline
+        );
     }
 
     #[test]
