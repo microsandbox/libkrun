@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
+#[cfg(any(test, not(feature = "tee")))]
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 //--------------------------------------------------------------------------------------------------
@@ -39,6 +40,8 @@ pub struct PrivateMemoryBacking {
 impl PrivateMemoryBacking {
     /// Construct an unlinked, immutable sparse zero base for a fresh private-memory VM.
     /// Boot writes fault into private pages; the zero file itself is never modified afterward.
+    // TEE builders do not use private mappings; keep the helper available for mapping unit tests.
+    #[cfg(any(test, not(feature = "tee")))]
     pub(crate) fn zeroed(ranges: &[(GuestAddress, usize)]) -> io::Result<Self> {
         #[cfg(not(unix))]
         {
@@ -113,6 +116,7 @@ impl PrivateMemoryBacking {
     }
 
     /// Map the complete image without reading or copying its RAM-sized contents.
+    #[cfg(any(test, not(feature = "tee")))]
     pub(crate) fn map(&self, expected: &[(GuestAddress, usize)]) -> io::Result<GuestMemoryMmap> {
         self.validate()?;
         // A portable image can coalesce contiguous extents that the VMM constructs as several
