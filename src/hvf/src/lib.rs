@@ -8,6 +8,7 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+mod gic_registers;
 
 #[macro_use]
 extern crate log;
@@ -272,6 +273,7 @@ pub enum Error {
     GicStateCreate,
     GicStateRead,
     GicStateWrite,
+    GicStateApiUnavailable(&'static str),
     VmCreate,
 }
 
@@ -282,6 +284,10 @@ impl Display for Error {
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            GicStateApiUnavailable(symbol) => write!(
+                f,
+                "GIC execution-state capture/restore is unavailable: this macOS lacks {symbol}"
+            ),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryProtect => write!(f, "Error changing HVF memory permissions"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
@@ -837,6 +843,7 @@ impl HvfVcpu<'_> {
 
     /// Captures this vCPU on its owning thread at a stopped execution boundary.
     pub fn capture_state(&self) -> Result<HvfVcpuState, Error> {
+        gic_registers::get().require(self.nested_enabled)?;
         if self.pending_mmio_read.is_some() {
             // An MMIO read is completed on the next run entry. Capturing only the architectural
             // registers here would lose both the destination register and the pending bus value.
@@ -905,6 +912,7 @@ impl HvfVcpu<'_> {
         if !state.has_register_topology(self.nested_enabled) {
             return Err(Error::VcpuStateTopology);
         }
+        gic_registers::get().require(self.nested_enabled)?;
 
         for &(register, value) in &state.general {
             self.write_reg(register, value)?;
@@ -952,7 +960,10 @@ impl HvfVcpu<'_> {
 
     fn read_icc_reg(&self, register: hv_gic_icc_reg_t) -> Result<u64, Error> {
         let mut value = 0_u64;
-        let result = unsafe { hv_gic_get_icc_reg(self.vcpuid, register, &mut value) };
+        let read = gic_registers::get()
+            .read_icc
+            .ok_or(Error::GicStateApiUnavailable("hv_gic_get_icc_reg"))?;
+        let result = unsafe { read(self.vcpuid, register, &mut value) };
         if result == HV_SUCCESS {
             Ok(value)
         } else {
@@ -961,7 +972,10 @@ impl HvfVcpu<'_> {
     }
 
     fn write_icc_reg(&self, register: hv_gic_icc_reg_t, value: u64) -> Result<(), Error> {
-        let result = unsafe { hv_gic_set_icc_reg(self.vcpuid, register, value) };
+        let write = gic_registers::get()
+            .write_icc
+            .ok_or(Error::GicStateApiUnavailable("hv_gic_set_icc_reg"))?;
+        let result = unsafe { write(self.vcpuid, register, value) };
         if result == HV_SUCCESS {
             Ok(())
         } else {
@@ -971,7 +985,10 @@ impl HvfVcpu<'_> {
 
     fn read_ich_reg(&self, register: hv_gic_ich_reg_t) -> Result<u64, Error> {
         let mut value = 0_u64;
-        let result = unsafe { hv_gic_get_ich_reg(self.vcpuid, register, &mut value) };
+        let read = gic_registers::get()
+            .read_ich
+            .ok_or(Error::GicStateApiUnavailable("hv_gic_get_ich_reg"))?;
+        let result = unsafe { read(self.vcpuid, register, &mut value) };
         if result == HV_SUCCESS {
             Ok(value)
         } else {
@@ -980,7 +997,10 @@ impl HvfVcpu<'_> {
     }
 
     fn write_ich_reg(&self, register: hv_gic_ich_reg_t, value: u64) -> Result<(), Error> {
-        let result = unsafe { hv_gic_set_ich_reg(self.vcpuid, register, value) };
+        let write = gic_registers::get()
+            .write_ich
+            .ok_or(Error::GicStateApiUnavailable("hv_gic_set_ich_reg"))?;
+        let result = unsafe { write(self.vcpuid, register, value) };
         if result == HV_SUCCESS {
             Ok(())
         } else {
