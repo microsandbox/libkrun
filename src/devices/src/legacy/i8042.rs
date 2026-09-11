@@ -345,13 +345,14 @@ mod tests {
         i8042.read(0, 1, &mut data);
         assert_eq!(data, [1, 2]);
 
-        // Check if reset works.
-        // Write 1 to the reset event fd, so that read doesn't block in case the event fd
-        // counter doesn't change (for 0 it blocks).
-        assert!(reset_evt.write(1).is_ok());
+        // The nonblocking event must start empty so this proves that the command signals it.
+        assert_eq!(
+            reset_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let mut data = [CMD_RESET_CPU];
         i8042.write(0, OFS_STATUS, &data);
-        assert!(reset_evt.read().unwrap() >= 1);
+        assert_eq!(reset_evt.read().unwrap(), 1);
 
         // Check the dummy speaker/system-control port used by PIT calibration.
         data[0] = 0x03;
@@ -361,6 +362,40 @@ mod tests {
         let first_timer_output = data[0] & PB_TIMER2_OUTPUT;
         i8042.read(0, OFS_PORT_B, &mut data);
         assert_ne!(data[0] & PB_TIMER2_OUTPUT, first_timer_output);
+    }
+
+    #[test]
+    fn test_i8042_poweroff_exit_is_byte_status_command() {
+        let mut i8042 = I8042Device::new(
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        );
+        let reset_evt = i8042.get_reset_evt_clone().unwrap();
+
+        // The firmware contract is exactly one byte 0xfe at port 0x64 (offset 4).
+        // A keyboard command, another port, or a wider write must not terminate the VM.
+        let other_writes: &[(u64, &[u8])] = &[
+            (4, &[]),
+            (4, &[0xfe, 0x00]),
+            (4, &[0xfd]),
+            (0, &[0xfe]),
+            (1, &[0xfe]),
+            (3, &[0xfe]),
+        ];
+        for &(offset, data) in other_writes {
+            i8042.write(0, offset, data);
+            assert_eq!(
+                reset_evt.read().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+
+        i8042.write(0, 4, &[0xfe]);
+        assert_eq!(reset_evt.read().unwrap(), 1);
+        assert_eq!(
+            reset_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
