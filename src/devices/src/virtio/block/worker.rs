@@ -880,7 +880,7 @@ impl BlockWorker {
         Writer::new(&request.mem, chain).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    fn process_request(
+    pub(super) fn process_request(
         &mut self,
         request_header: RequestHeader,
         reader: &mut Reader,
@@ -966,17 +966,15 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
-                if self.disk.has_writeback_limit() && unmap {
-                    // The bounded device advertises write_zeroes_may_unmap=0. Fail closed if a
-                    // non-conforming guest still requests a hole-punching zero operation.
-                    return Err(RequestError::UnsupportedMutation);
-                }
                 let offset = sector_offset(discard_write_data.sector)?;
                 let length = sector_count_bytes(discard_write_data.num_sectors)?;
                 self.disk
                     .validate_mutation_range(offset, length)
                     .map_err(RequestError::InvalidMutationRange)?;
-                if unmap {
+                // UNMAP grants permission to deallocate; it does not require it. In bounded
+                // mode, satisfy the request using accounted zero writes instead of punching
+                // holes. Linux ext4 legitimately uses this flag during online expansion.
+                if unmap && !self.disk.has_writeback_limit() {
                     self.disk
                         .discard_to_zero(offset, length)
                         .map_err(RequestError::DiscardingToZero)?;
