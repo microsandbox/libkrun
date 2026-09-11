@@ -5308,7 +5308,7 @@ pub mod tests {
         let address = 0x8020_0000;
         #[cfg(target_arch = "x86_64")]
         let address = 0x20_0000;
-        resources.kernel_bundle = Some(KernelBundle {
+        resources.kernel_bundle = Some(crate::vmm_config::kernel_bundle::KernelBundle {
             host_addr: kernel.as_ptr() as u64,
             guest_addr: address,
             entry_addr: address,
