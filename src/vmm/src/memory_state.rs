@@ -178,6 +178,10 @@ pub struct MemoryCaptureStats {
     pub emitted_bytes: u64,
     /// Zero bytes represented sparsely.
     pub zero_bytes: u64,
+    /// Guest bytes actually read to inspect or emit their contents.
+    pub guest_bytes_read: u64,
+    /// Known-zero unplugged bytes covered without reading guest memory.
+    pub unplugged_bytes_skipped: u64,
     /// Number of bounded sink calls.
     pub chunks: u64,
 }

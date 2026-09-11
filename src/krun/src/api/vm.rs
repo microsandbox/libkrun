@@ -1021,6 +1021,10 @@ impl VmControlRegistry {
     }
 
     fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
+        self.wait_until_paused_inner(Some(timeout))
+    }
+
+    fn wait_until_paused_inner(&self, timeout: Option<Duration>) -> Result<VmExecutionState> {
         let started = Instant::now();
         let mut state = self.state.lock().map_err(|_| {
             Error::Runtime(RuntimeError::Control(
@@ -1042,6 +1046,16 @@ impl VmControlRegistry {
                 | None => {}
             }
 
+            let Some(timeout) = timeout else {
+                // Construction may be dominated by slow storage. A separate owner cancels
+                // construction; it must not spend the later execution-barrier deadline here.
+                state = self.state_changed.wait(state).map_err(|_| {
+                    Error::Runtime(RuntimeError::Control(
+                        "VMM control registry is poisoned".to_string(),
+                    ))
+                })?;
+                continue;
+            };
             let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
                 return Err(wait_until_paused_timeout(timeout, state.execution));
             };
@@ -1256,6 +1270,41 @@ mod tests {
             Error::Runtime(RuntimeError::Control(message))
                 if message.contains("timed out") && message.contains("last state: None")
         ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn construction_wait_wakes_on_an_indeterminate_boundary() {
+        let control = make_vm().control_handle();
+        let waiting = control.clone();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            finished
+                .send(waiting.wait_until_paused_without_timeout())
+                .unwrap();
+        });
+        assert!(matches!(
+            result.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        control
+            .vmm
+            .publish_execution_state(VmExecutionState::Indeterminate);
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(Error::Runtime(RuntimeError::Control(message))) if message.contains("indeterminate")
+        ));
+        worker.join().unwrap();
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn construction_wait_refuses_an_already_indeterminate_boundary() {
+        let control = make_vm().control_handle();
+        control
+            .vmm
+            .publish_execution_state(VmExecutionState::Indeterminate);
+        assert!(control.wait_until_paused_without_timeout().is_err());
     }
 
     #[cfg(not(feature = "tee"))]
@@ -1692,6 +1741,13 @@ impl VmControl {
     /// without polling or allowing a guest instruction to run first.
     pub fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
         self.vmm.wait_until_paused(timeout)
+    }
+
+    /// Wait for the construction-paused boundary without charging storage preparation
+    /// against an execution-barrier deadline. The embedding runtime owns cancellation.
+    /// This does not resume the VM or relax any vCPU/device quiescence barriers.
+    pub fn wait_until_paused_without_timeout(&self) -> Result<VmExecutionState> {
+        self.vmm.wait_until_paused_inner(None)
     }
 
     /// Captures the exact backend execution state at the current paused boundary.

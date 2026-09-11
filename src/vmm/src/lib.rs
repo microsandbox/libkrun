@@ -40,6 +40,7 @@ use crate::linux::vstate;
 pub mod execution_state;
 #[cfg(target_os = "macos")]
 mod macos;
+mod memory_capture;
 /// Backend-neutral memory generation and incremental-baseline contracts.
 pub mod memory_state;
 mod metrics;
@@ -1767,34 +1768,24 @@ impl Vmm {
             MemoryCaptureKind::Incremental { .. } => capture.changed_ranges().to_vec(),
         };
 
-        let mut buffer = vec![0_u8; options.chunk_size()];
-        let mut stats = MemoryCaptureStats::default();
-        for range in ranges {
-            let mut start = range.start();
-            let mut remaining = range.length();
-            while remaining > 0 {
-                let length = remaining.min(options.chunk_size() as u64) as usize;
-                let bytes = &mut buffer[..length];
-                self.guest_memory
-                    .read_slice(bytes, GuestAddress(start))
-                    .map_err(Error::MemoryAccess)?;
-                let chunk_range = GuestMemoryRange::new(start, length as u64)
-                    .expect("bounded memory chunks cannot overflow");
-                if options.detects_zero() && bytes.iter().all(|byte| *byte == 0) {
-                    sink.write_zero(chunk_range).map_err(Error::MemorySink)?;
-                    stats.zero_bytes += length as u64;
-                } else {
-                    sink.write_bytes(chunk_range, bytes)
-                        .map_err(Error::MemorySink)?;
-                    stats.emitted_bytes += length as u64;
-                }
-                stats.logical_bytes += length as u64;
-                stats.chunks += 1;
-                start += length as u64;
-                remaining -= length as u64;
-            }
+        // Planning freezes and drains host requests, and the pending plan prevents vCPU resume.
+        // Locking the actual device here therefore observes the same completed plug/unplug cut
+        // as device-state capture. A requested size or plugged byte total cannot replace its map.
+        if !matches!(self.memory_access.mode(), MemoryAccessMode::Frozen { .. }) {
+            return Err(Error::MemoryCaptureRequiresPause);
         }
-        Ok(stats)
+        let unplugged = memory_capture::unplugged_ranges(self)?;
+        memory_capture::stream_memory(
+            &ranges,
+            &unplugged,
+            options,
+            |range, bytes| {
+                self.guest_memory
+                    .read_slice(bytes, GuestAddress(range.start()))
+                    .map_err(Error::MemoryAccess)
+            },
+            sink,
+        )
     }
 
     /// Materializes exact bytes into an inert or paused guest-memory range.

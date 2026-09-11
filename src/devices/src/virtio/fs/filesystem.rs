@@ -410,6 +410,11 @@ pub trait FileSystem {
         self.validate_state(state)
     }
 
+    /// Return a Linux errno for an unavailable restored resource, before dispatch.
+    fn request_error(&self, _inode: u64) -> Option<i32> {
+        None
+    }
+
     /// Initialize the file system.
     ///
     /// This method is called when a connection to the FUSE kernel module is first established. The
