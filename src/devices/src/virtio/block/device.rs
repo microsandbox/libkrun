@@ -1733,6 +1733,126 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn bounded_worker_accepts_unmap_zeroes_without_discarding() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        use vm_memory::{Bytes, GuestAddress};
+
+        use super::super::worker::{DiscardWriteData, RequestError, RequestHeader};
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::descriptor_utils::{
+            create_descriptor_chain, DescriptorType, Reader, Writer,
+        };
+
+        // Cross several explicit-zero chunks under a tiny pressure target. A full overwrite
+        // must persist, retain allocated blocks and leave the neighboring sentinels intact.
+        let backing = TempFile::new().unwrap();
+        let length = 4 * 1024 * 1024;
+        backing
+            .as_file()
+            .write_all_at(&vec![0x5a; length], 0)
+            .unwrap();
+        backing.as_file().sync_all().unwrap();
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+        let limit = WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES);
+        limit.set_target_bytes(4096).unwrap();
+        let mut block = Block::new_with_writeback_limit_handle(
+            "zero-regression".into(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(limit),
+            MetricsWriter::default().register_block_device("zero-regression".into()),
+        )
+        .unwrap();
+        let mut disk = block.disk.take().unwrap();
+        disk.set_writeback_config(block.writeback_config.as_ref())
+            .unwrap();
+        assert!(disk.has_writeback_limit());
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue {
+                queue: crate::virtio::Queue::new(256),
+                event: Arc::new(EventFd::new(0).unwrap()),
+            },
+            InterruptTransport::new(DummyIrqChip::new().into(), "zero-regression".into()).unwrap(),
+            mem.clone(),
+            disk,
+            EventFd::new(0).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            MetricsWriter::default().register_block_device("zero-regression".into()),
+        );
+        let mut request = |kind, sector, num_sectors, flags| {
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x1000),
+                vec![
+                    (DescriptorType::Readable, 16),
+                    (DescriptorType::Writable, 1),
+                ],
+                0,
+            )
+            .unwrap();
+            // Encode wire bytes rather than sharing the handler's struct construction.
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&u64::to_le_bytes(sector));
+            payload.extend_from_slice(&u32::to_le_bytes(num_sectors));
+            payload.extend_from_slice(&u32::to_le_bytes(flags));
+            mem.write_slice(&payload, GuestAddress(0x1000)).unwrap();
+            let header_mem = GuestAddress(0x2000);
+            mem.write_obj(kind, header_mem).unwrap();
+            let header: RequestHeader = mem.read_obj(header_mem).unwrap();
+            worker.process_request(
+                header,
+                &mut Reader::new(&mem, chain.clone()).unwrap(),
+                &mut Writer::new(&mem, chain).unwrap(),
+            )
+        };
+        assert_eq!(std::mem::size_of::<DiscardWriteData>(), 16);
+        for flags in [0, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP] {
+            assert_eq!(
+                request(
+                    VIRTIO_BLK_T_WRITE_ZEROES,
+                    8,
+                    (length / 512 - 16) as u32,
+                    flags
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert!(matches!(
+            request(
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                (length / 512 - 1) as u64,
+                2,
+                VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP
+            ),
+            Err(RequestError::InvalidMutationRange(_))
+        ));
+        assert!(matches!(
+            request(VIRTIO_BLK_T_DISCARD, 0, 8, 0),
+            Err(RequestError::UnsupportedMutation)
+        ));
+        request(VIRTIO_BLK_T_FLUSH, 0, 0, 0).unwrap();
+        drop(worker);
+        let bytes = std::fs::read(backing.as_path()).unwrap();
+        assert!(bytes[..4096].iter().all(|b| *b == 0x5a));
+        assert!(bytes[4096..length - 4096].iter().all(|b| *b == 0));
+        assert!(bytes[length - 4096..].iter().all(|b| *b == 0x5a));
+        assert!(
+            backing.as_file().metadata().unwrap().blocks() >= allocated,
+            "bounded zero writes must not punch holes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_writeback_rejects_incompatible_disk_settings() {
         let result = Block::new_with_writeback_limit(
             "raw".to_string(),

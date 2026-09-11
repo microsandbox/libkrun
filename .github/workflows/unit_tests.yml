@@ -52,6 +52,9 @@ jobs:
       - name: Windows NUMA allocation test
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml windows_numa_mapping_allocates_accessible_memory
 
+      - name: Windows eager restore memory test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml eager_restore_replaces_payload_bytes_without_losing_regions
+
       - name: Windows device Clippy
         run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings
 

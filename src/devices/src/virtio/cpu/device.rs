@@ -43,6 +43,10 @@ const NOT_IN_GUEST: u64 = u64::MAX;
 // Config space offsets (three little-endian u32 fields).
 const CONFIG_ACTUAL_ONLINE_OFFSET: u64 = 8;
 
+const CPU_STATE_MAGIC: &[u8; 8] = b"MSBKCPU\0";
+const CPU_STATE_SCHEMA: u16 = 1;
+const CPU_STATE_LEN: usize = 26;
+
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 struct VirtioCpuConfig {
@@ -298,6 +302,36 @@ impl Cpu {
             enforced: self.enforcement.enforced(),
         }
     }
+
+    fn decode_checkpoint_state(&self, state: &[u8]) -> Result<CpuStateSnapshot, VirtioStateError> {
+        let invalid = || VirtioStateError::Incompatible("invalid msb-cpu checkpoint state".into());
+        if state.len() != CPU_STATE_LEN
+            || &state[..8] != CPU_STATE_MAGIC
+            || u16::from_le_bytes(state[8..10].try_into().unwrap()) != CPU_STATE_SCHEMA
+        {
+            return Err(invalid());
+        }
+        let word = |offset| u32::from_le_bytes(state[offset..offset + 4].try_into().unwrap());
+        let snapshot = CpuStateSnapshot {
+            possible: word(10),
+            requested_online: word(14),
+            actual_online: word(18),
+            enforced: word(22),
+        };
+        if snapshot.possible != self.config.possible
+            || [
+                snapshot.requested_online,
+                snapshot.actual_online,
+                snapshot.enforced,
+            ]
+            .iter()
+            .any(|count| *count == 0 || *count > snapshot.possible)
+        {
+            return Err(invalid());
+        }
+        // A guest may not yet have reached the requested count. Do not manufacture convergence.
+        Ok(snapshot)
+    }
 }
 
 impl VirtioDevice for Cpu {
@@ -407,5 +441,94 @@ impl VirtioDevice for Cpu {
             ))?;
         self.device_state = DeviceState::Inactive;
         Ok(queues)
+    }
+
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "msb-cpu must be quiesced before capture",
+            ));
+        }
+        let snapshot = self.state_snapshot();
+        let mut state = Vec::with_capacity(CPU_STATE_LEN);
+        state.extend_from_slice(CPU_STATE_MAGIC);
+        state.extend_from_slice(&CPU_STATE_SCHEMA.to_le_bytes());
+        for count in [
+            snapshot.possible,
+            snapshot.requested_online,
+            snapshot.actual_online,
+            snapshot.enforced,
+        ] {
+            state.extend_from_slice(&count.to_le_bytes());
+        }
+        self.decode_checkpoint_state(&state)?;
+        Ok(state)
+    }
+
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        self.decode_checkpoint_state(state).map(|_| ())
+    }
+
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "msb-cpu must be inactive before restore",
+            ));
+        }
+        let snapshot = self.decode_checkpoint_state(state)?;
+        self.config.requested_online = snapshot.requested_online;
+        self.config.actual_online = snapshot.actual_online;
+        // Update the existing shared object: already-constructed vCPUs hold clones of it.
+        CpuEnforcement::set(&self.enforcement, snapshot.enforced);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_preserves_pending_resize_and_shared_enforcement() {
+        for (actual, requested) in [(2, 4), (4, 1), (3, 3)] {
+            let mut source = Cpu::new(4, actual).unwrap();
+            source.set_requested_online(requested);
+            let state = source.capture_device_state().unwrap();
+            let mut destination = Cpu::new(4, 1).unwrap();
+            let enforcement = destination.enforcement();
+            destination.restore_device_state(&state).unwrap();
+            assert_eq!(destination.state_snapshot().actual_online, actual);
+            assert_eq!(enforcement.enforced(), requested);
+            assert_eq!(destination.capture_device_state().unwrap(), state);
+            destination.set_requested_online(4);
+            assert!(enforcement.runnable(3));
+            destination.write_config(CONFIG_ACTUAL_ONLINE_OFFSET, &4u32.to_le_bytes());
+            assert_eq!(destination.state_snapshot().actual_online, 4);
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_invalid_state_without_mutation() {
+        let mut destination = Cpu::new(4, 4).unwrap();
+        let original = destination.capture_device_state().unwrap();
+        let mut invalid = vec![Vec::new(), original[..25].to_vec()];
+        for offset in [0, 8, 10, 14, 18, 22] {
+            let mut corrupt = original.clone();
+            corrupt[offset] ^= 1;
+            invalid.push(corrupt);
+        }
+        for offset in [14, 18, 22] {
+            let mut corrupt = original.clone();
+            corrupt[offset..offset + 4].fill(0);
+            invalid.push(corrupt);
+        }
+        for corrupt in invalid {
+            assert!(destination.restore_device_state(&corrupt).is_err());
+            assert_eq!(destination.capture_device_state().unwrap(), original);
+        }
+        assert!(Cpu::new(8, 4)
+            .unwrap()
+            .validate_device_state(&original)
+            .is_err());
     }
 }

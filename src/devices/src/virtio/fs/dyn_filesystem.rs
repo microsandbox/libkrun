@@ -64,6 +64,12 @@ pub trait DynFileSystem: Send + Sync {
         self.validate_state(state)
     }
 
+    /// Reject a request against a permanently unavailable restored resource.
+    /// The returned errno is a Linux protocol value, not a host-platform errno.
+    fn request_error(&self, _inode: u64) -> Option<i32> {
+        None
+    }
+
     /// Initialize the file system.
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         Ok(FsOptions::empty())
@@ -563,6 +569,10 @@ impl DynFileSystemAdapter {
 impl FileSystem for DynFileSystemAdapter {
     type Inode = u64;
     type Handle = u64;
+
+    fn request_error(&self, inode: u64) -> Option<i32> {
+        self.0.request_error(inode)
+    }
 
     fn capture_state(&self) -> io::Result<Vec<u8>> {
         self.0.capture_state()

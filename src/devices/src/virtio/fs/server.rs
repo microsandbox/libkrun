@@ -122,6 +122,22 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
         debug!("opcode: {}", in_header.opcode);
+        // A degraded mount retains its transport and consumes requests. Protocol housekeeping
+        // keeps its native no-reply behavior; emitting an error reply to FORGET would corrupt
+        // the guest's request accounting. The backend supplies already-normalized Linux errno.
+        let housekeeping = [
+            Opcode::Forget as u32,
+            Opcode::BatchForget as u32,
+            Opcode::Destroy as u32,
+            Opcode::Interrupt as u32,
+            Opcode::NotifyReply as u32,
+        ]
+        .contains(&in_header.opcode);
+        if !housekeeping {
+            if let Some(errno) = self.fs.request_error(in_header.nodeid) {
+                return reply_error(io::Error::from_raw_os_error(errno), in_header.unique, w);
+            }
+        }
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -161,7 +177,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Destroy as u32 => self.destroy(),
             x if x == Opcode::Ioctl as u32 => self.ioctl(in_header, r, w, exit_code),
             x if x == Opcode::Poll as u32 => self.poll(in_header, r, w),
-            x if x == Opcode::NotifyReply as u32 => self.notify_reply(in_header, r, w),
+            x if x == Opcode::NotifyReply as u32 => self.notify_reply(), // No reply.
             x if x == Opcode::BatchForget as u32 => self.batch_forget(in_header, r, w),
             x if x == Opcode::Fallocate as u32 => self.fallocate(in_header, r, w),
             x if x == Opcode::Readdirplus as u32 => self.readdirplus(in_header, r, w),
@@ -465,6 +481,9 @@ impl<F: FileSystem + Sync> Server<F> {
         mut r: Reader,
         w: Writer,
     ) -> Result<usize> {
+        if let Some(errno) = self.fs.request_error(newdir) {
+            return reply_error(io::Error::from_raw_os_error(errno), in_header.unique, w);
+        }
         let buflen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
             .and_then(|l| l.checked_sub(msg_size))
@@ -512,6 +531,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
+        if let Some(errno) = self.fs.request_error(oldnodeid) {
+            return reply_error(io::Error::from_raw_os_error(errno), in_header.unique, w);
+        }
 
         let namelen = (in_header.len as usize)
             .checked_sub(size_of::<InHeader>())
@@ -1250,12 +1272,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn notify_reply(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    fn notify_reply(&self) -> Result<usize> {
+        // This is the guest's response to a server notification, not a new request.
+        // Even an unsupported backend callback must not create another FUSE reply.
         if let Err(e) = self.fs.notify_reply() {
-            reply_error(e, in_header.unique, w)
-        } else {
-            Ok(0)
+            debug!("filesystem notification reply was not handled: {e}");
         }
+        Ok(0)
     }
 
     fn batch_forget(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
@@ -1346,6 +1369,12 @@ impl<F: FileSystem + Sync> Server<F> {
             flags,
             ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        // Secondary operands carry independent inode identities; the header gate
+        // alone cannot protect a stale destination from a still-valid source.
+        if let Some(errno) = self.fs.request_error(nodeid_out) {
+            return reply_error(io::Error::from_raw_os_error(errno), in_header.unique, w);
+        }
 
         match self.fs.copyfilerange(
             Context::from(in_header),
@@ -1683,4 +1712,168 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::*;
+    use crate::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType};
+
+    const STALE_INODE: u64 = 99;
+    const REPLY_SENTINEL: u8 = 0xa5;
+
+    struct DegradedFs {
+        unavailable: bool,
+    }
+
+    impl FileSystem for DegradedFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn request_error(&self, inode: u64) -> Option<i32> {
+            if self.unavailable {
+                Some(5) // Linux EIO, including on macOS and Windows hosts.
+            } else if inode == STALE_INODE {
+                Some(116) // Linux ESTALE is not the host's errno on macOS.
+            } else {
+                None
+            }
+        }
+    }
+
+    fn dispatch(fs: DegradedFs, opcode: Opcode, inode: u64, body: &[u8]) -> (usize, Vec<u8>) {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let header = InHeader {
+            len: (size_of::<InHeader>() + body.len()) as u32,
+            opcode: opcode as u32,
+            unique: 42,
+            nodeid: inode,
+            ..Default::default()
+        };
+        let request_address = GuestAddress(0x1000);
+        let reply_address = GuestAddress(0x1000 + u64::from(header.len));
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            request_address,
+            vec![
+                (DescriptorType::Readable, header.len),
+                (DescriptorType::Writable, 128),
+            ],
+            0,
+        )
+        .unwrap();
+        memory.write_obj(header, request_address).unwrap();
+        memory
+            .write_slice(body, GuestAddress(0x1000 + size_of::<InHeader>() as u64))
+            .unwrap();
+        memory
+            .write_slice(&[REPLY_SENTINEL; 128], reply_address)
+            .unwrap();
+        let reader = Reader::new(&memory, chain.clone()).unwrap();
+        let writer = Writer::new(&memory, chain).unwrap();
+        let server = Server::new(Arc::new(fs), 0);
+        let written = server
+            .handle_message(
+                reader,
+                writer,
+                &None,
+                &Arc::new(AtomicI32::new(0)),
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                &None,
+            )
+            .unwrap();
+        let mut reply = vec![0; 128];
+        memory.read_slice(&mut reply, reply_address).unwrap();
+        (written, reply)
+    }
+
+    fn assert_error(opcode: Opcode, inode: u64, body: &[u8], unavailable: bool, errno: i32) {
+        let (written, reply) = dispatch(DegradedFs { unavailable }, opcode, inode, body);
+        assert_eq!(written, size_of::<OutHeader>());
+        let header = OutHeader::from_slice(&reply[..written]).unwrap();
+        assert_eq!(header.error, -errno);
+        assert_eq!(header.unique, 42);
+    }
+
+    #[test]
+    fn degraded_mount_errors_use_linux_errno() {
+        assert_error(Opcode::Getattr, STALE_INODE, &[], false, 116);
+        assert_error(Opcode::Getattr, 1, &[], true, 5);
+    }
+
+    #[test]
+    fn degraded_secondary_operands_are_rejected_before_backend_dispatch() {
+        // The header inode remains healthy, so each operation must also check its
+        // separately encoded inode. Default backend operations would return ENOSYS.
+        let mut link = LinkIn {
+            oldnodeid: STALE_INODE,
+        }
+        .as_slice()
+        .to_vec();
+        link.extend_from_slice(b"new-link\0");
+        assert_error(Opcode::Link, 1, &link, false, 116);
+
+        let mut rename = RenameIn {
+            newdir: STALE_INODE,
+        }
+        .as_slice()
+        .to_vec();
+        rename.extend_from_slice(b"old\0new\0");
+        assert_error(Opcode::Rename, 1, &rename, false, 116);
+
+        let mut rename2 = Rename2In {
+            newdir: STALE_INODE,
+            ..Default::default()
+        }
+        .as_slice()
+        .to_vec();
+        rename2.extend_from_slice(b"old\0new\0");
+        assert_error(Opcode::Rename2, 1, &rename2, false, 116);
+
+        let copy = CopyfilerangeIn {
+            nodeid_out: STALE_INODE,
+            ..Default::default()
+        };
+        assert_error(Opcode::CopyFileRange, 1, copy.as_slice(), false, 116);
+    }
+
+    #[test]
+    fn degraded_housekeeping_and_interrupt_keep_no_reply_semantics() {
+        let mut batch = BatchForgetIn {
+            count: 1,
+            ..Default::default()
+        }
+        .as_slice()
+        .to_vec();
+        batch.extend_from_slice(
+            ForgetOne {
+                nodeid: STALE_INODE,
+                nlookup: 1,
+            }
+            .as_slice(),
+        );
+        let cases = [
+            (Opcode::Forget, ForgetIn { nlookup: 1 }.as_slice().to_vec()),
+            (Opcode::BatchForget, batch),
+            (Opcode::Destroy, vec![]),
+            (
+                Opcode::Interrupt,
+                InterruptIn { unique: 42 }.as_slice().to_vec(),
+            ),
+            // The default notify_reply callback returns ENOSYS. It must still not
+            // write a response, irrespective of whether this export is degraded.
+            (Opcode::NotifyReply, vec![]),
+        ];
+        for unavailable in [false, true] {
+            for (opcode, body) in &cases {
+                let (written, reply) =
+                    dispatch(DegradedFs { unavailable }, *opcode, STALE_INODE, body);
+                assert_eq!(written, 0, "opcode {opcode:?}");
+                assert_eq!(reply, vec![REPLY_SENTINEL; 128], "opcode {opcode:?}");
+            }
+        }
+    }
 }
