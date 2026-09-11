@@ -1,5 +1,7 @@
 //! VM handle for entering microVMs.
 
+#[cfg(not(feature = "tee"))]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::Infallible;
 #[cfg(any(not(feature = "tee"), test))]
@@ -139,7 +141,14 @@ struct VmmMemoryRestoreTarget<'a> {
     vmm: &'a mut vmm::Vmm,
     expected: Vec<vmm::memory_state::GuestMemoryRange>,
     restored: Vec<vmm::memory_state::GuestMemoryRange>,
+    /// Coalesced ranges previously written by this restore source. Zero ranges outside these
+    /// remain guaranteed-zero lazy backing, even when the source emits records out of order.
+    written: RestoreWrittenRanges,
 }
+
+#[cfg(not(feature = "tee"))]
+#[derive(Default)]
+struct RestoreWrittenRanges(BTreeMap<u64, u64>);
 
 /// Shared VMM registry and notification point for execution-state observers.
 #[cfg(not(feature = "tee"))]
@@ -556,6 +565,11 @@ impl Vm {
 
         // Build the microVM
         let (sender, _receiver) = unbounded();
+
+        #[cfg(not(feature = "tee"))]
+        {
+            self.vmr.zeroed_restore_memory = self.memory_restore.is_some();
+        }
 
         let (_vmm, placement_report) = vmm::builder::build_microvm_paused(
             &mut self.vmr,
@@ -1442,6 +1456,30 @@ mod tests {
             vec![range(0x1000, 0x2000), range(0x5000, 0x1000)]
         );
     }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn fresh_restore_zeroes_only_intersect_previously_written_bytes() {
+        let range =
+            |start, length| vmm::memory_state::GuestMemoryRange::new(start, length).unwrap();
+        let mut writes = RestoreWrittenRanges::default();
+        assert!(writes.intersections(range(0, 32 << 30)).is_empty());
+        for (start, length) in [(100, 20), (20, 30), (45, 10), (80, 20), (120, 10)] {
+            writes.insert(range(start, length));
+        }
+        assert_eq!(
+            writes.intersections(range(0, 256)),
+            vec![range(20, 35), range(80, 50)]
+        );
+        assert_eq!(
+            writes.intersections(range(40, 60)),
+            vec![range(40, 15), range(80, 20)]
+        );
+        assert!(writes.intersections(range(55, 25)).is_empty());
+        writes.insert(range(0, 256));
+        assert_eq!(writes.0.len(), 1);
+        assert_eq!(writes.intersections(range(40, 60)), vec![range(40, 60)]);
+    }
 }
 
 #[cfg(not(feature = "tee"))]
@@ -1454,14 +1492,30 @@ impl VmMemoryRestoreTarget for VmmMemoryRestoreTarget<'_> {
         self.vmm
             .materialize_memory(range, bytes)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        self.written.insert(range);
         self.restored.push(range);
         Ok(())
     }
 
     fn write_zero(&mut self, range: vmm::memory_state::GuestMemoryRange) -> io::Result<()> {
-        self.vmm
-            .materialize_zero_memory(range)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let length = usize::try_from(range.length()).map_err(io::Error::other)?;
+        if !self
+            .vmm
+            .guest_memory()
+            .check_range(vm_memory::GuestAddress(range.start()), length)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero restore range is outside guest RAM",
+            ));
+        }
+        // Fresh mappings are known-zero, not merely nonresident. Overlays that replace bytes
+        // previously written by this source still require physical zeroing of those bytes.
+        for overlap in self.written.intersections(range) {
+            self.vmm
+                .materialize_zero_memory(overlap)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         self.restored.push(range);
         Ok(())
     }
@@ -1486,6 +1540,7 @@ impl<'a> VmmMemoryRestoreTarget<'a> {
             vmm,
             expected,
             restored: Vec::new(),
+            written: RestoreWrittenRanges::default(),
         }
     }
 
@@ -1497,6 +1552,53 @@ impl<'a> VmmMemoryRestoreTarget<'a> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl RestoreWrittenRanges {
+    fn insert(&mut self, range: vmm::memory_state::GuestMemoryRange) {
+        let mut start = range.start();
+        let mut end = start + range.length();
+        if let Some((&previous, &previous_end)) = self.0.range(..=start).next_back() {
+            if previous_end >= start {
+                start = previous;
+                end = end.max(previous_end);
+                self.0.remove(&previous);
+            }
+        }
+        while let Some((&next, &next_end)) = self.0.range(start..=end).next() {
+            end = end.max(next_end);
+            self.0.remove(&next);
+        }
+        self.0.insert(start, end);
+    }
+
+    fn intersections(
+        &self,
+        range: vmm::memory_state::GuestMemoryRange,
+    ) -> Vec<vmm::memory_state::GuestMemoryRange> {
+        let start = range.start();
+        let end = start + range.length();
+        let first = self
+            .0
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(&key, _)| key);
+        self.0
+            .range(first..end)
+            .filter_map(|(&written_start, &written_end)| {
+                let overlap_start = start.max(written_start);
+                let overlap_end = end.min(written_end);
+                (overlap_start < overlap_end).then(|| {
+                    vmm::memory_state::GuestMemoryRange::new(
+                        overlap_start,
+                        overlap_end - overlap_start,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect()
     }
 }
 

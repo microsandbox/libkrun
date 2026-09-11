@@ -296,6 +296,9 @@ pub struct VmResources {
     /// Construct fresh RAM from private immutable zero backing before loading boot payloads.
     #[cfg(not(feature = "tee"))]
     pub private_memory_boot: bool,
+    /// Construct untouched anonymous RAM for an eager restore, excluding cold-boot writes.
+    #[cfg(not(feature = "tee"))]
+    pub zeroed_restore_memory: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// Resolved host logical processor for every possible vCPU thread.
@@ -402,6 +405,8 @@ impl Default for VmResources {
             private_memory_backing: None,
             #[cfg(not(feature = "tee"))]
             private_memory_boot: false,
+            #[cfg(not(feature = "tee"))]
+            zeroed_restore_memory: false,
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,

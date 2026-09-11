@@ -1629,7 +1629,9 @@ pub fn build_microvm_paused(
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
         #[cfg(not(feature = "tee"))]
-        let kernel_boot = kernel_boot && vm_resources.private_memory_backing.is_none();
+        let kernel_boot = kernel_boot
+            && vm_resources.private_memory_backing.is_none()
+            && !vm_resources.zeroed_restore_memory;
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -2050,7 +2052,8 @@ pub fn build_microvm_paused(
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
     #[cfg(not(feature = "tee"))]
-    let configure_boot_memory = vm_resources.private_memory_backing.is_none();
+    let configure_boot_memory =
+        vm_resources.private_memory_backing.is_none() && !vm_resources.zeroed_restore_memory;
     #[cfg(feature = "tee")]
     let configure_boot_memory = true;
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -2926,7 +2929,7 @@ fn create_guest_memory_with_placement(
     }
 
     #[cfg(not(feature = "tee"))]
-    let (guest_mem, memory_placement) = if let Some(topology) = &vm_resources.numa_topology {
+    let (guest_mem, mut memory_placement) = if let Some(topology) = &vm_resources.numa_topology {
         create_numa_guest_memory(&arch_mem_regions, &numa_managed_regions, topology)?
     } else {
         (
@@ -2975,6 +2978,33 @@ fn create_guest_memory_with_placement(
         backing
             .map(&expected)
             .map_err(StartMicrovmError::PrivateMemoryBacking)?
+    } else if vm_resources.zeroed_restore_memory {
+        // Resolve payload geometry above, then discard its temporary initialization writes.
+        // This happens before hypervisor registration and before workers retain RAM pointers.
+        // Preserve NUMA fault policy on the replacement rather than silently losing placement.
+        // KernelMmap can insert a separate region while loading the payload (notably on x86).
+        // Reconstruct the resulting map, not merely the preliminary architecture ranges.
+        let expected = guest_mem
+            .iter()
+            .map(|region| (region.start_addr(), region.len() as usize))
+            .collect::<Vec<_>>();
+        if let Some(topology) = &vm_resources.numa_topology {
+            let managed = expected
+                .iter()
+                .map(|range| {
+                    arch_mem_regions
+                        .iter()
+                        .position(|candidate| candidate == range)
+                        .is_some_and(|index| numa_managed_regions[index])
+                })
+                .collect::<Vec<_>>();
+            let (fresh, placement) = create_numa_guest_memory(&expected, &managed, topology)?;
+            memory_placement = placement;
+            fresh
+        } else {
+            GuestMemoryMmap::from_ranges(&expected)
+                .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?
+        }
     } else {
         guest_mem
     };
@@ -5262,6 +5292,55 @@ pub mod tests {
         });
 
         create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+    }
+
+    #[test]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn eager_restore_replaces_payload_bytes_without_losing_regions() {
+        let mut resources = VmResources::default();
+        let kernel = vm_memory::MmapRegion::<()>::new(64 * 1024).unwrap();
+        // Aligned owned mapping also supports the x86 direct kernel-region insertion path.
+        unsafe { std::ptr::write_bytes(kernel.as_ptr(), 0x5a, kernel.size()) };
+        #[cfg(target_arch = "aarch64")]
+        let address = 0x8020_0000;
+        #[cfg(target_arch = "x86_64")]
+        let address = 0x20_0000;
+        resources.kernel_bundle = Some(KernelBundle {
+            host_addr: kernel.as_ptr() as u64,
+            guest_addr: address,
+            entry_addr: address,
+            size: kernel.size(),
+        });
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+        let payload = Payload::KernelMmap;
+        #[cfg(any(target_arch = "aarch64", target_os = "windows"))]
+        let payload = Payload::KernelCopy;
+        let (boot, _, _, _) = create_guest_memory(128, &resources, &payload).unwrap();
+        let ranges = boot
+            .iter()
+            .map(|r| (r.start_addr(), r.len()))
+            .collect::<Vec<_>>();
+        let mut page = [0; 4096];
+        boot.read_slice(&mut page, GuestAddress(address)).unwrap();
+        assert!(page.iter().all(|b| *b == 0x5a));
+        resources.zeroed_restore_memory = true;
+        let (restore, _, _, _) = create_guest_memory(128, &resources, &payload).unwrap();
+        assert_eq!(
+            restore
+                .iter()
+                .map(|r| (r.start_addr(), r.len()))
+                .collect::<Vec<_>>(),
+            ranges
+        );
+        restore
+            .read_slice(&mut page, GuestAddress(address))
+            .unwrap();
+        assert!(page.iter().all(|b| *b == 0));
+        // Dropping the temporary payload mapping must not mutate the shared firmware bytes.
+        assert_eq!(unsafe { *kernel.as_ptr() }, 0x5a);
     }
 
     #[test]

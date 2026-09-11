@@ -38,6 +38,11 @@ const VIRTIO_MEM_STATE_MIXED: u16 = 2;
 
 pub(crate) const BASE_AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
 
+const MEM_STATE_MAGIC: &[u8; 8] = b"MSBKMEM\0";
+const MEM_STATE_SCHEMA: u16 = 1;
+const MEM_STATE_HEADER_LEN: usize = 60;
+const MAX_MEM_STATE_BYTES: usize = 64 * 1024;
+
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 struct VirtioMemConfig {
@@ -160,6 +165,67 @@ impl Mem {
             plugged_size: self.config.plugged_size,
             region_size: self.config.region_size,
         }
+    }
+
+    fn decode_checkpoint_state(
+        &self,
+        state: &[u8],
+    ) -> Result<(VirtioMemConfig, Vec<bool>), VirtioStateError> {
+        let incompatible =
+            || VirtioStateError::Incompatible("invalid virtio-mem checkpoint state".into());
+        if state.len() < MEM_STATE_HEADER_LEN
+            || state.len() > MAX_MEM_STATE_BYTES
+            || &state[..8] != MEM_STATE_MAGIC
+            || u16::from_le_bytes(state[8..10].try_into().unwrap()) != MEM_STATE_SCHEMA
+        {
+            return Err(incompatible());
+        }
+        let word = |offset| u64::from_le_bytes(state[offset..offset + 8].try_into().unwrap());
+        let config = VirtioMemConfig {
+            node_id: u16::from_le_bytes(state[10..12].try_into().unwrap()),
+            block_size: word(12),
+            addr: word(20),
+            region_size: word(28),
+            usable_region_size: word(36),
+            plugged_size: word(44),
+            requested_size: word(52),
+            padding: [0; 6],
+        };
+        // Construction geometry cannot be inferred from the current requested/plugged total.
+        // Validate it before mutating any destination state or allocating the decoded bitmap.
+        if config.block_size != self.config.block_size
+            || config.node_id != self.config.node_id
+            || config.addr != self.config.addr
+            || config.region_size != self.config.region_size
+            || config.usable_region_size > config.region_size
+            || config.requested_size > config.usable_region_size
+            || config.plugged_size > config.usable_region_size
+            || !config
+                .usable_region_size
+                .is_multiple_of(VIRTIO_MEM_BLOCK_SIZE)
+            || !config.requested_size.is_multiple_of(VIRTIO_MEM_BLOCK_SIZE)
+            || !config.plugged_size.is_multiple_of(VIRTIO_MEM_BLOCK_SIZE)
+            || config.addr.checked_add(config.region_size).is_none()
+        {
+            return Err(incompatible());
+        }
+        let count = self.plugged_blocks.len();
+        let packed = &state[MEM_STATE_HEADER_LEN..];
+        if packed.len() != count.div_ceil(8)
+            || (count % 8 != 0 && packed.last().unwrap() >> (count % 8) != 0)
+        {
+            return Err(incompatible());
+        }
+        let blocks = (0..count)
+            .map(|index| packed[index / 8] & (1 << (index % 8)) != 0)
+            .collect::<Vec<_>>();
+        let plugged = blocks.iter().filter(|bit| **bit).count() as u64 * VIRTIO_MEM_BLOCK_SIZE;
+        let usable_blocks = (config.usable_region_size / VIRTIO_MEM_BLOCK_SIZE) as usize;
+        if plugged != config.plugged_size || blocks[usable_blocks..].iter().any(|bit| *bit) {
+            return Err(incompatible());
+        }
+        // requested_size may be below plugged_size while a shrink is still converging.
+        Ok((config, blocks))
     }
 
     /// Map a guest request range onto block indices, if fully inside the region.
@@ -470,5 +536,143 @@ impl VirtioDevice for Mem {
             ))?;
         self.device_state = DeviceState::Inactive;
         Ok(queues)
+    }
+
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "virtio-mem must be quiesced before capture",
+            ));
+        }
+        let length = MEM_STATE_HEADER_LEN + self.plugged_blocks.len().div_ceil(8);
+        if length > MAX_MEM_STATE_BYTES {
+            return Err(VirtioStateError::Incompatible(
+                "virtio-mem checkpoint exceeds device-state limit".into(),
+            ));
+        }
+        let mut state = Vec::with_capacity(length);
+        state.extend_from_slice(MEM_STATE_MAGIC);
+        state.extend_from_slice(&MEM_STATE_SCHEMA.to_le_bytes());
+        state.extend_from_slice(&self.config.node_id.to_le_bytes());
+        for value in [
+            self.config.block_size,
+            self.config.addr,
+            self.config.region_size,
+            self.config.usable_region_size,
+            self.config.plugged_size,
+            self.config.requested_size,
+        ] {
+            state.extend_from_slice(&value.to_le_bytes());
+        }
+        state.resize(length, 0);
+        for (index, plugged) in self.plugged_blocks.iter().enumerate() {
+            if *plugged {
+                state[MEM_STATE_HEADER_LEN + index / 8] |= 1 << (index % 8);
+            }
+        }
+        self.decode_checkpoint_state(&state)?;
+        Ok(state)
+    }
+
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        self.decode_checkpoint_state(state).map(|_| ())
+    }
+
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "virtio-mem must be inactive before restore",
+            ));
+        }
+        let (config, blocks) = self.decode_checkpoint_state(state)?;
+        self.config = config;
+        self.plugged_blocks = blocks;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    fn device(blocks: u64) -> Mem {
+        let mut device = Mem::new().unwrap();
+        device
+            .set_region(2 << 30, blocks * VIRTIO_MEM_BLOCK_SIZE)
+            .unwrap();
+        device
+    }
+
+    #[test]
+    fn checkpoint_preserves_noncontiguous_blocks_and_pending_targets() {
+        let mut source = device(9);
+        let base = source.config.addr;
+        source.set_requested_size(6 * VIRTIO_MEM_BLOCK_SIZE);
+        assert_eq!(
+            { source.handle_plug(base, 2).resp_type },
+            VIRTIO_MEM_RESP_ACK
+        );
+        assert_eq!(
+            {
+                source
+                    .handle_plug(base + 5 * VIRTIO_MEM_BLOCK_SIZE, 1)
+                    .resp_type
+            },
+            VIRTIO_MEM_RESP_ACK
+        );
+        for target in [6, 1] {
+            source.set_requested_size(target * VIRTIO_MEM_BLOCK_SIZE);
+            let state = source.capture_device_state().unwrap();
+            let mut restored = device(9);
+            restored.restore_device_state(&state).unwrap();
+            assert_eq!(restored.plugged_blocks, source.plugged_blocks);
+            assert_eq!(
+                restored.state_snapshot().requested_size,
+                target * VIRTIO_MEM_BLOCK_SIZE
+            );
+            assert_eq!(
+                restored.state_snapshot().plugged_size,
+                3 * VIRTIO_MEM_BLOCK_SIZE
+            );
+            assert_eq!(restored.capture_device_state().unwrap(), state);
+            // Subsequent requests must consult restored occupancy, not a fresh all-unplugged map.
+            assert_eq!(
+                { restored.handle_plug(base, 1).resp_type },
+                VIRTIO_MEM_RESP_NACK
+            );
+            assert_eq!(
+                { restored.handle_unplug(base, 1).resp_type },
+                VIRTIO_MEM_RESP_ACK
+            );
+            restored.set_requested_size(9 * VIRTIO_MEM_BLOCK_SIZE);
+            assert_eq!(
+                { restored.handle_plug(base, 1).resp_type },
+                VIRTIO_MEM_RESP_ACK
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_rejects_missing_inconsistent_and_mismatched_state_without_mutation() {
+        let source = device(9);
+        let state = source.capture_device_state().unwrap();
+        let mut invalid = vec![Vec::new(), state[..59].to_vec()];
+        for offset in [8, 10, 12, 20, 28, 36, 44, 52, MEM_STATE_HEADER_LEN] {
+            let mut corrupt = state.clone();
+            corrupt[offset] ^= 1;
+            invalid.push(corrupt);
+        }
+        let mut padding = state.clone();
+        *padding.last_mut().unwrap() = 0x80;
+        invalid.push(padding);
+        let mut trailing = state.clone();
+        trailing.push(0);
+        invalid.push(trailing);
+        let mut destination = device(9);
+        for corrupt in invalid {
+            assert!(destination.restore_device_state(&corrupt).is_err());
+            assert_eq!(destination.capture_device_state().unwrap(), state);
+        }
+        assert!(device(10).validate_device_state(&state).is_err());
     }
 }
