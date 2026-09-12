@@ -147,6 +147,9 @@ impl PreparedBlockBackend {
             capacity_sectors: size / SECTOR_SIZE,
             read_only,
             sync_mode: SyncMode::Full,
+            // This backend has no host file and therefore no direct-I/O handle.
+            #[cfg(target_os = "linux")]
+            direct_io: false,
             #[cfg(windows)]
             windows_raw_file: None,
         })
