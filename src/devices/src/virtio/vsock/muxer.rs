@@ -1099,6 +1099,19 @@ impl VsockMuxer {
                 .unwrap()
                 .insert(id, Mutex::new(Box::new(unix)));
             self.process_proxy_update(id, update);
+        } else {
+            // An omitted service is unavailable, not a request that should hang.
+            // Match the Windows muxer and never infer a host socket from a port.
+            push_packet(
+                self.cid,
+                MuxerRx::Reset {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                },
+                &self.rxq,
+                queue,
+                mem,
+            );
         }
     }
 
@@ -1246,6 +1259,43 @@ impl VsockMuxer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_stream_route_returns_reset_without_opening_a_proxy() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::{Descriptor, DescriptorChain};
+        use vm_memory::{Bytes, GuestAddress};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+        let mut packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        packet
+            .set_src_port(1234)
+            .set_dst_port(5000)
+            .set_op(uapi::VSOCK_OP_REQUEST);
+        let mut muxer = VsockMuxer::new(3, None, None, None, None, TsiFlags::empty());
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(8))));
+        muxer.process_op_request(&packet);
+        assert!(muxer.proxy_map.read().unwrap().is_empty());
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset {
+                local_port: 5000,
+                peer_port: 1234
+            })
+        ));
+    }
 
     #[test]
     fn datagram_peer_limit_evicts_the_least_recently_used_peer_per_port() {

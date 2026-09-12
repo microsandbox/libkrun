@@ -648,6 +648,21 @@ impl VmResources {
             .insert_with_writeback_limit(config, writeback_limit_bytes, self.metrics.clone())
     }
 
+    /// Retains a captured block device without granting access to host storage.
+    #[cfg(feature = "blk")]
+    pub fn add_unavailable_block_device(
+        &mut self,
+        state: &devices::virtio::block::BlockState,
+    ) -> Result<BlockConfigError> {
+        let metrics = self.metrics.register_block_device(state.id.clone());
+        let block = devices::virtio::Block::new_unavailable(state, metrics)
+            .map_err(BlockConfigError::CreateBlockDevice)?;
+        self.block
+            .list
+            .push_back(std::sync::Arc::new(std::sync::Mutex::new(block)));
+        Ok(())
+    }
+
     /// Adds a block device with an optional live dirty-data budget.
     #[cfg(feature = "blk")]
     pub fn add_block_device_with_writeback_limit_handle(

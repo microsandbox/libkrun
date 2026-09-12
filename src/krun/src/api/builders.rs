@@ -419,6 +419,7 @@ pub struct DiskBuilder {
     pub(crate) configs: Vec<ConfiguredDisk>,
     current_path: Option<PathBuf>,
     current_layers: Option<Vec<DiskLayer>>,
+    current_unavailable: Option<crate::BlockDeviceState>,
     current_id: Option<String>,
     current_read_only: bool,
     current_format: DiskImageFormat,
@@ -458,6 +459,7 @@ pub struct DiskLayer {
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone)]
 pub(crate) struct ConfiguredDisk {
+    pub(crate) unavailable: Option<crate::BlockDeviceState>,
     pub(crate) config: DiskConfig,
     pub(crate) layers: Option<Vec<DiskLayer>>,
     pub(crate) writeback_limit_bytes: Option<u64>,
@@ -1357,6 +1359,7 @@ impl DiskBuilder {
             configs: Vec::new(),
             current_path: None,
             current_layers: None,
+            current_unavailable: None,
             current_id: None,
             current_read_only: false,
             current_format: DiskImageFormat::Raw,
@@ -1391,6 +1394,14 @@ impl DiskBuilder {
         self.finish_current();
         self.current_path = Some(path.as_ref().to_path_buf());
         self.current_layers = None;
+        self
+    }
+
+    /// Retain a captured block device without attaching storage. Guest storage
+    /// requests fail with IOERR; no file is opened, created, or shared.
+    pub fn unavailable(mut self, state: crate::BlockDeviceState) -> Self {
+        self.finish_current();
+        self.current_unavailable = Some(state);
         self
     }
 
@@ -1466,11 +1477,15 @@ impl DiskBuilder {
     }
 
     fn finish_current(&mut self) {
-        if self.current_path.is_none() && self.current_layers.is_none() {
+        if self.current_path.is_none()
+            && self.current_layers.is_none()
+            && self.current_unavailable.is_none()
+        {
             return;
         }
         let path = self.current_path.take().unwrap_or_default();
         self.configs.push(ConfiguredDisk {
+            unavailable: self.current_unavailable.take(),
             config: DiskConfig {
                 path,
                 id: self.current_id.take(),

@@ -8,6 +8,7 @@ use super::QueueConfig;
 mod backend;
 pub mod device;
 mod limit;
+mod unavailable;
 #[cfg(windows)]
 mod windows;
 mod worker;

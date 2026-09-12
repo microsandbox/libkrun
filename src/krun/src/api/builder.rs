@@ -754,6 +754,11 @@ impl VmBuilder {
         // Apply block device configuration
         #[cfg(feature = "blk")]
         for (i, configured_disk) in self.disk.configs.into_iter().enumerate() {
+            if let Some(state) = configured_disk.unavailable {
+                vmr.add_unavailable_block_device(&state.device)
+                    .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
+                continue;
+            }
             let explicit_layers = configured_disk.layers;
             let config = configured_disk.config;
             let block_id = config
