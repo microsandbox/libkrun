@@ -91,6 +91,7 @@ impl CacheType {
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
+    pub(crate) unavailable: bool,
     cache_type: CacheType,
     read_only: bool,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
@@ -148,6 +149,7 @@ impl DiskProperties {
 
         Ok(Self {
             cache_type,
+            unavailable: false,
             read_only,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
@@ -671,6 +673,7 @@ unsafe impl ByteValued for VirtioBlkConfig {}
 
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
+    unavailable: bool,
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
@@ -702,6 +705,36 @@ pub struct Block {
 }
 
 impl Block {
+    /// Recreate the guest-visible contract while denying all storage I/O.
+    /// No source path is accepted or opened. Identity queries remain available.
+    pub fn new_unavailable(state: &BlockState, metrics: BlockMetricsWriter) -> io::Result<Self> {
+        let size = state
+            .capacity_sectors
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "block capacity overflow")
+            })?;
+        let prepared = PreparedBlockBackend::unavailable(size, state.read_only)?;
+        let mut block = Self::from_prepared_backend(
+            state.id.clone(),
+            state.partuuid.clone(),
+            state.cache_type,
+            state.disk_image_id.clone(),
+            prepared,
+            metrics,
+        )?;
+        block
+            .restore_state(state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        block.unavailable = true;
+        block
+            .disk
+            .as_mut()
+            .expect("new block owns its disk")
+            .unavailable = true;
+        Ok(block)
+    }
+
     /// Create a new virtio block device that operates on the given file.
     ///
     /// The given file must be seekable and sizable.
@@ -1010,6 +1043,7 @@ impl Block {
         };
 
         Ok(Block {
+            unavailable: false,
             id,
             partuuid,
             config,
@@ -1210,6 +1244,7 @@ impl Block {
         };
 
         Ok(Block {
+            unavailable: false,
             id,
             partuuid,
             disk: Some(disk),
@@ -1419,13 +1454,14 @@ impl VirtioDevice for Block {
         let disk = match self.disk.take() {
             Some(d) => d,
             None => {
-                let disk = DiskProperties::new(
+                let mut disk = DiskProperties::new(
                     Arc::clone(&self.disk_image),
                     self.disk_image_id.clone(),
                     self.cache_type,
                     self.is_read_only(),
                 )
                 .map_err(|_| ActivateError::BadActivate)?;
+                disk.unavailable = self.unavailable;
                 #[cfg(windows)]
                 {
                     let mut disk = disk;
@@ -1729,6 +1765,93 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("at least"));
+    }
+
+    #[test]
+    fn unavailable_worker_rejects_all_storage_io_but_preserves_identity() {
+        use super::super::worker::{RequestError, RequestHeader};
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::descriptor_utils::{
+            create_descriptor_chain, DescriptorType, Reader, Writer,
+        };
+        use vm_memory::{Bytes, GuestAddress};
+
+        for cache_type in [CacheType::Writeback, CacheType::Unsafe] {
+            let state = BlockState {
+                version: BLOCK_STATE_VERSION,
+                id: "missing".into(),
+                partuuid: None,
+                capacity_sectors: 8 * 1024 * 1024,
+                disk_image_id: b"missing".to_vec(),
+                avail_features: 1u64 << VIRTIO_F_VERSION_1,
+                cache_type,
+                read_only: false,
+            };
+            let mut block = Block::new_unavailable(
+                &state,
+                MetricsWriter::default().register_block_device("missing".into()),
+            )
+            .unwrap();
+            assert_eq!(block.capture_state().unwrap(), state);
+            block.stop_worker().unwrap();
+            let disk = block.disk.take().unwrap();
+            assert!(disk.unavailable);
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let mut worker = BlockWorker::new(
+                DeviceQueue {
+                    queue: crate::virtio::Queue::new(256),
+                    event: Arc::new(EventFd::new(0).unwrap()),
+                },
+                InterruptTransport::new(DummyIrqChip::new().into(), "missing".into()).unwrap(),
+                mem.clone(),
+                disk,
+                EventFd::new(0).unwrap(),
+                Arc::new(AtomicBool::new(false)),
+                MetricsWriter::default().register_block_device("missing".into()),
+            );
+            for kind in [
+                VIRTIO_BLK_T_IN,
+                VIRTIO_BLK_T_OUT,
+                VIRTIO_BLK_T_FLUSH,
+                VIRTIO_BLK_T_DISCARD,
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                VIRTIO_BLK_T_GET_ID,
+            ] {
+                let chain = create_descriptor_chain(
+                    &mem,
+                    GuestAddress(0),
+                    GuestAddress(0x1000),
+                    vec![(DescriptorType::Writable, 512)],
+                    0,
+                )
+                .unwrap();
+                mem.write_obj(kind, GuestAddress(0x2000)).unwrap();
+                let header: RequestHeader = mem.read_obj(GuestAddress(0x2000)).unwrap();
+                mem.write_slice(&[0x5a; 512], GuestAddress(0x1000)).unwrap();
+                let mut writer = Writer::new(&mem, chain.clone()).unwrap();
+                let result = worker.process_request(
+                    header,
+                    &mut Reader::new(&mem, chain.clone()).unwrap(),
+                    &mut writer,
+                );
+                if kind == VIRTIO_BLK_T_GET_ID {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(
+                        matches!(result, Err(RequestError::Unavailable)),
+                        "request {kind}: {result:?}"
+                    );
+                    writer.write_obj(VIRTIO_BLK_S_IOERR as u8).unwrap();
+                    let mut payload = [0; 511];
+                    mem.read_slice(&mut payload, GuestAddress(0x1000)).unwrap();
+                    assert_eq!(payload, [0x5a; 511]);
+                    assert_eq!(
+                        mem.read_obj::<u8>(GuestAddress(0x11ff)).unwrap(),
+                        VIRTIO_BLK_S_IOERR as u8
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

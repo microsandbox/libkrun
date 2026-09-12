@@ -54,6 +54,7 @@ pub enum RequestError {
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
     UnknownRequest,
+    Unavailable,
 }
 
 /// The request header represents the mandatory fields of each block device request.
@@ -387,6 +388,9 @@ impl BlockWorker {
             let (status, len): (u8, usize) =
                 match self.process_request(request_header, &mut reader, &mut writer) {
                     Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
+                    // An intentionally unavailable disk is expected to reject I/O. Only
+                    // the final status byte was written; avoid logging every guest retry.
+                    Err(RequestError::Unavailable) => (VIRTIO_BLK_S_IOERR as u8, 1),
                     Err(e) => {
                         error!("error processing request: {e:?}");
                         (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
@@ -487,6 +491,8 @@ impl BlockWorker {
             let (status, len): (u8, usize) =
                 match self.process_request(request_header, &mut reader, &mut writer) {
                     Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
+                    // Match the non-IOCP path for intentionally unavailable devices.
+                    Err(RequestError::Unavailable) => (VIRTIO_BLK_S_IOERR as u8, 1),
                     Err(e) => {
                         error!("error processing request: {e:?}");
                         (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
@@ -886,6 +892,20 @@ impl BlockWorker {
         reader: &mut Reader,
         writer: &mut Writer,
     ) -> result::Result<usize, RequestError> {
+        // Never report successful flush/discard/zeroing for an unavailable disk,
+        // even if the source selected unsafe caching. GET_ID is topology, not I/O.
+        if self.disk.unavailable && request_header.request_type != VIRTIO_BLK_T_GET_ID {
+            // READ descriptors include a data area before the status byte. Leave
+            // those bytes untouched and put IOERR in the status descriptor, not RAM data.
+            let status_offset = writer
+                .available_bytes()
+                .checked_sub(1)
+                .ok_or(RequestError::InvalidDataLength)?;
+            *writer = writer.split_at(status_offset).map_err(|error| {
+                RequestError::WritingToDescriptor(io::Error::new(io::ErrorKind::InvalidData, error))
+            })?;
+            return Err(RequestError::Unavailable);
+        }
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
                 let data_len = writer

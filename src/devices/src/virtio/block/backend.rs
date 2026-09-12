@@ -134,6 +134,27 @@ impl BlockBackendSpec {
 }
 
 impl PreparedBlockBackend {
+    /// Prepare a disk identity without opening or allocating any host backing.
+    pub(super) fn unavailable(size: u64, read_only: bool) -> io::Result<Self> {
+        let storage: Box<dyn DynStorage> = Box::new(super::unavailable::UnavailableStorage {
+            size,
+            helper: Default::default(),
+        });
+        let raw = Raw::open_image_sync(storage, !read_only)?;
+        Ok(Self {
+            disk_image: Arc::new(Mutex::new(SyncFormatAccess::new(raw)?)),
+            discard_alignment: 1,
+            capacity_sectors: size / SECTOR_SIZE,
+            read_only,
+            sync_mode: SyncMode::Full,
+            // This backend has no host file and therefore no direct-I/O handle.
+            #[cfg(target_os = "linux")]
+            direct_io: false,
+            #[cfg(windows)]
+            windows_raw_file: None,
+        })
+    }
+
     /// Opens only the paths named by `spec` and composes them behind one image interface.
     pub fn open(spec: &BlockBackendSpec) -> io::Result<Self> {
         spec.validate()?;
